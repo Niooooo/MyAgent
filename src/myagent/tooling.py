@@ -8,6 +8,8 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
 
+from .permissions import PermissionLevel, PermissionManager
+
 
 ToolResult = dict[str, Any]
 ToolHandler = Callable[..., ToolResult]
@@ -42,15 +44,26 @@ class FunctionTool:
 class ToolRegistry:
     """Store function tools and provide one guarded execution path."""
 
-    def __init__(self, tools: Iterable[FunctionTool] = ()) -> None:
+    def __init__(
+        self,
+        tools: Iterable[FunctionTool] = (),
+        *,
+        permission_manager: PermissionManager | None = None,
+    ) -> None:
         self._tools: dict[str, FunctionTool] = {}
+        self.permission_manager = permission_manager
         for tool in tools:
             self.register(tool)
 
     @property
     def definitions(self) -> list[dict[str, Any]]:
         """Return all API definitions in stable registration order."""
-        return [tool.definition for tool in self._tools.values()]
+        return [
+            tool.definition
+            for tool in self._tools.values()
+            if self.permission_manager is None
+            or self.permission_manager.is_tool_allowed(tool.name)
+        ]
 
     def register(self, tool: FunctionTool) -> None:
         """Register a uniquely named tool."""
@@ -82,6 +95,15 @@ class ToolRegistry:
                 "ok": False,
                 "error": f"Invalid arguments for {name}: {exc}",
             }
+
+        if self.permission_manager is not None:
+            decision = self.permission_manager.authorize(name, arguments)
+            if decision.level is PermissionLevel.DENY:
+                return {
+                    "ok": False,
+                    "error": f"Permission denied: {decision.reason}",
+                    "permission": "denied",
+                }
 
         try:
             result = tool.handler(**arguments)

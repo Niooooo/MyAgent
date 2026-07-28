@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 
 from .agent import AgentLoop, AgentLoopLimitError
+from .permissions import ApprovalRequest
 from .tools import BashTool
 
 
@@ -38,6 +40,7 @@ def main() -> None:
         model=args.model,
         max_tool_rounds=max_tool_rounds,
         bash_tool=BashTool(timeout_seconds=bash_timeout),
+        approval_callback=_ask_user_approval,
     )
 
     if args.prompt:
@@ -68,3 +71,18 @@ def _run_turn(agent: AgentLoop, user_input: str) -> None:
         print(f"request failed: {exc}", file=sys.stderr)
     else:
         print(f"agent> {answer}")
+
+
+def _ask_user_approval(request: ApprovalRequest) -> bool:
+    """Show a sensitive tool call and request one-time human approval."""
+    print("\nApproval required before executing a sensitive operation:")
+    print(f"tool: {request.tool_name}")
+    print(f"reason: {request.reason}")
+    print("arguments:")
+    print(json.dumps(dict(request.arguments), ensure_ascii=False, indent=2))
+    try:
+        answer = input("Approve this operation once? [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    return answer in {"y", "yes"}
