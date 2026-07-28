@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from os import PathLike
 from typing import Any
 
+from .permissions import ApprovalCallback
 from .tooling import ToolRegistry
 from .tools import build_default_tool_registry
 
@@ -36,11 +37,18 @@ class AgentLoop:
         bash_tool: Callable[[str], dict[str, Any]] | None = None,
         tool_registry: ToolRegistry | None = None,
         workspace_root: str | PathLike[str] | None = None,
+        allowed_tools: Iterable[str] | None = None,
+        approval_callback: ApprovalCallback | None = None,
     ) -> None:
         if max_tool_rounds < 0:
             raise ValueError("max_tool_rounds must be non-negative")
-        if tool_registry is not None and bash_tool is not None:
-            raise ValueError("Pass either tool_registry or bash_tool, not both")
+        if tool_registry is not None and any(
+            value is not None
+            for value in (bash_tool, workspace_root, allowed_tools, approval_callback)
+        ):
+            raise ValueError(
+                "Pass either tool_registry or default-tool configuration, not both"
+            )
 
         self.client = client
         self.model = model
@@ -50,6 +58,8 @@ class AgentLoop:
         self.tool_registry = tool_registry or build_default_tool_registry(
             cwd=workspace_root,
             bash_tool=bash_tool,
+            allowed_tools=None if allowed_tools is None else set(allowed_tools),
+            approval_callback=approval_callback,
         )
 
     def run(self, user_input: str) -> str:

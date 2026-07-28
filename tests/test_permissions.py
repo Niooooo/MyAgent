@@ -1,0 +1,112 @@
+import unittest
+
+from myagent.permissions import (
+    ApprovalRequest,
+    DefaultPermissionPolicy,
+    PermissionLevel,
+    PermissionManager,
+    classify_bash_command,
+)
+
+
+class BashPermissionClassificationTests(unittest.TestCase):
+    def test_safe_commands_are_allowed(self) -> None:
+        for command in ["pwd", "ls -la", "printf 'rm -rf /'"]:
+            with self.subTest(command=command):
+                self.assertEqual(
+                    classify_bash_command(command).level,
+                    PermissionLevel.ALLOW,
+                )
+
+    def test_destructive_commands_require_approval(self) -> None:
+        commands = [
+            "rm note.txt",
+            "rmdir empty-directory",
+            "mv old.txt new.txt",
+            "git reset --hard HEAD~1",
+            "git clean -fd",
+            "git push --force origin main",
+            "printf changed > note.txt",
+            "sed -i 's/old/new/' note.txt",
+        ]
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertEqual(
+                    classify_bash_command(command).level,
+                    PermissionLevel.REQUIRE_APPROVAL,
+                )
+
+    def test_recursive_forced_rm_is_permanently_denied(self) -> None:
+        commands = [
+            "rm note.txt && rm -rf directory",
+            "printf changed > note.txt; rm --recursive --force directory",
+            "env MODE=test rm -R -f directory",
+            "sudo -u root rm -rf directory",
+        ]
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertEqual(
+                    classify_bash_command(command).level,
+                    PermissionLevel.DENY,
+                )
+
+
+class PermissionManagerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.policy = DefaultPermissionPolicy()
+
+    def test_file_reads_are_allowed_without_approval(self) -> None:
+        decision = PermissionManager(self.policy).authorize(
+            "read_file", {"path": "note.txt"}
+        )
+
+        self.assertEqual(decision.level, PermissionLevel.ALLOW)
+
+    def test_sensitive_call_can_be_approved_once(self) -> None:
+        requests: list[ApprovalRequest] = []
+        manager = PermissionManager(
+            self.policy,
+            lambda request: requests.append(request) or True,
+        )
+
+        decision = manager.authorize("bash", {"command": "rm note.txt"})
+
+        self.assertEqual(decision.level, PermissionLevel.ALLOW)
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0].tool_name, "bash")
+
+    def test_missing_or_rejected_approval_is_denied(self) -> None:
+        without_handler = PermissionManager(self.policy).authorize(
+            "write_file", {"path": "note.txt", "content": "changed"}
+        )
+        rejected = PermissionManager(self.policy, lambda _: False).authorize(
+            "edit_file",
+            {"path": "note.txt", "old_text": "old", "new_text": "new"},
+        )
+
+        self.assertEqual(without_handler.level, PermissionLevel.DENY)
+        self.assertIn("no user approval handler", without_handler.reason)
+        self.assertEqual(rejected.level, PermissionLevel.DENY)
+        self.assertIn("did not approve", rejected.reason)
+
+    def test_permanent_denial_never_asks_for_approval(self) -> None:
+        requests = []
+        manager = PermissionManager(
+            self.policy,
+            lambda request: requests.append(request) or True,
+        )
+
+        decision = manager.authorize("bash", {"command": "rm -rf directory"})
+
+        self.assertEqual(decision.level, PermissionLevel.DENY)
+        self.assertEqual(requests, [])
+
+    def test_non_allowlisted_tool_is_denied(self) -> None:
+        decision = PermissionManager(self.policy).authorize("network", {})
+
+        self.assertEqual(decision.level, PermissionLevel.DENY)
+        self.assertIn("allowlist", decision.reason)
+
+
+if __name__ == "__main__":
+    unittest.main()

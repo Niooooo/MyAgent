@@ -1,3 +1,4 @@
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -53,6 +54,59 @@ class BashToolTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertIn("non-empty", result["error"])
         self.assertEqual(seen_commands, [])
+
+    def test_allowlist_hides_and_blocks_unlisted_tools(self) -> None:
+        seen_commands = []
+        registry = build_default_tool_registry(
+            bash_tool=lambda command: seen_commands.append(command) or {"ok": True},
+            allowed_tools={"read_file", "glob", "grep"},
+        )
+
+        visible_names = {definition["name"] for definition in registry.definitions}
+        result = registry.execute("bash", '{"command": "pwd"}')
+
+        self.assertEqual(visible_names, {"read_file", "glob", "grep"})
+        self.assertFalse(result["ok"])
+        self.assertIn("allowlist", result["error"])
+        self.assertEqual(seen_commands, [])
+
+    def test_sensitive_command_only_executes_after_user_approval(self) -> None:
+        seen_commands = []
+        requests = []
+        registry = build_default_tool_registry(
+            bash_tool=lambda command: seen_commands.append(command) or {"ok": True},
+            approval_callback=lambda request: requests.append(request) or True,
+        )
+
+        result = registry.execute("bash", '{"command": "rm note.txt"}')
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(seen_commands, ["rm note.txt"])
+        self.assertEqual(len(requests), 1)
+
+    def test_denied_sensitive_command_does_not_reach_handler(self) -> None:
+        seen_commands = []
+        registry = build_default_tool_registry(
+            bash_tool=lambda command: seen_commands.append(command) or {"ok": True}
+        )
+
+        result = registry.execute("bash", '{"command": "rm note.txt"}')
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["permission"], "denied")
+        self.assertEqual(seen_commands, [])
+
+    def test_write_file_requires_user_approval(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            registry = build_default_tool_registry(cwd=temporary_directory)
+
+            result = registry.execute(
+                "write_file",
+                '{"path": "note.txt", "content": "changed"}',
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertIn("approval", result["error"])
 
 
 if __name__ == "__main__":
