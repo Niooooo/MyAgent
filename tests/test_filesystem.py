@@ -1,10 +1,13 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from types import MappingProxyType
+from unittest.mock import patch
 
 from myagent.filesystem import WorkspaceFiles, filesystem_tools
-from myagent.tooling import ToolExecutionError, ToolRegistry
+from myagent.tooling import FunctionTool, ToolExecutionError, ToolRegistry
 
 
 class WorkspaceFilesTests(unittest.TestCase):
@@ -56,6 +59,60 @@ class WorkspaceFilesTests(unittest.TestCase):
             self.workspace.read_file("../outside.txt")
         with self.assertRaisesRegex(ToolExecutionError, "must be relative"):
             self.workspace.glob("../*.txt")
+
+        outside = self.root.parent / "outside.txt"
+        with self.assertRaisesRegex(ToolExecutionError, "escapes"):
+            self.workspace.read_file(str(outside.resolve()))
+
+    def test_symlink_cannot_escape_workspace(self) -> None:
+        outside_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(outside_directory.cleanup)
+        outside = Path(outside_directory.name, "outside.txt")
+        outside.write_text("secret", encoding="utf-8")
+        link = self.root / "link.txt"
+        try:
+            link.symlink_to(outside)
+        except OSError as exc:
+            self.skipTest(f"symbolic links are unavailable: {exc}")
+
+        with self.assertRaisesRegex(ToolExecutionError, "escapes"):
+            self.workspace.read_file("link.txt")
+
+    def test_read_and_search_limits_are_preserved(self) -> None:
+        limited = WorkspaceFiles(self.root, max_read_bytes=4, max_results=1)
+        (self.root / "large.txt").write_text("12345", encoding="utf-8")
+        (self.root / "first.txt").write_text("hit", encoding="utf-8")
+        (self.root / "second.txt").write_text("hit", encoding="utf-8")
+
+        with self.assertRaisesRegex(ToolExecutionError, "read limit"):
+            limited.read_file("large.txt")
+        result = limited.grep("hit")
+
+        self.assertEqual(result["count"], 1)
+        self.assertTrue(result["truncated"])
+
+    def test_grep_skips_repository_and_cache_directories(self) -> None:
+        for directory in (".git", ".venv", "__pycache__"):
+            ignored = self.root / directory
+            ignored.mkdir()
+            (ignored / "ignored.txt").write_text("needle", encoding="utf-8")
+        (self.root / "included.txt").write_text("needle", encoding="utf-8")
+
+        result = self.workspace.grep("needle")
+
+        self.assertEqual(
+            [match["path"] for match in result["matches"]],
+            ["included.txt"],
+        )
+
+    def test_writes_replace_a_same_directory_temporary_file(self) -> None:
+        real_replace = os.replace
+        with patch("myagent.filesystem.os.replace", wraps=real_replace) as replace:
+            self.workspace.write_file("nested/note.txt", "content")
+
+        temporary_name, target_name = replace.call_args.args
+        self.assertEqual(Path(temporary_name).parent, Path(target_name).parent)
+        self.assertEqual(Path(target_name), self.root / "nested" / "note.txt")
 
     def test_glob_and_grep_return_structured_matches(self) -> None:
         source = self.root / "src"
@@ -118,6 +175,61 @@ class ToolRegistryTests(unittest.TestCase):
 
         self.assertIn("Invalid arguments for read_file", missing["error"])
         self.assertIn("Invalid arguments for read_file", extra["error"])
+
+    def test_registry_rejects_non_object_arguments(self) -> None:
+        result = self.registry.execute("read_file", '[]')
+
+        self.assertEqual(
+            result,
+            {
+                "ok": False,
+                "error": "Invalid tool arguments: expected a JSON object",
+            },
+        )
+
+    def test_registry_converts_non_object_handler_result_to_error(self) -> None:
+        registry = ToolRegistry(
+            [
+                FunctionTool(
+                    name="invalid_result",
+                    description="Return an invalid result",
+                    parameters={"type": "object", "properties": {}},
+                    handler=lambda: "not an object",  # type: ignore[arg-type]
+                )
+            ]
+        )
+
+        result = registry.execute("invalid_result", "{}")
+
+        self.assertEqual(
+            result,
+            {
+                "ok": False,
+                "error": "invalid_result tool returned a non-object result",
+            },
+        )
+
+    def test_pre_tool_hook_receives_read_only_arguments(self) -> None:
+        from myagent.hooks import HookRegistry, PreToolUse
+
+        hooks = HookRegistry()
+        seen_argument_types = []
+
+        def inspect_arguments(event: PreToolUse) -> None:
+            seen_argument_types.append(type(event.arguments))
+            with self.assertRaises(TypeError):
+                event.arguments["path"] = "changed"  # type: ignore[index]
+
+        hooks.register(PreToolUse, inspect_arguments)
+        registry = ToolRegistry(
+            filesystem_tools(WorkspaceFiles(self.temporary_directory.name)),
+            hooks=hooks,
+        )
+
+        result = registry.execute("read_file", '{"path":"missing.txt"}')
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(seen_argument_types, [MappingProxyType])
 
 
 if __name__ == "__main__":

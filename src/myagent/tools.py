@@ -6,17 +6,16 @@ import os
 import subprocess
 from collections.abc import Callable, Iterable
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from .filesystem import WorkspaceFiles, filesystem_tools
-from .permissions import (
-    ApprovalCallback,
-    DefaultPermissionPolicy,
-    PermissionLevel,
-    PermissionManager,
-    classify_bash_command,
-)
-from .tooling import FunctionTool, ToolRegistry
+from .permissions import PermissionLevel, classify_bash_command
+from .tooling import FunctionTool
+
+if TYPE_CHECKING:
+    from .hooks import HookRegistry
+    from .permissions import ApprovalCallback
+    from .todo import TodoList
+    from .tooling import ToolRegistry
 
 
 BASH_TOOL: dict[str, Any] = {
@@ -120,34 +119,44 @@ class BashTool:
         return f"{value[:self.max_output_chars]}\n...[truncated {omitted} characters]"
 
 
-def build_default_tool_registry(
-    *,
-    cwd: str | os.PathLike[str] | None = None,
-    bash_tool: Callable[[str], dict[str, Any]] | None = None,
-    allowed_tools: Iterable[str] | None = None,
-    approval_callback: ApprovalCallback | None = None,
-) -> ToolRegistry:
-    """Create the standard tool set behind the default permission policy."""
-    workspace = WorkspaceFiles(cwd)
-    bash_handler = bash_tool if bash_tool is not None else BashTool(cwd=workspace.root)
+def build_bash_function_tool(
+    handler: Callable[[str], dict[str, Any]],
+) -> FunctionTool:
+    """Bind one Bash handler to the stable public function-tool schema."""
 
     def execute_bash(command: str) -> dict[str, Any]:
         if not isinstance(command, str) or not command.strip():
             return {"ok": False, "error": "bash requires a non-empty command"}
-        return bash_handler(command)
+        return handler(command)
 
-    bash_function = FunctionTool(
+    return FunctionTool(
         name="bash",
         description=BASH_TOOL["description"],
         parameters=BASH_TOOL["parameters"],
         handler=execute_bash,
         strict=True,
     )
-    permissions = PermissionManager(
-        DefaultPermissionPolicy(allowed_tools),
-        approval_callback,
-    )
-    return ToolRegistry(
-        [bash_function, *filesystem_tools(workspace)],
-        permission_manager=permissions,
+
+
+def build_default_tool_registry(
+    *,
+    cwd: str | os.PathLike[str] | None = None,
+    bash_tool: Callable[[str], dict[str, Any]] | None = None,
+    allowed_tools: Iterable[str] | None = None,
+    approval_callback: ApprovalCallback | None = None,
+    hooks: HookRegistry | None = None,
+    todo_list: TodoList | None = None,
+    todo_reminder_tool_calls: int | None = None,
+) -> ToolRegistry:
+    """Preserve the original import path for the default composition helper."""
+    from .composition import build_default_tool_registry as build_registry
+
+    return build_registry(
+        cwd=cwd,
+        bash_tool=bash_tool,
+        allowed_tools=allowed_tools,
+        approval_callback=approval_callback,
+        hooks=hooks,
+        todo_list=todo_list,
+        todo_reminder_tool_calls=todo_reminder_tool_calls,
     )

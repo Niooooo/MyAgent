@@ -1,5 +1,6 @@
 import unittest
 
+from myagent.tooling import FunctionTool, ToolRegistry
 from myagent.permissions import (
     ApprovalRequest,
     DefaultPermissionPolicy,
@@ -89,6 +90,17 @@ class PermissionManagerTests(unittest.TestCase):
         self.assertEqual(rejected.level, PermissionLevel.DENY)
         self.assertIn("did not approve", rejected.reason)
 
+    def test_approval_callback_failure_is_denied(self) -> None:
+        def fail(_request: ApprovalRequest) -> bool:
+            raise RuntimeError("approval unavailable")
+
+        decision = PermissionManager(self.policy, fail).authorize(
+            "write_file", {"path": "note.txt", "content": "changed"}
+        )
+
+        self.assertEqual(decision.level, PermissionLevel.DENY)
+        self.assertIn("user approval failed", decision.reason)
+
     def test_permanent_denial_never_asks_for_approval(self) -> None:
         requests = []
         manager = PermissionManager(
@@ -106,6 +118,27 @@ class PermissionManagerTests(unittest.TestCase):
 
         self.assertEqual(decision.level, PermissionLevel.DENY)
         self.assertIn("allowlist", decision.reason)
+
+    def test_legacy_registry_permission_manager_injection_remains_supported(self) -> None:
+        registry = ToolRegistry(
+            [
+                FunctionTool(
+                    name="echo",
+                    description="Echo",
+                    parameters={"type": "object", "properties": {}},
+                    handler=lambda: {"ok": True},
+                )
+            ],
+            permission_manager=PermissionManager(
+                DefaultPermissionPolicy({"echo"})
+            ),
+        )
+
+        self.assertEqual(
+            [definition["name"] for definition in registry.definitions],
+            ["echo"],
+        )
+        self.assertEqual(registry.execute("echo", "{}"), {"ok": True})
 
 
 if __name__ == "__main__":
