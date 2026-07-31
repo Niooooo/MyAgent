@@ -5,29 +5,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from myagent.agent import AgentLoop, AgentLoopLimitError
-
-
-def function_call(call_id="call_1", name="bash", arguments='{"command":"pwd"}'):
-    return SimpleNamespace(
-        type="function_call",
-        call_id=call_id,
-        name=name,
-        arguments=arguments,
-    )
-
-
-def response(output, output_text=""):
-    return SimpleNamespace(output=output, output_text=output_text)
-
-
-class FakeResponses:
-    def __init__(self, responses):
-        self._responses = iter(responses)
-        self.requests = []
-
-    def create(self, **kwargs):
-        self.requests.append(kwargs)
-        return next(self._responses)
+from myagent.tooling import FunctionTool, ToolExecutionError, ToolRegistry
+from tests.fakes import FakeResponses, function_call, response
 
 
 class AgentLoopTests(unittest.TestCase):
@@ -65,6 +44,97 @@ class AgentLoopTests(unittest.TestCase):
         output = json.loads(responses.requests[1]["input"][-1]["output"])
         self.assertFalse(output["ok"])
         self.assertIn("Invalid tool arguments", output["error"])
+
+    def test_executes_every_function_call_in_one_response(self) -> None:
+        calls = [
+            function_call(call_id="call_1", arguments='{"command":"pwd"}'),
+            function_call(call_id="call_2", arguments='{"command":"ls"}'),
+        ]
+        responses = FakeResponses([response(calls), response([], "done")])
+        seen_commands = []
+        agent = AgentLoop(
+            SimpleNamespace(responses=responses),
+            bash_tool=lambda command: seen_commands.append(command)
+            or {"ok": True, "command": command},
+        )
+
+        self.assertEqual(agent.run("inspect"), "done")
+
+        self.assertEqual(seen_commands, ["pwd", "ls"])
+        outputs = responses.requests[1]["input"][-2:]
+        self.assertEqual(
+            [item["call_id"] for item in outputs],
+            ["call_1", "call_2"],
+        )
+
+    def test_reset_clears_history_before_the_next_user_turn(self) -> None:
+        responses = FakeResponses([response([], "first"), response([], "second")])
+        agent = AgentLoop(SimpleNamespace(responses=responses))
+
+        agent.run("one")
+        agent.reset()
+        agent.run("two")
+
+        self.assertEqual(
+            responses.requests[1]["input"],
+            [{"role": "user", "content": "two"}],
+        )
+
+    def test_empty_model_response_is_an_error(self) -> None:
+        agent = AgentLoop(
+            SimpleNamespace(responses=FakeResponses([response([], "  ")]))
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "neither tool calls nor text"):
+            agent.run("answer")
+
+    def test_expected_and_unexpected_tool_failures_are_returned_to_model(self) -> None:
+        def expected_failure() -> dict[str, object]:
+            raise ToolExecutionError("expected failure")
+
+        def unexpected_failure() -> dict[str, object]:
+            raise RuntimeError("unexpected failure")
+
+        registry = ToolRegistry(
+            [
+                FunctionTool(
+                    name="expected",
+                    description="Expected failure",
+                    parameters={"type": "object", "properties": {}},
+                    handler=expected_failure,
+                ),
+                FunctionTool(
+                    name="unexpected",
+                    description="Unexpected failure",
+                    parameters={"type": "object", "properties": {}},
+                    handler=unexpected_failure,
+                ),
+            ]
+        )
+        responses = FakeResponses(
+            [
+                response(
+                    [
+                        function_call("call_expected", "expected", "{}"),
+                        function_call("call_unexpected", "unexpected", "{}"),
+                    ]
+                ),
+                response([], "handled"),
+            ]
+        )
+        agent = AgentLoop(
+            SimpleNamespace(responses=responses),
+            tool_registry=registry,
+        )
+
+        self.assertEqual(agent.run("fail safely"), "handled")
+
+        expected, unexpected = responses.requests[1]["input"][-2:]
+        self.assertEqual(json.loads(expected["output"])["error"], "expected failure")
+        self.assertIn(
+            "unexpected tool failed: unexpected failure",
+            json.loads(unexpected["output"])["error"],
+        )
 
     def test_stops_before_tool_execution_at_limit(self) -> None:
         responses = FakeResponses([response([function_call()])])
@@ -115,7 +185,17 @@ class AgentLoopTests(unittest.TestCase):
         }
         self.assertEqual(
             tool_names,
-            {"bash", "read_file", "write_file", "edit_file", "glob", "grep"},
+            {
+                "bash",
+                "read_file",
+                "write_file",
+                "edit_file",
+                "glob",
+                "grep",
+                "update_todo_list",
+                "get_todo_list",
+                "record_todo_verification",
+            },
         )
         output = json.loads(responses.requests[1]["input"][-1]["output"])
         self.assertEqual(output["content"], "workspace note")

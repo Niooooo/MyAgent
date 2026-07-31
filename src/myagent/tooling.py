@@ -6,13 +6,22 @@ import inspect
 import json
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from typing import Any
+from types import MappingProxyType
+from typing import Any, Protocol
 
-from .permissions import PermissionLevel, PermissionManager
+from .hooks import HookExecutionError, HookRegistry, PostToolUse, PreToolUse
 
 
 ToolResult = dict[str, Any]
 ToolHandler = Callable[..., ToolResult]
+
+
+class ToolAccessControl(Protocol):
+    """Compatibility interface for access controls attached to a registry."""
+
+    def is_tool_allowed(self, tool_name: str) -> bool: ...
+
+    def __call__(self, event: PreToolUse) -> None: ...
 
 
 class ToolExecutionError(RuntimeError):
@@ -48,10 +57,26 @@ class ToolRegistry:
         self,
         tools: Iterable[FunctionTool] = (),
         *,
-        permission_manager: PermissionManager | None = None,
+        tool_visibility: Callable[[str], bool] | None = None,
+        hooks: HookRegistry | None = None,
+        permission_manager: ToolAccessControl | None = None,
     ) -> None:
         self._tools: dict[str, FunctionTool] = {}
+        if tool_visibility is not None and permission_manager is not None:
+            raise ValueError(
+                "Pass either tool_visibility or legacy permission_manager, not both"
+            )
+        self._tool_visibility = tool_visibility
+        # Keep the attribute and parameter as a migration layer for existing callers.
         self.permission_manager = permission_manager
+        self.hooks = hooks or HookRegistry()
+        if permission_manager is not None:
+            self._tool_visibility = permission_manager.is_tool_allowed
+            self.hooks.register(
+                PreToolUse,
+                permission_manager,
+                prepend=True,
+            )
         for tool in tools:
             self.register(tool)
 
@@ -61,8 +86,7 @@ class ToolRegistry:
         return [
             tool.definition
             for tool in self._tools.values()
-            if self.permission_manager is None
-            or self.permission_manager.is_tool_allowed(tool.name)
+            if self._tool_visibility is None or self._tool_visibility(tool.name)
         ]
 
     def register(self, tool: FunctionTool) -> None:
@@ -71,7 +95,13 @@ class ToolRegistry:
             raise ValueError(f"Tool already registered: {tool.name}")
         self._tools[tool.name] = tool
 
-    def execute(self, name: str, raw_arguments: str) -> ToolResult:
+    def execute(
+        self,
+        name: str,
+        raw_arguments: str,
+        *,
+        call_id: str | None = None,
+    ) -> ToolResult:
         """Decode arguments, call a tool, and keep failures in-band."""
         tool = self._tools.get(name)
         if tool is None:
@@ -96,25 +126,66 @@ class ToolRegistry:
                 "error": f"Invalid arguments for {name}: {exc}",
             }
 
-        if self.permission_manager is not None:
-            decision = self.permission_manager.authorize(name, arguments)
-            if decision.level is PermissionLevel.DENY:
-                return {
-                    "ok": False,
-                    "error": f"Permission denied: {decision.reason}",
-                    "permission": "denied",
-                }
+        readonly_arguments = MappingProxyType(arguments)
+        before = PreToolUse(name, readonly_arguments, call_id)
+        pre_tool_result = self._emit_pre_tool_use(before)
+        if pre_tool_result is not None:
+            return pre_tool_result
 
+        result = self._invoke_handler(tool, arguments)
+        after = PostToolUse(name, readonly_arguments, result, call_id)
+        return self._emit_post_tool_use(after)
+
+    def _emit_pre_tool_use(self, event: PreToolUse) -> ToolResult | None:
+        try:
+            self.hooks.emit(event)
+        except HookExecutionError as exc:
+            return {
+                "ok": False,
+                "error": str(exc),
+                "hook": "PreToolUse",
+            }
+        if event.denial_reason is None:
+            return None
+        if event.denial_result is not None:
+            return event.denial_result
+        return {
+            "ok": False,
+            "error": f"PreToolUse denied: {event.denial_reason}",
+            "hook": "PreToolUse",
+        }
+
+    @staticmethod
+    def _invoke_handler(
+        tool: FunctionTool,
+        arguments: dict[str, Any],
+    ) -> ToolResult:
         try:
             result = tool.handler(**arguments)
         except ToolExecutionError as exc:
             return {"ok": False, "error": str(exc)}
-        except Exception as exc:  # Keep unexpected tool failures in the agent loop.
-            return {"ok": False, "error": f"{name} tool failed: {exc}"}
+        except Exception as exc:  # Keep unexpected failures inside the loop.
+            return {"ok": False, "error": f"{tool.name} tool failed: {exc}"}
+        if isinstance(result, dict):
+            return result
+        return {
+            "ok": False,
+            "error": f"{tool.name} tool returned a non-object result",
+        }
 
-        if not isinstance(result, dict):
+    def _emit_post_tool_use(self, event: PostToolUse) -> ToolResult:
+        try:
+            self.hooks.emit(event)
+        except HookExecutionError as exc:
             return {
                 "ok": False,
-                "error": f"{name} tool returned a non-object result",
+                "error": str(exc),
+                "hook": "PostToolUse",
             }
-        return result
+        if isinstance(event.result, dict):
+            return event.result
+        return {
+            "ok": False,
+            "error": "PostToolUse hook returned a non-object result",
+            "hook": "PostToolUse",
+        }

@@ -8,16 +8,17 @@ import os
 import sys
 
 from .agent import AgentLoop, AgentLoopLimitError
+from .composition import AgentConfig, create_default_agent
 from .permissions import ApprovalRequest
-from .tools import BashTool
 
 
 def build_parser() -> argparse.ArgumentParser:
+    defaults = AgentConfig()
     parser = argparse.ArgumentParser(description="Run the MyAgent CLI")
     parser.add_argument("prompt", nargs="*", help="Run one task and exit")
     parser.add_argument(
         "--model",
-        default=os.getenv("OPENAI_MODEL", "gpt-5.6-sol"),
+        default=os.getenv("OPENAI_MODEL", defaults.model),
         help="OpenAI model ID (default: %(default)s)",
     )
     return parser
@@ -29,17 +30,9 @@ def main() -> None:
     # Import lazily so local unit tests for the loop and tools do not require the SDK.
     from openai import OpenAI
 
-    try:
-        max_tool_rounds = int(os.getenv("AGENT_MAX_TOOL_ROUNDS", "10"))
-        bash_timeout = int(os.getenv("BASH_TIMEOUT_SECONDS", "30"))
-    except ValueError as exc:
-        raise SystemExit(f"Invalid numeric environment variable: {exc}") from exc
-
-    agent = AgentLoop(
+    agent = create_default_agent(
         OpenAI(),
-        model=args.model,
-        max_tool_rounds=max_tool_rounds,
-        bash_tool=BashTool(timeout_seconds=bash_timeout),
+        config=_config_from_environment(args.model),
         approval_callback=_ask_user_approval,
     )
 
@@ -71,6 +64,28 @@ def _run_turn(agent: AgentLoop, user_input: str) -> None:
         print(f"request failed: {exc}", file=sys.stderr)
     else:
         print(f"agent> {answer}")
+
+
+def _config_from_environment(model: str) -> AgentConfig:
+    defaults = AgentConfig(model=model)
+    try:
+        return AgentConfig(
+            model=model,
+            max_tool_rounds=int(
+                os.getenv("AGENT_MAX_TOOL_ROUNDS", str(defaults.max_tool_rounds))
+            ),
+            bash_timeout_seconds=int(
+                os.getenv("BASH_TIMEOUT_SECONDS", str(defaults.bash_timeout_seconds))
+            ),
+            todo_reminder_tool_calls=int(
+                os.getenv(
+                    "TODO_REMINDER_TOOL_CALLS",
+                    str(defaults.todo_reminder_tool_calls),
+                )
+            ),
+        )
+    except ValueError as exc:
+        raise SystemExit(f"Invalid numeric environment variable: {exc}") from exc
 
 
 def _ask_user_approval(request: ApprovalRequest) -> bool:

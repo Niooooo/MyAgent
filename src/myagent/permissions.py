@@ -10,9 +10,21 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Protocol
 
+from .hooks import PreToolUse
+
 
 DEFAULT_TOOL_ALLOWLIST = frozenset(
-    {"bash", "read_file", "write_file", "edit_file", "glob", "grep"}
+    {
+        "bash",
+        "read_file",
+        "write_file",
+        "edit_file",
+        "glob",
+        "grep",
+        "update_todo_list",
+        "get_todo_list",
+        "record_todo_verification",
+    }
 )
 
 _SENSITIVE_FILE_TOOLS = {
@@ -302,6 +314,10 @@ class PermissionManager:
     def is_tool_allowed(self, tool_name: str) -> bool:
         return self.policy.is_tool_allowed(tool_name)
 
+    def __call__(self, event: PreToolUse) -> None:
+        """Keep legacy registry injection working through the Hook interface."""
+        _apply_permission_decision(self, event)
+
     def authorize(
         self,
         tool_name: str,
@@ -332,4 +348,34 @@ class PermissionManager:
         return PermissionDecision(
             PermissionLevel.DENY,
             f"{decision.reason}; the user did not approve this operation",
+        )
+
+
+class PermissionHook:
+    """Apply a ``PermissionManager`` as the built-in ``PreToolUse`` hook."""
+
+    def __init__(self, manager: PermissionManager) -> None:
+        self.manager = manager
+
+    def is_tool_allowed(self, tool_name: str) -> bool:
+        """Expose the same visibility rule used by execution authorization."""
+        return self.manager.is_tool_allowed(tool_name)
+
+    def __call__(self, event: PreToolUse) -> None:
+        _apply_permission_decision(self.manager, event)
+
+
+def _apply_permission_decision(
+    manager: PermissionManager,
+    event: PreToolUse,
+) -> None:
+    decision = manager.authorize(event.tool_name, event.arguments)
+    if decision.level is PermissionLevel.DENY:
+        event.deny(
+            decision.reason,
+            result={
+                "ok": False,
+                "error": f"Permission denied: {decision.reason}",
+                "permission": "denied",
+            },
         )
