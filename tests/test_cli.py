@@ -31,6 +31,8 @@ class EnvironmentConfigTests(unittest.TestCase):
             "AGENT_MAX_TOOL_ROUNDS": "7",
             "BASH_TIMEOUT_SECONDS": "11",
             "TODO_REMINDER_TOOL_CALLS": "3",
+            "SUBAGENT_MAX_WORKERS": "2",
+            "SUBAGENT_MAX_TASKS": "9",
         },
         clear=True,
     )
@@ -41,6 +43,8 @@ class EnvironmentConfigTests(unittest.TestCase):
         self.assertEqual(config.max_tool_rounds, 7)
         self.assertEqual(config.bash_timeout_seconds, 11)
         self.assertEqual(config.todo_reminder_tool_calls, 3)
+        self.assertEqual(config.subagent_max_workers, 2)
+        self.assertEqual(config.subagent_max_tasks, 9)
 
     @patch.dict("os.environ", {"AGENT_MAX_TOOL_ROUNDS": "invalid"}, clear=True)
     def test_invalid_numeric_environment_variable_is_reported(self) -> None:

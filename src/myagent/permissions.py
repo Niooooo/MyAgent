@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .hooks import PreToolUse
+from .subagents import SUBAGENT_TOOL_NAMES
 
 
 DEFAULT_TOOL_ALLOWLIST = frozenset(
@@ -24,6 +25,7 @@ DEFAULT_TOOL_ALLOWLIST = frozenset(
         "update_todo_list",
         "get_todo_list",
         "record_todo_verification",
+        *SUBAGENT_TOOL_NAMES,
     }
 )
 

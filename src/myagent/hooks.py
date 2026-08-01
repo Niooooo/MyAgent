@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
+from threading import RLock
 from typing import Any, TypeAlias
 
 
@@ -123,10 +124,11 @@ class HookRejectedError(RuntimeError):
 class HookRegistry:
     """Register and emit the four lifecycle hook types in stable order."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, _execution_lock: Any | None = None) -> None:
         self._handlers: dict[HookEventType, list[HookHandler]] = {
             event_type: [] for event_type in _EVENT_TYPES
         }
+        self._execution_lock = _execution_lock or RLock()
 
     def register(
         self,
@@ -140,17 +142,33 @@ class HookRegistry:
             raise ValueError(f"Unsupported hook event: {event_type!r}")
         if not callable(handler):
             raise TypeError("hook handler must be callable")
-        if prepend:
-            self._handlers[event_type].insert(0, handler)
-        else:
-            self._handlers[event_type].append(handler)
+        with self._execution_lock:
+            if prepend:
+                self._handlers[event_type].insert(0, handler)
+            else:
+                self._handlers[event_type].append(handler)
         return handler
 
     def handlers_for(self, event_type: HookEventType) -> tuple[HookHandler, ...]:
         """Return an immutable snapshot of handlers for introspection and tests."""
         if event_type not in self._handlers:
             raise ValueError(f"Unsupported hook event: {event_type!r}")
-        return tuple(self._handlers[event_type])
+        with self._execution_lock:
+            return tuple(self._handlers[event_type])
+
+    def clone(self) -> HookRegistry:
+        """Copy registrations while sharing the serialized execution boundary.
+
+        Runtime composition uses this to give a child agent its own registry and
+        built-in Hook state without concurrently invoking shared user handlers.
+        """
+        with self._execution_lock:
+            cloned = HookRegistry(_execution_lock=self._execution_lock)
+            cloned._handlers = {
+                event_type: list(handlers)
+                for event_type, handlers in self._handlers.items()
+            }
+        return cloned
 
     def emit(self, event: HookEvent) -> None:
         """Run every handler for an event, wrapping unexpected failures."""
@@ -158,11 +176,20 @@ class HookRegistry:
         if event_type not in self._handlers:
             raise ValueError(f"Unsupported hook event: {event_type!r}")
 
-        for handler in tuple(self._handlers[event_type]):
-            try:
-                handler(event)
-            except HookExecutionError:
-                raise
-            except Exception as exc:
-                handler_name = getattr(handler, "__qualname__", type(handler).__name__)
-                raise HookExecutionError(event_type.__name__, handler_name, exc) from exc
+        with self._execution_lock:
+            for handler in tuple(self._handlers[event_type]):
+                try:
+                    handler(event)
+                except HookExecutionError:
+                    raise
+                except Exception as exc:
+                    handler_name = getattr(
+                        handler,
+                        "__qualname__",
+                        type(handler).__name__,
+                    )
+                    raise HookExecutionError(
+                        event_type.__name__,
+                        handler_name,
+                        exc,
+                    ) from exc

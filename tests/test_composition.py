@@ -56,6 +56,37 @@ class DefaultCompositionTests(unittest.TestCase):
         self.assertIs(agent.hooks, hooks)
         self.assertIs(agent.tool_registry.hooks, hooks)
         self.assertIsNotNone(agent.todo_list)
+        agent.close()
+
+    def test_agent_config_allowlist_can_disable_subagent_tools(self) -> None:
+        agent = create_default_agent(
+            SimpleNamespace(responses=SimpleNamespace()),
+            config=AgentConfig(allowed_tools=frozenset({"read_file"})),
+        )
+        self.addCleanup(agent.close)
+
+        visible = {
+            definition["name"] for definition in agent.tool_registry.definitions
+        }
+        forged = agent.tool_registry.execute(
+            "fork_subagent",
+            '{"task":"not allowed"}',
+        )
+
+        self.assertEqual(visible, {"read_file"})
+        self.assertEqual(forged["permission"], "denied")
+
+    def test_agent_close_shuts_down_subagent_management(self) -> None:
+        agent = create_default_agent(
+            SimpleNamespace(responses=SimpleNamespace()),
+        )
+        registry = agent.tool_registry
+
+        agent.close()
+        result = registry.execute("fork_subagent", '{"task":"too late"}')
+
+        self.assertEqual(result["status"], "closed")
+        self.assertEqual(result["code"], "manager_closed")
 
 
 if __name__ == "__main__":

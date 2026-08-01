@@ -35,24 +35,26 @@ def main() -> None:
         config=_config_from_environment(args.model),
         approval_callback=_ask_user_approval,
     )
-
-    if args.prompt:
-        _run_turn(agent, " ".join(args.prompt))
-        return
-
-    print(f"MyAgent ({args.model}). Type 'exit' or 'quit' to leave.")
-    while True:
-        try:
-            user_input = input("you> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
+    try:
+        if args.prompt:
+            _run_turn(agent, " ".join(args.prompt))
             return
 
-        if user_input.lower() in {"exit", "quit"}:
-            return
-        if not user_input:
-            continue
-        _run_turn(agent, user_input)
+        print(f"MyAgent ({args.model}). Type 'exit' or 'quit' to leave.")
+        while True:
+            try:
+                user_input = input("you> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return
+
+            if user_input.lower() in {"exit", "quit"}:
+                return
+            if not user_input:
+                continue
+            _run_turn(agent, user_input)
+    finally:
+        agent.close()
 
 
 def _run_turn(agent: AgentLoop, user_input: str) -> None:
@@ -81,6 +83,18 @@ def _config_from_environment(model: str) -> AgentConfig:
                 os.getenv(
                     "TODO_REMINDER_TOOL_CALLS",
                     str(defaults.todo_reminder_tool_calls),
+                )
+            ),
+            subagent_max_workers=int(
+                os.getenv(
+                    "SUBAGENT_MAX_WORKERS",
+                    str(defaults.subagent_max_workers),
+                )
+            ),
+            subagent_max_tasks=int(
+                os.getenv(
+                    "SUBAGENT_MAX_TASKS",
+                    str(defaults.subagent_max_tasks),
                 )
             ),
         )

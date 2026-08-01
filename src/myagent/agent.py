@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable, Iterable, Sequence
 from os import PathLike
+from threading import Lock
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from .hooks import (
@@ -92,6 +93,7 @@ class AgentLoop:
         hooks: HookRegistry | None = None,
         todo_list: TodoList | None = None,
         todo_reminder_tool_calls: int | None = None,
+        close_callback: Callable[[], None] | None = None,
     ) -> None:
         if max_tool_rounds < 0:
             raise ValueError("max_tool_rounds must be non-negative")
@@ -115,6 +117,9 @@ class AgentLoop:
         self.instructions = instructions
         self.max_tool_rounds = max_tool_rounds
         self.history: list[object] = []
+        self._close_callback = close_callback
+        self._close_lock = Lock()
+        self._closed = False
         if tool_registry is not None:
             if hooks is not None and tool_registry.hooks is not hooks:
                 raise ValueError(
@@ -128,6 +133,7 @@ class AgentLoop:
             from .composition import build_default_components
 
             components = build_default_components(
+                client=client,
                 cwd=workspace_root,
                 bash_tool=bash_tool,
                 allowed_tools=None if allowed_tools is None else set(allowed_tools),
@@ -135,9 +141,14 @@ class AgentLoop:
                 hooks=hooks,
                 todo_list=todo_list,
                 todo_reminder_tool_calls=todo_reminder_tool_calls,
+                model=model,
+                instructions=instructions,
+                max_tool_rounds=max_tool_rounds,
             )
             self.todo_list = components.todo_list
             self.tool_registry = components.tool_registry
+            if self._close_callback is None:
+                self._close_callback = components.close
         self.hooks = self.tool_registry.hooks
 
     def run(self, user_input: str) -> str:
@@ -177,6 +188,16 @@ class AgentLoop:
     def reset(self) -> None:
         """Clear the in-memory conversation history."""
         self.history.clear()
+
+    def close(self) -> None:
+        """Release resources attached by the runtime composition root."""
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+            callback = self._close_callback
+        if callback is not None:
+            callback()
 
     def _submit_user_input(self, user_input: str) -> None:
         if not isinstance(user_input, str):
