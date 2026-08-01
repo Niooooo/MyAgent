@@ -195,6 +195,9 @@ class AgentLoopTests(unittest.TestCase):
                 "update_todo_list",
                 "get_todo_list",
                 "record_todo_verification",
+                "run_subagent",
+                "fork_subagent",
+                "collect_subagent",
             },
         )
         output = json.loads(responses.requests[1]["input"][-1]["output"])

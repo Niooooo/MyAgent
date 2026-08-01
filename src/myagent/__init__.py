@@ -25,6 +25,7 @@ from .permissions import (
     PermissionHook,
     PermissionPolicy,
 )
+from .subagents import SubAgentManager
 from .todo import TodoItem, TodoList, TodoReminder, TodoStatus
 from .tooling import FunctionTool, ToolRegistry
 
@@ -48,6 +49,7 @@ __all__ = [
     "PreToolUse",
     "Stop",
     "StopReason",
+    "SubAgentManager",
     "ToolRegistry",
     "TodoItem",
     "TodoList",

@@ -24,7 +24,9 @@ composition.create_default_agent
         |-- ToolRegistry <---- HookRegistry
         |       |              |-- PermissionHook（首个 PreToolUse）
         |       |              `-- TodoReminder
-        |       `-- Bash / Filesystem / TODO FunctionTools
+        |       `-- Bash / Filesystem / TODO / SubAgent FunctionTools
+        |-- SubAgentManager（有界 ThreadPoolExecutor）
+        |       `-- 新 AgentLoop -> 不含 SubAgent tools 的新 Registry
         `-- TodoList（每个 Agent 实例独立）
 ```
 
@@ -48,6 +50,7 @@ AgentLoop -> Responses API -> function_call
 | `tools.py` | Bash schema、Bash 执行和永久拒绝的纵深检查 |
 | `filesystem.py` | 工作区内文件读写、精确编辑、Glob/Grep、安全路径解析及对应 schemas |
 | `todo.py` | 实例级 TODO 状态、版本化验证、TODO tools 和 Hook 驱动提醒 |
+| `subagents.py` | 同步子 Agent、后台 Fork、结果状态/收取、有界并发和 executor 关闭 |
 
 应用入口推荐使用 `create_default_agent(client, config=AgentConfig(...))`。现有的 `AgentLoop(client, bash_tool=..., workspace_root=..., ...)` 构造方式与 `myagent.tools.build_default_tool_registry` 导入路径仍作为兼容入口保留；它们最终也委托给同一个 composition root。
 
@@ -64,8 +67,47 @@ AgentLoop -> Responses API -> function_call
 | `update_todo_list` | 创建或整体更新全局 TODO List |
 | `get_todo_list` | 读取 TODO List 与验证状态 |
 | `record_todo_verification` | 在实际验证后记录具体证据 |
+| `run_subagent` | 阻塞运行一个全新的子 Agent，只返回最终文本 |
+| `fork_subagent` | 在有界后台线程池启动独立子 Agent，立即返回 `fork_id` |
+| `collect_subagent` | 轮询或限时等待 Fork；终态结果只可收取一次 |
 
 文件类工具统一限制在启动 `myagent` 时的工作目录内。工具定义、权限检查和执行都经过 `ToolRegistry` 的唯一入口；新增工具时只需提供 schema 与 handler，不需要继续扩展 Agent Loop 的条件分支。
+
+## 子 Agent：同步调用与后台 Fork
+
+主 Agent 可以按任务性质选择同步或后台执行。同步工具会等待一个全新的子 Agent 完成：
+
+```json
+{"task": "检查 src/myagent/tooling.py 的错误边界并给出结论"}
+```
+
+`run_subagent` 成功时只返回：
+
+```json
+{"ok": true, "output": "子 Agent 的最终回答"}
+```
+
+后台任务分两步。先调用 `fork_subagent`：
+
+```json
+{"task": "独立审阅测试覆盖并列出遗漏"}
+```
+
+它会立即返回不可预测的 `fork_id` 和 `status=running`。随后调用：
+
+```json
+{"fork_id": "返回的 fork_id", "wait": true, "timeout_seconds": 30}
+```
+
+`collect_subagent` 在任务未完成时返回 `running`；等待超时会返回 `code=timeout`，但不会取消仍在运行的任务；完成时返回 `status=completed` 和唯一的 `output` 文本；失败只返回有界错误摘要。终态只可收取一次，再次收取会得到 `status=cleaned`，从未存在的 ID 则为 `status=unknown`。
+
+每次同步调用和 Fork 都创建新的 `AgentLoop`、history、`ToolRegistry`、`PermissionManager`、`TodoList` 和 `TodoReminder`。子 Agent 不继承主 Agent 或其他子 Agent 的对话 history，只接收显式 `task`。其 reasoning、Responses `output`、工具参数、中间结果和完整 history 不会进入管理器记录或主 Agent history；成功边界只保留最终文本。
+
+子 Agent 的普通工具仍完整经过 JSON/签名校验、首个 `PermissionHook`、其他 `PreToolUse`、handler 和 `PostToolUse`，并保留原始 `call_id`。它自身也会触发 `UserPromptSubmit` 和 `Stop`。但三种 SubAgent 管理工具不会注册到子 Registry：schemas 中不可见，伪造 `function_call` 也只会得到 `Unknown tool`，因此不能递归委派。自定义 `allowed_tools` 会先应用，再额外排除整个管理工具族。
+
+后台执行默认最多 4 个 worker，并最多保留 16 个尚未收取的 Fork 记录；达到记录上限后必须先收取终态任务。共享的用户 Hook 和终端逐次审批通过 Hook 执行锁串行化，避免多个后台线程的 `input()` 交错；注入的 Bash handler 也会被串行保护。默认运行时不会自动批准任何敏感调用。
+
+程序化使用结束后应调用 `agent.close()`；CLI 的所有退出路径都会自动调用它。关闭过程拒绝新任务、取消尚未启动的 Future、等待正在执行的子 Agent 收尾，并清理内存状态，因此进程退出可能等待已开始的 API 请求或工具调用完成。TODO、Fork 状态和已收取标记都只保存在当前进程内，重启后不会恢复。
 
 ## 生命周期 Hooks
 
@@ -176,6 +218,8 @@ myagent "列出当前目录中的 Python 文件"
 - `AGENT_MAX_TOOL_ROUNDS`：默认 `10`
 - `BASH_TIMEOUT_SECONDS`：默认 `30`
 - `TODO_REMINDER_TOOL_CALLS`：TODO List 长时间未更新提醒阈值，默认 `4`
+- `SUBAGENT_MAX_WORKERS`：同步与 Fork 共用的最大子 Agent worker 数，默认 `4`
+- `SUBAGENT_MAX_TASKS`：尚未收取的 Fork 记录上限，默认 `16`
 
 交互模式中的 `exit`、`quit` 或 `Ctrl-D` 会退出程序。
 
