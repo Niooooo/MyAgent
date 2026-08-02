@@ -8,7 +8,13 @@ from dataclasses import dataclass, field
 from threading import Lock
 from typing import Any
 
-from .agent import DEFAULT_INSTRUCTIONS, DEFAULT_MODEL, AgentLoop, ResponsesClient
+from .agent import (
+    DEFAULT_INSTRUCTIONS,
+    DEFAULT_MODEL,
+    AgentLoop,
+    InstructionsProvider,
+    ResponsesClient,
+)
 from .filesystem import WorkspaceFiles, filesystem_tools
 from .hooks import HookRegistry, PreToolUse
 from .permissions import (
@@ -18,6 +24,7 @@ from .permissions import (
     PermissionHook,
     PermissionManager,
 )
+from .skills import LOAD_SKILL_TOOL, SkillStore, render_skill_catalog, skill_tools
 from .subagents import (
     DEFAULT_SUBAGENT_MAX_TASKS,
     DEFAULT_SUBAGENT_MAX_WORKERS,
@@ -68,6 +75,8 @@ class DefaultAgentComponents:
     tool_registry: ToolRegistry
     hooks: HookRegistry
     todo_list: TodoList
+    skill_store: SkillStore | None = None
+    instructions_provider: InstructionsProvider | None = None
     _close_callback: Callable[[], None] = field(
         default=_noop,
         repr=False,
@@ -107,12 +116,16 @@ def build_default_components(
     max_tool_rounds: int = 10,
     subagent_max_workers: int = DEFAULT_SUBAGENT_MAX_WORKERS,
     subagent_max_tasks: int = DEFAULT_SUBAGENT_MAX_TASKS,
+    skill_store: SkillStore | None = None,
 ) -> DefaultAgentComponents:
     """Create and connect the standard tools, policies, state, and hooks."""
     if max_tool_rounds < 0:
         raise ValueError("max_tool_rounds must be non-negative")
 
     workspace_root = WorkspaceFiles(cwd).root
+    if skill_store is not None and skill_store.workspace_root != workspace_root:
+        raise ValueError("skill_store must use the configured workspace root")
+    shared_skill_store = skill_store or SkillStore(workspace_root)
     hook_registry = hooks if hooks is not None else HookRegistry()
     child_hook_template = hook_registry.clone()
     reminder_interval = (
@@ -146,6 +159,7 @@ def build_default_components(
                 hooks=child_hook_template.clone(),
                 todo_list=TodoList(),
                 todo_reminder_tool_calls=reminder_interval,
+                skill_store=shared_skill_store,
             )
             child = AgentLoop(
                 client,
@@ -154,8 +168,10 @@ def build_default_components(
                 max_tool_rounds=max_tool_rounds,
                 tool_registry=child_components.tool_registry,
                 hooks=child_components.hooks,
+                instructions_provider=child_components.instructions_provider,
             )
             child.todo_list = child_components.todo_list
+            child.skill_store = child_components.skill_store
             return child
 
         manager = SubAgentManager(
@@ -174,6 +190,7 @@ def build_default_components(
             hooks=hook_registry,
             todo_list=todo_list if todo_list is not None else TodoList(),
             todo_reminder_tool_calls=reminder_interval,
+            skill_store=shared_skill_store,
             additional_tools=management_tools,
         )
     except BaseException:
@@ -187,6 +204,8 @@ def build_default_components(
         tool_registry=components.tool_registry,
         hooks=components.hooks,
         todo_list=components.todo_list,
+        skill_store=components.skill_store,
+        instructions_provider=components.instructions_provider,
         _close_callback=manager.close,
     )
 
@@ -200,6 +219,7 @@ def _build_standard_components(
     hooks: HookRegistry,
     todo_list: TodoList,
     todo_reminder_tool_calls: int,
+    skill_store: SkillStore,
     additional_tools: Iterable[FunctionTool] = (),
 ) -> DefaultAgentComponents:
     """Build one isolated ordinary capability set and its guarded registry."""
@@ -220,6 +240,7 @@ def _build_standard_components(
             build_bash_function_tool(bash_handler),
             *filesystem_tools(workspace),
             *todo_tools(todo_list),
+            *skill_tools(skill_store),
             *additional_tools,
         ],
         tool_visibility=permission_hook.is_tool_allowed,
@@ -228,11 +249,23 @@ def _build_standard_components(
     # Preserve the existing introspection attribute without making ToolRegistry
     # responsible for constructing or understanding the concrete permission type.
     tool_registry.permission_manager = permissions
+    instructions_provider = None
+    if permission_hook.is_tool_allowed(LOAD_SKILL_TOOL):
+        instructions_provider = _skill_catalog_provider(skill_store)
     return DefaultAgentComponents(
         tool_registry=tool_registry,
         hooks=hooks,
         todo_list=todo_list,
+        skill_store=skill_store,
+        instructions_provider=instructions_provider,
     )
+
+
+def _skill_catalog_provider(store: SkillStore) -> InstructionsProvider:
+    def provide() -> str:
+        return render_skill_catalog(store.catalog())
+
+    return provide
 
 
 def _split_allowed_tools(
@@ -295,8 +328,10 @@ def create_default_agent(
         max_tool_rounds=selected.max_tool_rounds,
         tool_registry=components.tool_registry,
         hooks=components.hooks,
+        instructions_provider=components.instructions_provider,
         close_callback=components.close,
     )
     # Keep the state discoverable on the public AgentLoop compatibility surface.
     agent.todo_list = components.todo_list
+    agent.skill_store = components.skill_store
     return agent

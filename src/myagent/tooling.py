@@ -105,16 +105,25 @@ class ToolRegistry:
         """Decode arguments, call a tool, and keep failures in-band."""
         tool = self._tools.get(name)
         if tool is None:
-            return {"ok": False, "error": f"Unknown tool: {name}"}
+            return {
+                "ok": False,
+                "code": "unknown_tool",
+                "error": f"Unknown tool: {name}",
+            }
 
         try:
             arguments = json.loads(raw_arguments)
         except (TypeError, json.JSONDecodeError) as exc:
-            return {"ok": False, "error": f"Invalid tool arguments: {exc}"}
+            return {
+                "ok": False,
+                "code": "invalid_tool_arguments",
+                "error": f"Invalid tool arguments: {exc}",
+            }
 
         if not isinstance(arguments, dict):
             return {
                 "ok": False,
+                "code": "invalid_tool_arguments",
                 "error": "Invalid tool arguments: expected a JSON object",
             }
 
@@ -123,6 +132,7 @@ class ToolRegistry:
         except TypeError as exc:
             return {
                 "ok": False,
+                "code": "invalid_tool_arguments",
                 "error": f"Invalid arguments for {name}: {exc}",
             }
 
@@ -142,6 +152,7 @@ class ToolRegistry:
         except HookExecutionError as exc:
             return {
                 "ok": False,
+                "code": "pre_tool_hook_failed",
                 "error": str(exc),
                 "hook": "PreToolUse",
             }
@@ -151,6 +162,7 @@ class ToolRegistry:
             return event.denial_result
         return {
             "ok": False,
+            "code": "pre_tool_denied",
             "error": f"PreToolUse denied: {event.denial_reason}",
             "hook": "PreToolUse",
         }
@@ -163,13 +175,22 @@ class ToolRegistry:
         try:
             result = tool.handler(**arguments)
         except ToolExecutionError as exc:
-            return {"ok": False, "error": str(exc)}
+            return {
+                "ok": False,
+                "code": "tool_execution_error",
+                "error": str(exc),
+            }
         except Exception as exc:  # Keep unexpected failures inside the loop.
-            return {"ok": False, "error": f"{tool.name} tool failed: {exc}"}
+            return {
+                "ok": False,
+                "code": "tool_execution_failed",
+                "error": f"{tool.name} tool failed: {exc}",
+            }
         if isinstance(result, dict):
             return result
         return {
             "ok": False,
+            "code": "invalid_tool_result",
             "error": f"{tool.name} tool returned a non-object result",
         }
 
@@ -179,6 +200,7 @@ class ToolRegistry:
         except HookExecutionError as exc:
             return {
                 "ok": False,
+                "code": "post_tool_hook_failed",
                 "error": str(exc),
                 "hook": "PostToolUse",
             }
@@ -186,6 +208,7 @@ class ToolRegistry:
             return event.result
         return {
             "ok": False,
+            "code": "invalid_post_tool_result",
             "error": "PostToolUse hook returned a non-object result",
             "hook": "PostToolUse",
         }

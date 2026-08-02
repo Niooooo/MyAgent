@@ -20,6 +20,7 @@ from .tooling import ToolRegistry, ToolResult
 
 if TYPE_CHECKING:
     from .permissions import ApprovalCallback
+    from .skills import SkillStore
     from .todo import TodoList
 
 
@@ -33,6 +34,8 @@ Do not claim all TODO items are finished until relevant checks have run and thei
 evidence has been recorded with record_todo_verification.
 """
 DEFAULT_MODEL = "gpt-5.6-sol"
+
+InstructionsProvider = Callable[[], str]
 
 
 class AgentLoopLimitError(RuntimeError):
@@ -84,6 +87,7 @@ class AgentLoop:
         *,
         model: str = DEFAULT_MODEL,
         instructions: str = DEFAULT_INSTRUCTIONS,
+        instructions_provider: InstructionsProvider | None = None,
         max_tool_rounds: int = 10,
         bash_tool: Callable[[str], dict[str, Any]] | None = None,
         tool_registry: ToolRegistry | None = None,
@@ -97,6 +101,8 @@ class AgentLoop:
     ) -> None:
         if max_tool_rounds < 0:
             raise ValueError("max_tool_rounds must be non-negative")
+        if instructions_provider is not None and not callable(instructions_provider):
+            raise TypeError("instructions_provider must be callable")
         if tool_registry is not None and any(
             value is not None
             for value in (
@@ -115,11 +121,13 @@ class AgentLoop:
         self.client = client
         self.model = model
         self.instructions = instructions
+        self.instructions_provider = instructions_provider
         self.max_tool_rounds = max_tool_rounds
         self.history: list[object] = []
         self._close_callback = close_callback
         self._close_lock = Lock()
         self._closed = False
+        self.skill_store: SkillStore | None = None
         if tool_registry is not None:
             if hooks is not None and tool_registry.hooks is not hooks:
                 raise ValueError(
@@ -146,7 +154,12 @@ class AgentLoop:
                 max_tool_rounds=max_tool_rounds,
             )
             self.todo_list = components.todo_list
+            self.skill_store = components.skill_store
             self.tool_registry = components.tool_registry
+            self.instructions_provider = _combine_instructions_providers(
+                self.instructions_provider,
+                components.instructions_provider,
+            )
             if self._close_callback is None:
                 self._close_callback = components.close
         self.hooks = self.tool_registry.hooks
@@ -217,10 +230,21 @@ class AgentLoop:
     def _request_response(self) -> ModelResponse:
         return self.client.responses.create(
             model=self.model,
-            instructions=self.instructions,
+            instructions=self._effective_instructions(),
             tools=self.tool_registry.definitions,
             input=self.history,
         )
+
+    def _effective_instructions(self) -> str:
+        provider = self.instructions_provider
+        if provider is None:
+            return self.instructions
+        dynamic_instructions = provider()
+        if not isinstance(dynamic_instructions, str):
+            raise TypeError("instructions_provider must return a string")
+        if not dynamic_instructions.strip():
+            return self.instructions
+        return f"{self.instructions}\n\n{dynamic_instructions}"
 
     def _record_response(
         self,
@@ -274,3 +298,25 @@ class AgentLoop:
                 raise
             if hasattr(failure, "add_note"):
                 failure.add_note(f"A Stop hook also failed: {exc}")
+
+
+def _combine_instructions_providers(
+    *providers: InstructionsProvider | None,
+) -> InstructionsProvider | None:
+    selected = tuple(provider for provider in providers if provider is not None)
+    if not selected:
+        return None
+    if len(selected) == 1:
+        return selected[0]
+
+    def combined() -> str:
+        fragments: list[str] = []
+        for provider in selected:
+            fragment = provider()
+            if not isinstance(fragment, str):
+                raise TypeError("instructions_provider must return a string")
+            if fragment.strip():
+                fragments.append(fragment)
+        return "\n\n".join(fragments)
+
+    return combined
