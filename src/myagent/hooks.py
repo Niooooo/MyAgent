@@ -42,6 +42,8 @@ class PreToolUse:
     call_id: str | None = None
     denial_reason: str | None = field(default=None, init=False)
     denial_result: dict[str, Any] | None = field(default=None, init=False)
+    permission_level: str | None = field(default=None, init=False)
+    permission_reason: str | None = field(default=None, init=False)
 
     def deny(
         self,
@@ -57,6 +59,7 @@ class PreToolUse:
         self.denial_reason = reason
         self.denial_result = dict(result) if result is not None else {
             "ok": False,
+            "code": "pre_tool_denied",
             "error": f"PreToolUse denied: {reason}",
             "hook": "PreToolUse",
         }

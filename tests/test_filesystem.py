@@ -183,6 +183,7 @@ class ToolRegistryTests(unittest.TestCase):
             result,
             {
                 "ok": False,
+                "code": "invalid_tool_arguments",
                 "error": "Invalid tool arguments: expected a JSON object",
             },
         )
@@ -205,6 +206,7 @@ class ToolRegistryTests(unittest.TestCase):
             result,
             {
                 "ok": False,
+                "code": "invalid_tool_result",
                 "error": "invalid_result tool returned a non-object result",
             },
         )

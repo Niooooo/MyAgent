@@ -1,6 +1,6 @@
 """MyAgent package."""
 
-from .agent import AgentLoop, AgentLoopLimitError
+from .agent import AgentLoop, AgentLoopLimitError, InstructionsProvider
 from .composition import (
     AgentConfig,
     DefaultAgentComponents,
@@ -26,6 +26,14 @@ from .permissions import (
     PermissionPolicy,
 )
 from .subagents import SubAgentManager
+from .skills import (
+    Skill,
+    SkillStore,
+    SkillStoreError,
+    SkillSummary,
+    render_skill_catalog,
+    skill_tools,
+)
 from .todo import TodoItem, TodoList, TodoReminder, TodoStatus
 from .tooling import FunctionTool, ToolRegistry
 
@@ -40,6 +48,7 @@ __all__ = [
     "HookExecutionError",
     "HookRegistry",
     "HookRejectedError",
+    "InstructionsProvider",
     "PermissionDecision",
     "PermissionLevel",
     "PermissionManager",
@@ -50,6 +59,10 @@ __all__ = [
     "Stop",
     "StopReason",
     "SubAgentManager",
+    "Skill",
+    "SkillStore",
+    "SkillStoreError",
+    "SkillSummary",
     "ToolRegistry",
     "TodoItem",
     "TodoList",
@@ -57,4 +70,6 @@ __all__ = [
     "TodoStatus",
     "UserPromptSubmit",
     "create_default_agent",
+    "render_skill_catalog",
+    "skill_tools",
 ]

@@ -11,6 +11,12 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .hooks import PreToolUse
+from .skills import (
+    ADD_SKILL_TOOL,
+    DELETE_SKILL_TOOL,
+    SKILL_TOOL_NAMES,
+    UPDATE_SKILL_TOOL,
+)
 from .subagents import SUBAGENT_TOOL_NAMES
 
 
@@ -25,6 +31,7 @@ DEFAULT_TOOL_ALLOWLIST = frozenset(
         "update_todo_list",
         "get_todo_list",
         "record_todo_verification",
+        *SKILL_TOOL_NAMES,
         *SUBAGENT_TOOL_NAMES,
     }
 )
@@ -32,6 +39,11 @@ DEFAULT_TOOL_ALLOWLIST = frozenset(
 _SENSITIVE_FILE_TOOLS = {
     "write_file": "writing a file can create or replace workspace content",
     "edit_file": "editing a file changes workspace content",
+}
+_SENSITIVE_SKILL_TOOLS = {
+    ADD_SKILL_TOOL: "adding a Skill persists instructions in the workspace",
+    UPDATE_SKILL_TOOL: "updating a Skill overwrites persistent instructions",
+    DELETE_SKILL_TOOL: "deleting a Skill removes persistent instructions",
 }
 _SENSITIVE_COMMANDS = {
     "chmod",
@@ -294,6 +306,12 @@ class DefaultPermissionPolicy:
                 _SENSITIVE_FILE_TOOLS[tool_name],
             )
 
+        if tool_name in _SENSITIVE_SKILL_TOOLS:
+            return PermissionDecision(
+                PermissionLevel.REQUIRE_APPROVAL,
+                _SENSITIVE_SKILL_TOOLS[tool_name],
+            )
+
         if tool_name == "bash":
             command = arguments.get("command")
             if isinstance(command, str):
@@ -372,11 +390,14 @@ def _apply_permission_decision(
     event: PreToolUse,
 ) -> None:
     decision = manager.authorize(event.tool_name, event.arguments)
+    event.permission_level = decision.level.value
+    event.permission_reason = decision.reason
     if decision.level is PermissionLevel.DENY:
         event.deny(
             decision.reason,
             result={
                 "ok": False,
+                "code": "permission_denied",
                 "error": f"Permission denied: {decision.reason}",
                 "permission": "denied",
             },
