@@ -17,6 +17,12 @@ from .agent import (
 )
 from .filesystem import WorkspaceFiles, filesystem_tools
 from .hooks import HookRegistry, PreToolUse
+from .memory import (
+    ContextMemory,
+    MemoryConfig,
+    ToolResultStore,
+    memory_tools,
+)
 from .permissions import (
     ApprovalCallback,
     DEFAULT_TOOL_ALLOWLIST,
@@ -66,6 +72,11 @@ class AgentConfig:
     subagent_max_workers: int = DEFAULT_SUBAGENT_MAX_WORKERS
     subagent_max_tasks: int = DEFAULT_SUBAGENT_MAX_TASKS
     allowed_tools: frozenset[str] | None = None
+    memory: MemoryConfig = field(default_factory=MemoryConfig)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.memory, MemoryConfig):
+            raise TypeError("memory must be a MemoryConfig")
 
 
 @dataclass(frozen=True)
@@ -77,6 +88,8 @@ class DefaultAgentComponents:
     todo_list: TodoList
     skill_store: SkillStore | None = None
     instructions_provider: InstructionsProvider | None = None
+    context_memory: ContextMemory | None = None
+    tool_result_store: ToolResultStore | None = None
     _close_callback: Callable[[], None] = field(
         default=_noop,
         repr=False,
@@ -117,6 +130,8 @@ def build_default_components(
     subagent_max_workers: int = DEFAULT_SUBAGENT_MAX_WORKERS,
     subagent_max_tasks: int = DEFAULT_SUBAGENT_MAX_TASKS,
     skill_store: SkillStore | None = None,
+    memory_config: MemoryConfig | None = None,
+    tool_result_store: ToolResultStore | None = None,
 ) -> DefaultAgentComponents:
     """Create and connect the standard tools, policies, state, and hooks."""
     if max_tool_rounds < 0:
@@ -125,7 +140,18 @@ def build_default_components(
     workspace_root = WorkspaceFiles(cwd).root
     if skill_store is not None and skill_store.workspace_root != workspace_root:
         raise ValueError("skill_store must use the configured workspace root")
+    if (
+        tool_result_store is not None
+        and tool_result_store.workspace_root != workspace_root
+    ):
+        raise ValueError("tool_result_store must use the configured workspace root")
+    selected_memory_config = (
+        memory_config if memory_config is not None else MemoryConfig()
+    )
+    if not isinstance(selected_memory_config, MemoryConfig):
+        raise TypeError("memory_config must be a MemoryConfig")
     shared_skill_store = skill_store or SkillStore(workspace_root)
+    shared_tool_result_store = tool_result_store or ToolResultStore(workspace_root)
     hook_registry = hooks if hooks is not None else HookRegistry()
     child_hook_template = hook_registry.clone()
     reminder_interval = (
@@ -160,6 +186,8 @@ def build_default_components(
                 todo_list=TodoList(),
                 todo_reminder_tool_calls=reminder_interval,
                 skill_store=shared_skill_store,
+                memory_config=selected_memory_config,
+                tool_result_store=shared_tool_result_store,
             )
             child = AgentLoop(
                 client,
@@ -169,6 +197,7 @@ def build_default_components(
                 tool_registry=child_components.tool_registry,
                 hooks=child_components.hooks,
                 instructions_provider=child_components.instructions_provider,
+                context_memory=child_components.context_memory,
             )
             child.todo_list = child_components.todo_list
             child.skill_store = child_components.skill_store
@@ -191,6 +220,8 @@ def build_default_components(
             todo_list=todo_list if todo_list is not None else TodoList(),
             todo_reminder_tool_calls=reminder_interval,
             skill_store=shared_skill_store,
+            memory_config=selected_memory_config,
+            tool_result_store=shared_tool_result_store,
             additional_tools=management_tools,
         )
     except BaseException:
@@ -206,6 +237,8 @@ def build_default_components(
         todo_list=components.todo_list,
         skill_store=components.skill_store,
         instructions_provider=components.instructions_provider,
+        context_memory=components.context_memory,
+        tool_result_store=components.tool_result_store,
         _close_callback=manager.close,
     )
 
@@ -220,6 +253,8 @@ def _build_standard_components(
     todo_list: TodoList,
     todo_reminder_tool_calls: int,
     skill_store: SkillStore,
+    memory_config: MemoryConfig,
+    tool_result_store: ToolResultStore,
     additional_tools: Iterable[FunctionTool] = (),
 ) -> DefaultAgentComponents:
     """Build one isolated ordinary capability set and its guarded registry."""
@@ -241,6 +276,10 @@ def _build_standard_components(
             *filesystem_tools(workspace),
             *todo_tools(todo_list),
             *skill_tools(skill_store),
+            *memory_tools(
+                tool_result_store,
+                max_chars=memory_config.load_memory_max_chars,
+            ),
             *additional_tools,
         ],
         tool_visibility=permission_hook.is_tool_allowed,
@@ -258,6 +297,8 @@ def _build_standard_components(
         todo_list=todo_list,
         skill_store=skill_store,
         instructions_provider=instructions_provider,
+        context_memory=ContextMemory(tool_result_store, memory_config),
+        tool_result_store=tool_result_store,
     )
 
 
@@ -321,6 +362,7 @@ def create_default_agent(
         max_tool_rounds=selected.max_tool_rounds,
         subagent_max_workers=selected.subagent_max_workers,
         subagent_max_tasks=selected.subagent_max_tasks,
+        memory_config=selected.memory,
     )
     agent = AgentLoop(
         client,
@@ -329,6 +371,7 @@ def create_default_agent(
         tool_registry=components.tool_registry,
         hooks=components.hooks,
         instructions_provider=components.instructions_provider,
+        context_memory=components.context_memory,
         close_callback=components.close,
     )
     # Keep the state discoverable on the public AgentLoop compatibility surface.

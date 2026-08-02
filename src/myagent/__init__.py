@@ -16,6 +16,7 @@ from .hooks import (
     StopReason,
     UserPromptSubmit,
 )
+from .memory import ContextMemory, MemoryConfig, ToolResultStore, memory_tools
 from .permissions import (
     ApprovalRequest,
     DefaultPermissionPolicy,
@@ -49,6 +50,8 @@ __all__ = [
     "HookRegistry",
     "HookRejectedError",
     "InstructionsProvider",
+    "ContextMemory",
+    "MemoryConfig",
     "PermissionDecision",
     "PermissionLevel",
     "PermissionManager",
@@ -64,12 +67,14 @@ __all__ = [
     "SkillStoreError",
     "SkillSummary",
     "ToolRegistry",
+    "ToolResultStore",
     "TodoItem",
     "TodoList",
     "TodoReminder",
     "TodoStatus",
     "UserPromptSubmit",
     "create_default_agent",
+    "memory_tools",
     "render_skill_catalog",
     "skill_tools",
 ]

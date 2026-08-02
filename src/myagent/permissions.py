@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .hooks import PreToolUse
+from .memory import LOAD_MEMORY_TOOL
 from .skills import (
     ADD_SKILL_TOOL,
     DELETE_SKILL_TOOL,
@@ -31,6 +32,7 @@ DEFAULT_TOOL_ALLOWLIST = frozenset(
         "update_todo_list",
         "get_todo_list",
         "record_todo_verification",
+        LOAD_MEMORY_TOOL,
         *SKILL_TOOL_NAMES,
         *SUBAGENT_TOOL_NAMES,
     }

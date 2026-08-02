@@ -22,14 +22,16 @@ CLI / AgentConfig
 composition.create_default_agent
         |-- shared SkillStore <---- .myagent/skills/*.md
         |       `-- dynamic Catalog provider（每次请求重新读取）
+        |-- shared ToolResultStore <---- .myagent/memory/tool-results/*.json
         |-- AgentLoop
-        |       `-- 基础 instructions + metadata-only Skill Catalog
+        |       |-- 基础 instructions + metadata-only Skill Catalog
+        |       `-- 独立 ContextMemory（history 块与压缩状态）
         |-- ToolRegistry <---- HookRegistry
         |       |              |-- PermissionHook（首个 PreToolUse）
         |       |              `-- TodoReminder
-        |       `-- Bash / Filesystem / TODO / Skill / SubAgent FunctionTools
+        |       `-- Bash / Filesystem / TODO / Skill / Memory / SubAgent FunctionTools
         |-- SubAgentManager（有界 ThreadPoolExecutor）
-        |       `-- 新 AgentLoop -> 同一 SkillStore，不含 SubAgent tools 的新 Registry
+        |       `-- 新 AgentLoop -> 共享 Stores、独立 ContextMemory、不含 SubAgent tools
         `-- TodoList（每个 Agent 实例独立）
 ```
 
@@ -53,6 +55,7 @@ AgentLoop -> Responses API -> function_call
 | `tools.py` | Bash schema、Bash 执行和永久拒绝的纵深检查 |
 | `filesystem.py` | 工作区内文件读写、精确编辑、Glob/Grep、安全路径解析及对应 schemas |
 | `skills.py` | Skill 格式、严格 front matter 解析、校验、Catalog、原子持久化及四个 FunctionTool |
+| `memory.py` | 大型工具结果持久化、引用分段读取、确定性工具摘要和原子历史块压缩 |
 | `todo.py` | 实例级 TODO 状态、版本化验证、TODO tools 和 Hook 驱动提醒 |
 | `subagents.py` | 同步子 Agent、后台 Fork、结果状态/收取、有界并发和 executor 关闭 |
 
@@ -75,6 +78,7 @@ AgentLoop -> Responses API -> function_call
 | `add_skill` | 创建一个新 Skill，不覆盖同名文件；逐次审批 |
 | `update_skill` | 完整替换已有 Skill 的 description 和正文；逐次审批 |
 | `delete_skill` | 删除一个已有 Skill，不返回已删除正文；逐次审批 |
+| `load_memory` | 按 `memory://tool-result/<id>` 引用分段读取已持久化的完整工具结果 |
 | `run_subagent` | 阻塞运行一个全新的子 Agent，只返回最终文本 |
 | `fork_subagent` | 在有界后台线程池启动独立子 Agent，立即返回 `fork_id` |
 | `collect_subagent` | 轮询或限时等待 Fork；终态结果只可收取一次 |
@@ -118,6 +122,16 @@ description: Review Python changes for correctness, readability and regressions.
 
 同一默认运行时中的共享 `SkillStore` 使用 `RLock` 保护复合读写，因此父 Agent、同步子 Agent和多个 Fork 并发操作时不会在进程内越过存在性检查或互相覆盖；同名并发 add 只会有一个成功。原子替换也保证读取只能看到旧文件或新文件，而不是半个文件。这个保证仅覆盖共享同一 Store 的当前 Agent 进程；当前实现没有跨进程锁或跨进程事务，多个独立 MyAgent 进程同时写同一目录仍需外部协调。
 
+## 上下文记忆与分级压缩
+
+ContextMemory 只控制 Responses 输入的体积，不实现用户画像或语义长期记忆。默认依次应用三级策略：序列化工具结果超过 65536 个 UTF-8 字节时立即把完整 JSON 写入 Store，并只向模型保留最多 2000 字符的确定性预览；请求前，超过 8192 字节的尚未卸载工具结果会被持久化并换成确定性字段摘要；完成这两步后，序列化 history 仍超过 131072 字节且存在可安全裁剪的旧块时，AgentLoop 才使用当前配置的模型发起一次独立的 `tools=[]` Responses 请求，将这些历史数据压缩成最多 4000 字符的普通 assistant 摘要消息。阈值通过 `AgentConfig(memory=MemoryConfig(...))` 集中配置。第三级会增加一次模型请求的延迟和费用；请求失败、返回空文本或没有安全旧块时，主请求继续使用未裁剪的 history。
+
+一个 `response.output` 中的 reasoning、全部 `function_call` 和随后生成的全部 `function_call_output` 作为同一个交换块登记。第三级只能整体移除已经发送过且 call/output 配对完整的旧块；最早任务入口、最近两个用户回合、当前未发送用户输入以及模型刚生成的调用和结果会保留。送给摘要模型的输入被明确标为不可信历史数据，只包含用户/助手文本片段、工具名、状态、错误码、引用和内容提示；reasoning 只替换为“曾存在且内容已省略”的标记。模型摘要成功并通过非空和长度校验后才原子替换旧块；重复压缩会让模型合并已有摘要，不会逐轮追加摘要消息。
+
+完整结果仅在第一次达到保存条件时创建 `.myagent/memory/tool-results/`，以 UTF-8 JSON 保存，并通过随机的 `memory://tool-result/<id>` 引用访问。写入使用同目录临时文件、flush/fsync 和 `os.replace`；`load_memory` 默认只读允许，并用 `offset`、`max_chars` 分段返回，单次硬上限为 16000 字符、默认配置上限为 4000。`reset()` 会清空 Agent history、块索引和摘要状态，但不会删除这些结果文件。父 Agent 和子 Agent 共享 workspace-scoped `ToolResultStore`，同时各自持有独立的 ContextMemory 和 history；显式注入自定义 `ToolRegistry` 而不提供 ContextMemory 时不会创建另一套默认记忆运行时。
+
+持久化失败时，Agent 会保留原始完整工具输出，不会声称已经保存。当前切片不检测敏感信息，不加密，不自动过期、清理或限制磁盘配额；第三级压缩也暂不删除被裁剪块引用的结果文件，因为同一引用可能仍被保留 history 或外部调用方使用。因此大型工具结果可能以明文留在工作区隐藏目录中，使用者应自行控制工作区内容和生命周期。
+
 ## 子 Agent：同步调用与后台 Fork
 
 主 Agent 可以按任务性质选择同步或后台执行。同步工具会等待一个全新的子 Agent 完成：
@@ -146,7 +160,7 @@ description: Review Python changes for correctness, readability and regressions.
 
 `collect_subagent` 在任务未完成时返回 `running`；等待超时会返回 `code=timeout`，但不会取消仍在运行的任务；完成时返回 `status=completed` 和唯一的 `output` 文本；失败只返回有界错误摘要。终态只可收取一次，再次收取会得到 `status=cleaned`，从未存在的 ID 则为 `status=unknown`。
 
-每次同步调用和 Fork 都创建新的 `AgentLoop`、history、`ToolRegistry`、`PermissionManager`、`TodoList` 和 `TodoReminder`，但共享工作区级 `SkillStore`。子 Agent 不继承主 Agent 或其他子 Agent 的对话 history，只接收显式 `task`。其 reasoning、Responses `output`、工具参数、中间结果和完整 history 不会进入管理器记录或主 Agent history；成功边界只保留最终文本。
+每次同步调用和 Fork 都创建新的 `AgentLoop`、history、`ContextMemory`、`ToolRegistry`、`PermissionManager`、`TodoList` 和 `TodoReminder`，但共享工作区级 `SkillStore` 与 `ToolResultStore`。子 Agent 不继承主 Agent 或其他子 Agent 的对话 history，只接收显式 `task`。其 reasoning、Responses `output`、工具参数、中间结果和完整 history 不会进入管理器记录或主 Agent history；成功边界只保留最终文本。
 
 子 Agent 的普通工具仍完整经过 JSON/签名校验、首个 `PermissionHook`、其他 `PreToolUse`、handler 和 `PostToolUse`，并保留原始 `call_id`。它自身也会触发 `UserPromptSubmit` 和 `Stop`。但三种 SubAgent 管理工具不会注册到子 Registry：schemas 中不可见，伪造 `function_call` 也只会得到 `Unknown tool`，因此不能递归委派。自定义 `allowed_tools` 会先应用，再额外排除整个管理工具族。
 

@@ -46,11 +46,14 @@ class AgentLoopTests(unittest.TestCase):
         self.assertIn("Invalid tool arguments", output["error"])
 
     def test_executes_every_function_call_in_one_response(self) -> None:
+        reasoning = SimpleNamespace(type="reasoning", detail="protocol state")
         calls = [
             function_call(call_id="call_1", arguments='{"command":"pwd"}'),
             function_call(call_id="call_2", arguments='{"command":"ls"}'),
         ]
-        responses = FakeResponses([response(calls), response([], "done")])
+        responses = FakeResponses(
+            [response([reasoning, *calls]), response([], "done")]
+        )
         seen_commands = []
         agent = AgentLoop(
             SimpleNamespace(responses=responses),
@@ -61,10 +64,14 @@ class AgentLoopTests(unittest.TestCase):
         self.assertEqual(agent.run("inspect"), "done")
 
         self.assertEqual(seen_commands, ["pwd", "ls"])
-        outputs = responses.requests[1]["input"][-2:]
+        exchange = responses.requests[1]["input"][1:]
+        self.assertEqual(exchange[:3], [reasoning, *calls])
+        outputs = exchange[3:]
+        self.assertEqual(len(outputs), len(calls))
+        call_ids = [call.call_id for call in calls]
         self.assertEqual(
             [item["call_id"] for item in outputs],
-            ["call_1", "call_2"],
+            call_ids,
         )
 
     def test_reset_clears_history_before_the_next_user_turn(self) -> None:
@@ -195,6 +202,7 @@ class AgentLoopTests(unittest.TestCase):
                 "update_todo_list",
                 "get_todo_list",
                 "record_todo_verification",
+                "load_memory",
                 "load_skill",
                 "add_skill",
                 "update_skill",

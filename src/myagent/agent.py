@@ -16,6 +16,7 @@ from .hooks import (
     StopReason,
     UserPromptSubmit,
 )
+from .memory import ContextMemory, HISTORY_COMPACTION_INSTRUCTIONS
 from .tooling import ToolRegistry, ToolResult
 
 if TYPE_CHECKING:
@@ -91,6 +92,7 @@ class AgentLoop:
         max_tool_rounds: int = 10,
         bash_tool: Callable[[str], dict[str, Any]] | None = None,
         tool_registry: ToolRegistry | None = None,
+        context_memory: ContextMemory | None = None,
         workspace_root: str | PathLike[str] | None = None,
         allowed_tools: Iterable[str] | None = None,
         approval_callback: ApprovalCallback | None = None,
@@ -103,6 +105,13 @@ class AgentLoop:
             raise ValueError("max_tool_rounds must be non-negative")
         if instructions_provider is not None and not callable(instructions_provider):
             raise TypeError("instructions_provider must be callable")
+        if context_memory is not None and not isinstance(
+            context_memory,
+            ContextMemory,
+        ):
+            raise TypeError("context_memory must be a ContextMemory")
+        if tool_registry is None and context_memory is not None:
+            raise ValueError("context_memory requires an explicit tool_registry")
         if tool_registry is not None and any(
             value is not None
             for value in (
@@ -128,6 +137,7 @@ class AgentLoop:
         self._close_lock = Lock()
         self._closed = False
         self.skill_store: SkillStore | None = None
+        self.context_memory: ContextMemory | None = context_memory
         if tool_registry is not None:
             if hooks is not None and tool_registry.hooks is not hooks:
                 raise ValueError(
@@ -155,6 +165,7 @@ class AgentLoop:
             )
             self.todo_list = components.todo_list
             self.skill_store = components.skill_store
+            self.context_memory = components.context_memory
             self.tool_registry = components.tool_registry
             self.instructions_provider = _combine_instructions_providers(
                 self.instructions_provider,
@@ -201,6 +212,8 @@ class AgentLoop:
     def reset(self) -> None:
         """Clear the in-memory conversation history."""
         self.history.clear()
+        if self.context_memory is not None:
+            self.context_memory.reset()
 
     def close(self) -> None:
         """Release resources attached by the runtime composition root."""
@@ -224,16 +237,49 @@ class AgentLoop:
         if not isinstance(submitted.prompt, str) or not submitted.prompt.strip():
             raise ValueError("user_input must not be empty")
 
-        self.history.extend(submitted.context)
-        self.history.append({"role": "user", "content": submitted.prompt})
+        items = [
+            *submitted.context,
+            {"role": "user", "content": submitted.prompt},
+        ]
+        self.history.extend(items)
+        if self.context_memory is not None:
+            self.context_memory.record_user_turn(items)
 
     def _request_response(self) -> ModelResponse:
-        return self.client.responses.create(
+        if self.context_memory is not None:
+            self.context_memory.prepare_request(
+                self.history,
+                self._request_history_summary,
+            )
+        response = self.client.responses.create(
             model=self.model,
             instructions=self._effective_instructions(),
             tools=self.tool_registry.definitions,
             input=self.history,
         )
+        if self.context_memory is not None:
+            self.context_memory.mark_request_succeeded()
+        return response
+
+    def _request_history_summary(self, source: str, max_chars: int) -> str:
+        response = self.client.responses.create(
+            model=self.model,
+            instructions=HISTORY_COMPACTION_INSTRUCTIONS,
+            tools=[],
+            input=[
+                {
+                    "role": "user",
+                    "content": (
+                        f"Compress the following historical records to at most "
+                        f"{max_chars} characters.\n\n{source}"
+                    ),
+                }
+            ],
+        )
+        summary = response.output_text.strip()
+        if not summary:
+            raise RuntimeError("The history summarizer returned empty text")
+        return summary
 
     def _effective_instructions(self) -> str:
         provider = self.instructions_provider
@@ -252,6 +298,8 @@ class AgentLoop:
     ) -> list[FunctionCallItem]:
         # Reasoning items are protocol state, so every output item must survive.
         self.history.extend(response.output)
+        if self.context_memory is not None:
+            self.context_memory.record_response(response.output)
         return [
             cast(FunctionCallItem, item)
             for item in response.output
@@ -272,15 +320,24 @@ class AgentLoop:
             )
 
     def _execute_calls(self, calls: Sequence[FunctionCallItem]) -> None:
-        for call in calls:
-            result = self._execute_call(call)
-            self.history.append(
+        # Every handler and PostToolUse runs against the complete structured result
+        # before context memory sees serialized output.
+        results = [(call, self._execute_call(call)) for call in calls]
+        outputs: list[object] = []
+        for call, result in results:
+            serialized = json.dumps(result, ensure_ascii=False)
+            if self.context_memory is not None:
+                serialized = self.context_memory.prepare_tool_output(serialized)
+            outputs.append(
                 {
                     "type": "function_call_output",
                     "call_id": call.call_id,
-                    "output": json.dumps(result, ensure_ascii=False),
+                    "output": serialized,
                 }
             )
+        self.history.extend(outputs)
+        if self.context_memory is not None:
+            self.context_memory.record_tool_outputs(outputs)
 
     def _execute_call(self, call: FunctionCallItem) -> ToolResult:
         return self.tool_registry.execute(
