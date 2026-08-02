@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from types import SimpleNamespace
 from typing import Any
 
@@ -29,5 +30,7 @@ class FakeResponses:
         self.requests: list[dict[str, Any]] = []
 
     def create(self, **kwargs: Any) -> SimpleNamespace:
-        self.requests.append(kwargs)
+        # A real request consumes the input at call time. Keep the same semantics
+        # here so later in-place history compaction cannot rewrite test evidence.
+        self.requests.append(copy.deepcopy(kwargs))
         return next(self._responses)

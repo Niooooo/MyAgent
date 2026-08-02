@@ -7,6 +7,7 @@ from myagent.composition import (
     create_default_agent,
 )
 from myagent.hooks import HookRegistry, PreToolUse
+from myagent.memory import MemoryConfig
 from myagent.permissions import PermissionHook, PermissionManager
 
 
@@ -43,10 +44,15 @@ class DefaultCompositionTests(unittest.TestCase):
     def test_agent_factory_connects_the_configured_runtime(self) -> None:
         hooks = HookRegistry()
         client = SimpleNamespace(responses=SimpleNamespace())
+        memory = MemoryConfig(preview_chars=123)
 
         agent = create_default_agent(
             client,
-            config=AgentConfig(model="test-model", max_tool_rounds=3),
+            config=AgentConfig(
+                model="test-model",
+                max_tool_rounds=3,
+                memory=memory,
+            ),
             hooks=hooks,
         )
 
@@ -56,6 +62,8 @@ class DefaultCompositionTests(unittest.TestCase):
         self.assertIs(agent.hooks, hooks)
         self.assertIs(agent.tool_registry.hooks, hooks)
         self.assertIsNotNone(agent.todo_list)
+        self.assertIsNotNone(agent.context_memory)
+        self.assertIs(agent.context_memory.config, memory)
         agent.close()
 
     def test_agent_config_allowlist_can_disable_subagent_tools(self) -> None:
