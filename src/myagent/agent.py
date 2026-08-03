@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Iterable, Sequence
+import random
+import time
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from os import PathLike
 from threading import Lock
 from typing import TYPE_CHECKING, Any, Protocol, cast
@@ -36,6 +39,13 @@ Do not claim all TODO items are finished until relevant checks have run and thei
 evidence has been recorded with record_todo_verification.
 """
 DEFAULT_MODEL = "gpt-5.6-sol"
+FALLBACK_MODEL = "gpt-5.6-terra"
+DEFAULT_MAX_OUTPUT_TOKENS = 16_384
+EXPANDED_MAX_OUTPUT_TOKENS = 65_536
+MAX_TRANSIENT_RETRIES = 5
+CONTINUATION_PROMPT = (
+    "Continue from the exact truncation point without repeating prior content."
+)
 
 InstructionsProvider = Callable[[], str]
 
@@ -65,15 +75,14 @@ class ModelResponse(Protocol):
     output_text: str
 
 
+@dataclass
+class _RecoveredResponse:
+    output: list[ResponseOutputItem]
+    output_text: str
+
+
 class ResponsesEndpoint(Protocol):
-    def create(
-        self,
-        *,
-        model: str,
-        instructions: str,
-        tools: list[dict[str, Any]],
-        input: list[object],
-    ) -> ModelResponse: ...
+    def create(self, **kwargs: Any) -> ModelResponse: ...
 
 
 class ResponsesClient(Protocol):
@@ -88,6 +97,7 @@ class AgentLoop:
         client: ResponsesClient,
         *,
         model: str = DEFAULT_MODEL,
+        fallback_model: str = FALLBACK_MODEL,
         instructions: str = DEFAULT_INSTRUCTIONS,
         instructions_provider: InstructionsProvider | None = None,
         max_tool_rounds: int = 10,
@@ -104,6 +114,10 @@ class AgentLoop:
     ) -> None:
         if max_tool_rounds < 0:
             raise ValueError("max_tool_rounds must be non-negative")
+        if not isinstance(model, str) or not model.strip():
+            raise ValueError("model must be a non-empty string")
+        if not isinstance(fallback_model, str) or not fallback_model.strip():
+            raise ValueError("fallback_model must be a non-empty string")
         if instructions_provider is not None and not callable(instructions_provider):
             raise TypeError("instructions_provider must be callable")
         if context_memory is not None and not isinstance(
@@ -130,6 +144,7 @@ class AgentLoop:
 
         self.client = client
         self.model = model
+        self.fallback_model = fallback_model
         self.instructions = instructions
         self.instructions_provider = instructions_provider
         self.max_tool_rounds = max_tool_rounds
@@ -162,6 +177,7 @@ class AgentLoop:
                 todo_list=todo_list,
                 todo_reminder_tool_calls=todo_reminder_tool_calls,
                 model=model,
+                fallback_model=fallback_model,
                 instructions=instructions,
                 max_tool_rounds=max_tool_rounds,
             )
@@ -254,18 +270,33 @@ class AgentLoop:
                 self.history,
                 self._request_history_summary,
             )
-        response = self.client.responses.create(
-            model=self.model,
-            instructions=self._effective_instructions(),
-            tools=self.tool_registry.definitions,
-            input=self.history,
-        )
+        instructions = self._effective_instructions()
+        try:
+            response = self._request_model(
+                model=self.model,
+                instructions=instructions,
+                tools=self.tool_registry.definitions,
+                input=self.history,
+            )
+        except Exception as exc:
+            if self.context_memory is None or not _is_context_length_error(exc):
+                raise
+            self.context_memory.emergency_compact(
+                self.history,
+                self._request_history_summary,
+            )
+            response = self._request_model(
+                model=self.model,
+                instructions=instructions,
+                tools=self.tool_registry.definitions,
+                input=self.history,
+            )
         if self.context_memory is not None:
             self.context_memory.mark_request_succeeded()
         return response
 
     def _request_history_summary(self, source: str, max_chars: int) -> str:
-        response = self.client.responses.create(
+        response = self._request_model(
             model=self.model,
             instructions=HISTORY_COMPACTION_INSTRUCTIONS,
             tools=[],
@@ -283,6 +314,67 @@ class AgentLoop:
         if not summary:
             raise RuntimeError("The history summarizer returned empty text")
         return summary
+
+    def _request_model(
+        self,
+        *,
+        model: str,
+        instructions: str,
+        tools: list[dict[str, Any]],
+        input: list[object],
+    ) -> ModelResponse:
+        request = {
+            "model": model,
+            "instructions": instructions,
+            "tools": tools,
+            "input": input,
+        }
+        first = self._create_with_transient_retries(
+            **request,
+            max_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS,
+        )
+        if not _is_output_truncated(first):
+            return first
+
+        expanded = self._create_with_transient_retries(
+            **request,
+            max_output_tokens=EXPANDED_MAX_OUTPUT_TOKENS,
+        )
+        if not _is_output_truncated(expanded):
+            return expanded
+
+        response_id = getattr(expanded, "id", None)
+        if not isinstance(response_id, str) or not response_id:
+            raise RuntimeError("Cannot continue a truncated response without its id")
+        continuation = self._create_with_transient_retries(
+            model=model,
+            instructions=instructions,
+            tools=tools,
+            input=[{"role": "user", "content": CONTINUATION_PROMPT}],
+            previous_response_id=response_id,
+            max_output_tokens=EXPANDED_MAX_OUTPUT_TOKENS,
+        )
+        if getattr(continuation, "status", None) == "incomplete":
+            raise RuntimeError("The response continuation did not complete")
+        return _merge_responses(expanded, continuation)
+
+    def _create_with_transient_retries(self, **request: Any) -> ModelResponse:
+        for retry_number in range(MAX_TRANSIENT_RETRIES + 1):
+            try:
+                return self.client.responses.create(**request)
+            except Exception as exc:
+                status_code = getattr(exc, "status_code", None)
+                if status_code not in {429, 529} or retry_number == MAX_TRANSIENT_RETRIES:
+                    raise
+                next_retry = retry_number + 1
+                upper_bound = min(30, 2 ** (next_retry - 1))
+                time.sleep(random.uniform(0, upper_bound))
+                request["model"] = (
+                    self.fallback_model
+                    if status_code == 529 and next_retry >= 4
+                    else request["model"]
+                )
+        raise AssertionError("unreachable")
 
     def _effective_instructions(self) -> str:
         provider = self.instructions_provider
@@ -380,3 +472,71 @@ def _combine_instructions_providers(
         return "\n\n".join(fragments)
 
     return combined
+
+
+def _is_output_truncated(response: object) -> bool:
+    if getattr(response, "status", None) != "incomplete":
+        return False
+    details = getattr(response, "incomplete_details", None)
+    reason = (
+        details.get("reason")
+        if isinstance(details, Mapping)
+        else getattr(details, "reason", None)
+    )
+    return reason == "max_output_tokens"
+
+
+def _merge_responses(
+    partial: ModelResponse,
+    continuation: ModelResponse,
+) -> ModelResponse:
+    partial_text = getattr(partial, "output_text", None)
+    continuation_text = getattr(continuation, "output_text", None)
+    if not isinstance(partial_text, str) or not isinstance(continuation_text, str):
+        raise RuntimeError("Cannot safely merge response text")
+    partial_output = getattr(partial, "output", None)
+    continuation_output = getattr(continuation, "output", None)
+    if not _is_output_sequence(partial_output) or not _is_output_sequence(
+        continuation_output
+    ):
+        raise RuntimeError("Cannot safely merge response output items")
+
+    merged: list[ResponseOutputItem] = []
+    calls: dict[str, tuple[object, object]] = {}
+    for item in [*partial_output, *continuation_output]:
+        if getattr(item, "type", None) != "function_call":
+            merged.append(item)
+            continue
+        call_id = getattr(item, "call_id", None)
+        if not isinstance(call_id, str) or not call_id:
+            raise RuntimeError("Cannot safely merge a function call without call_id")
+        identity = (getattr(item, "name", None), getattr(item, "arguments", None))
+        previous = calls.get(call_id)
+        if previous is None:
+            calls[call_id] = identity
+            merged.append(item)
+        elif previous != identity:
+            raise RuntimeError(f"Conflicting function call while merging: {call_id}")
+    return _RecoveredResponse(merged, partial_text + continuation_text)
+
+
+def _is_output_sequence(value: object) -> bool:
+    return isinstance(value, Sequence) and not isinstance(value, (str, bytes))
+
+
+def _is_context_length_error(exc: BaseException) -> bool:
+    if getattr(exc, "status_code", None) != 400:
+        return False
+    return _contains_context_length_code(getattr(exc, "code", None)) or (
+        _contains_context_length_code(getattr(exc, "body", None))
+    )
+
+
+def _contains_context_length_code(value: object) -> bool:
+    if isinstance(value, str):
+        return "context_length_exceeded" in value
+    if isinstance(value, Mapping):
+        return any(_contains_context_length_code(item) for item in value.values())
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        return any(_contains_context_length_code(item) for item in value)
+    return False

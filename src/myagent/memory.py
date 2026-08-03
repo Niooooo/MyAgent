@@ -408,6 +408,43 @@ class ContextMemory:
         for block in self._blocks:
             block.sent = True
 
+    def emergency_compact(
+        self,
+        history: list[object],
+        summarizer: HistorySummarizer,
+    ) -> None:
+        """Replace the complete flat history after a real context-limit failure."""
+        source = _history_compaction_source(
+            [_HistoryBlock("emergency", list(history), None)],
+            max_item_chars=max(
+                self.config.preview_chars,
+                self.config.history_summary_chars,
+            ),
+        )
+        generated = summarizer(source, self.config.history_summary_chars)
+        summary_content = _normalized_history_summary(
+            generated,
+            self.config.history_summary_chars,
+        )
+        if summary_content is None:
+            raise RuntimeError("The emergency history summarizer returned empty text")
+
+        summary_message = {
+            "type": "message",
+            "role": "assistant",
+            "content": summary_content,
+        }
+        summary_block = _HistoryBlock(
+            "summary",
+            [summary_message],
+            None,
+            sent=False,
+        )
+        history[:] = [summary_message]
+        self._blocks = [summary_block]
+        self._open_exchange = None
+        self._managed_output_ids.clear()
+
     @property
     def block_count(self) -> int:
         return len(self._blocks)
