@@ -50,6 +50,7 @@ class DefaultCompositionTests(unittest.TestCase):
             client,
             config=AgentConfig(
                 model="test-model",
+                fallback_model="test-fallback",
                 max_tool_rounds=3,
                 memory=memory,
             ),
@@ -58,6 +59,7 @@ class DefaultCompositionTests(unittest.TestCase):
 
         self.assertIs(agent.client, client)
         self.assertEqual(agent.model, "test-model")
+        self.assertEqual(agent.fallback_model, "test-fallback")
         self.assertEqual(agent.max_tool_rounds, 3)
         self.assertIs(agent.hooks, hooks)
         self.assertIs(agent.tool_registry.hooks, hooks)

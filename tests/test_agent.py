@@ -3,13 +3,24 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import call, patch
 
 from myagent.agent import AgentLoop, AgentLoopLimitError
 from myagent.tooling import FunctionTool, ToolExecutionError, ToolRegistry
-from tests.fakes import FakeResponses, function_call, response
+from tests.fakes import FakeAPIError, FakeResponses, function_call, response
 
 
 class AgentLoopTests(unittest.TestCase):
+    def test_normal_request_uses_default_output_limit(self) -> None:
+        responses = FakeResponses([response([], "done")])
+        agent = AgentLoop(
+            SimpleNamespace(responses=responses),
+            tool_registry=ToolRegistry(),
+        )
+
+        self.assertEqual(agent.run("answer"), "done")
+        self.assertEqual(responses.requests[0]["max_output_tokens"], 16_384)
+
     def test_executes_tool_and_returns_final_text(self) -> None:
         reasoning = SimpleNamespace(type="reasoning")
         call = function_call()
@@ -221,6 +232,206 @@ class AgentLoopTests(unittest.TestCase):
         )
         output = json.loads(responses.requests[1]["input"][-1]["output"])
         self.assertEqual(output["content"], "workspace note")
+
+    def test_first_truncation_is_discarded_and_expanded_request_succeeds(self) -> None:
+        discarded_call = function_call("discarded", "bash", '{"command":"bad"}')
+        responses = FakeResponses(
+            [
+                response(
+                    [discarded_call],
+                    status="incomplete",
+                    incomplete_details=SimpleNamespace(reason="max_output_tokens"),
+                ),
+                response([], "done", status="completed"),
+            ]
+        )
+        executed: list[str] = []
+        agent = AgentLoop(
+            SimpleNamespace(responses=responses),
+            bash_tool=lambda command: executed.append(command) or {"ok": True},
+        )
+
+        self.assertEqual(agent.run("answer"), "done")
+        self.assertEqual(executed, [])
+        self.assertEqual(
+            [request["max_output_tokens"] for request in responses.requests],
+            [16_384, 65_536],
+        )
+        self.assertFalse(any(item is discarded_call for item in agent.history))
+
+    def test_second_truncation_continues_and_merges_in_output_order(self) -> None:
+        ignored = SimpleNamespace(type="message", text="ignored")
+        partial = SimpleNamespace(type="reasoning", detail="partial")
+        continued = SimpleNamespace(type="message", text="continued")
+        responses = FakeResponses(
+            [
+                response(
+                    [ignored],
+                    "ignored",
+                    status="incomplete",
+                    incomplete_details={"reason": "max_output_tokens"},
+                ),
+                response(
+                    [partial],
+                    "part",
+                    id="response_2",
+                    status="incomplete",
+                    incomplete_details={"reason": "max_output_tokens"},
+                ),
+                response([continued], "ial", status="completed"),
+            ]
+        )
+        agent = AgentLoop(
+            SimpleNamespace(responses=responses),
+            tool_registry=ToolRegistry(),
+        )
+
+        self.assertEqual(agent.run("answer"), "partial")
+        self.assertEqual(agent.history[1:], [partial, continued])
+        continuation_request = responses.requests[2]
+        self.assertEqual(continuation_request["previous_response_id"], "response_2")
+        self.assertEqual(continuation_request["max_output_tokens"], 65_536)
+        self.assertEqual(
+            continuation_request["instructions"],
+            responses.requests[1]["instructions"],
+        )
+        self.assertIn("without repeating", continuation_request["input"][0]["content"])
+
+    def test_continuation_deduplicates_the_same_function_call(self) -> None:
+        repeated = function_call("call_once", "bash", '{"command":"pwd"}')
+        responses = FakeResponses(
+            [
+                response(
+                    [],
+                    status="incomplete",
+                    incomplete_details={"reason": "max_output_tokens"},
+                ),
+                response(
+                    [repeated],
+                    id="response_2",
+                    status="incomplete",
+                    incomplete_details={"reason": "max_output_tokens"},
+                ),
+                response(
+                    [function_call("call_once", "bash", '{"command":"pwd"}')],
+                    status="completed",
+                ),
+                response([], "done"),
+            ]
+        )
+        executed: list[str] = []
+        agent = AgentLoop(
+            SimpleNamespace(responses=responses),
+            bash_tool=lambda command: executed.append(command) or {"ok": True},
+        )
+
+        self.assertEqual(agent.run("run"), "done")
+        self.assertEqual(executed, ["pwd"])
+        self.assertEqual(
+            sum(
+                getattr(item, "type", None) == "function_call"
+                and getattr(item, "call_id", None) == "call_once"
+                for item in agent.history
+            ),
+            1,
+        )
+
+    def test_three_truncations_raise_without_recording_any_output(self) -> None:
+        truncated_outputs = [
+            SimpleNamespace(type="reasoning", marker=index) for index in range(3)
+        ]
+        responses = FakeResponses(
+            [
+                response(
+                    [truncated_outputs[0]],
+                    status="incomplete",
+                    incomplete_details={"reason": "max_output_tokens"},
+                ),
+                response(
+                    [truncated_outputs[1]],
+                    id="response_2",
+                    status="incomplete",
+                    incomplete_details={"reason": "max_output_tokens"},
+                ),
+                response(
+                    [truncated_outputs[2]],
+                    status="incomplete",
+                    incomplete_details={"reason": "max_output_tokens"},
+                ),
+            ]
+        )
+        agent = AgentLoop(
+            SimpleNamespace(responses=responses),
+            tool_registry=ToolRegistry(),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "continuation did not complete"):
+            agent.run("answer")
+        self.assertEqual(agent.history, [{"role": "user", "content": "answer"}])
+
+    @patch("myagent.agent.time.sleep")
+    @patch("myagent.agent.random.uniform", return_value=0.25)
+    def test_429_retries_five_times_with_capped_exponential_bounds(
+        self,
+        random_uniform,
+        sleep,
+    ) -> None:
+        responses = FakeResponses(
+            [*[FakeAPIError(429) for _ in range(5)], response([], "done")]
+        )
+        agent = AgentLoop(
+            SimpleNamespace(responses=responses),
+            tool_registry=ToolRegistry(),
+        )
+
+        self.assertEqual(agent.run("answer"), "done")
+        self.assertEqual(len(responses.requests), 6)
+        self.assertEqual(
+            random_uniform.call_args_list,
+            [call(0, bound) for bound in (1, 2, 4, 8, 16)],
+        )
+        self.assertEqual(sleep.call_args_list, [call(0.25)] * 5)
+        self.assertEqual(
+            {request["model"] for request in responses.requests},
+            {"gpt-5.6-sol"},
+        )
+
+    @patch("myagent.agent.time.sleep")
+    @patch("myagent.agent.random.uniform", return_value=0)
+    def test_529_switches_to_fallback_after_three_retries(
+        self,
+        _random_uniform,
+        _sleep,
+    ) -> None:
+        responses = FakeResponses(
+            [*[FakeAPIError(529) for _ in range(4)], response([], "done")]
+        )
+        agent = AgentLoop(
+            SimpleNamespace(responses=responses),
+            tool_registry=ToolRegistry(),
+            fallback_model="configured-fallback",
+        )
+
+        self.assertEqual(agent.run("answer"), "done")
+        self.assertEqual(
+            [request["model"] for request in responses.requests],
+            ["gpt-5.6-sol"] * 4 + ["configured-fallback"],
+        )
+
+    @patch("myagent.agent.time.sleep")
+    @patch("myagent.agent.random.uniform")
+    def test_other_errors_are_not_retried(self, random_uniform, sleep) -> None:
+        responses = FakeResponses([FakeAPIError(500)])
+        agent = AgentLoop(
+            SimpleNamespace(responses=responses),
+            tool_registry=ToolRegistry(),
+        )
+
+        with self.assertRaises(FakeAPIError):
+            agent.run("answer")
+        self.assertEqual(len(responses.requests), 1)
+        random_uniform.assert_not_called()
+        sleep.assert_not_called()
 
 
 if __name__ == "__main__":

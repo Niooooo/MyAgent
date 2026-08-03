@@ -1,0 +1,11 @@
+{
+  "api_key": null,
+  "base_url": null,
+  "model": "gpt-5.6-sol",
+  "fallback_model": "gpt-5.6-terra",
+  "max_tool_rounds": 10,
+  "bash_timeout_seconds": 30,
+  "todo_reminder_tool_calls": 4,
+  "subagent_max_workers": 4,
+  "subagent_max_tasks": 16
+}

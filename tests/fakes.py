@@ -20,12 +20,30 @@ def function_call(
     )
 
 
-def response(output: list[object], output_text: str = "") -> SimpleNamespace:
-    return SimpleNamespace(output=output, output_text=output_text)
+def response(
+    output: list[object],
+    output_text: str = "",
+    **fields: Any,
+) -> SimpleNamespace:
+    return SimpleNamespace(output=output, output_text=output_text, **fields)
+
+
+class FakeAPIError(RuntimeError):
+    def __init__(
+        self,
+        status_code: int,
+        *,
+        body: object = None,
+        code: object = None,
+    ) -> None:
+        super().__init__(f"fake API error {status_code}")
+        self.status_code = status_code
+        self.body = body
+        self.code = code
 
 
 class FakeResponses:
-    def __init__(self, responses: list[SimpleNamespace]) -> None:
+    def __init__(self, responses: list[SimpleNamespace | BaseException]) -> None:
         self._responses = iter(responses)
         self.requests: list[dict[str, Any]] = []
 
@@ -33,4 +51,7 @@ class FakeResponses:
         # A real request consumes the input at call time. Keep the same semantics
         # here so later in-place history compaction cannot rewrite test evidence.
         self.requests.append(copy.deepcopy(kwargs))
-        return next(self._responses)
+        result = next(self._responses)
+        if isinstance(result, BaseException):
+            raise result
+        return result

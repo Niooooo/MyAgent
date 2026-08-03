@@ -239,7 +239,7 @@ TODO 提醒通过已有 Hook 接入，不在 Agent Loop 中增加工具名分支
 
 - Python 3.11+
 - 可从命令行调用的 `bash`（Linux/macOS 自带；Windows 可使用 Git Bash 或 WSL 中的 Bash）
-- `OPENAI_API_KEY`
+- 一个实现 OpenAI Responses API 的服务，以及通过 `OPENAI_API_KEY` 或 `myagent.config.json` 提供的 API Key
 
 ## 安装
 
@@ -271,9 +271,37 @@ myagent
 myagent "列出当前目录中的 Python 文件"
 ```
 
+先复制示例配置；真实配置 `myagent.config.json` 已加入 `.gitignore`，避免 API Key 被误提交：
+
+```powershell
+Copy-Item myagent.config.example.json myagent.config.json
+```
+
+CLI 会读取当前工作目录中的 `myagent.config.json`。它可以同时配置 OpenAI 客户端连接、主/备用模型和现有运行参数：
+
+```json
+{
+  "api_key": null,
+  "base_url": null,
+  "model": "gpt-5.6-sol",
+  "fallback_model": "gpt-5.6-terra",
+  "max_tool_rounds": 10,
+  "bash_timeout_seconds": 30,
+  "todo_reminder_tool_calls": 4,
+  "subagent_max_workers": 4,
+  "subagent_max_tasks": 16
+}
+```
+
+`api_key` 和 `base_url` 为 `null` 时沿用 OpenAI SDK 的环境变量或默认连接；也可以填写任意 OpenAI API 兼容服务的密钥、地址和模型 ID。兼容服务必须实现本项目使用的 Responses API（`/responses`），并支持工具调用、`max_output_tokens` 和 `previous_response_id` 等项目实际使用的语义；只有 Chat Completions 接口的服务不能直接使用。
+
+配置文件不存在时使用内置默认值。命令行和环境变量的优先级高于文件：`--model` → `OPENAI_MODEL` → `myagent.config.json`，`OPENAI_API_KEY`/`OPENAI_BASE_URL` → 文件连接字段，已有数值环境变量 → 文件数值字段。备用模型取自配置文件；连续 529 进入第 4、5 次重试时才会切换，429 不切换。SDK 自身重试固定关闭，不能通过配置覆盖。
+
 可通过环境变量覆盖默认配置：
 
 - `OPENAI_MODEL`：默认 `gpt-5.6-sol`
+- `OPENAI_API_KEY`：覆盖配置文件中的 `api_key`
+- `OPENAI_BASE_URL`：覆盖配置文件中的 `base_url`
 - `AGENT_MAX_TOOL_ROUNDS`：默认 `10`
 - `BASH_TIMEOUT_SECONDS`：默认 `30`
 - `TODO_REMINDER_TOOL_CALLS`：TODO List 长时间未更新提醒阈值，默认 `4`

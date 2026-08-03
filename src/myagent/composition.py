@@ -11,6 +11,7 @@ from typing import Any
 from .agent import (
     DEFAULT_INSTRUCTIONS,
     DEFAULT_MODEL,
+    FALLBACK_MODEL,
     AgentLoop,
     InstructionsProvider,
     ResponsesClient,
@@ -67,6 +68,7 @@ class AgentConfig:
     """Runtime values selected by the CLI or another application boundary."""
 
     model: str = DEFAULT_MODEL
+    fallback_model: str = FALLBACK_MODEL
     max_tool_rounds: int = 10
     bash_timeout_seconds: int = 30
     todo_reminder_tool_calls: int = DEFAULT_TODO_REMINDER_TOOL_CALLS
@@ -76,6 +78,10 @@ class AgentConfig:
     memory: MemoryConfig = field(default_factory=MemoryConfig)
 
     def __post_init__(self) -> None:
+        if not isinstance(self.model, str) or not self.model.strip():
+            raise ValueError("model must be a non-empty string")
+        if not isinstance(self.fallback_model, str) or not self.fallback_model.strip():
+            raise ValueError("fallback_model must be a non-empty string")
         if not isinstance(self.memory, MemoryConfig):
             raise TypeError("memory must be a MemoryConfig")
 
@@ -127,6 +133,7 @@ def build_default_components(
     todo_list: TodoList | None = None,
     todo_reminder_tool_calls: int | None = None,
     model: str = DEFAULT_MODEL,
+    fallback_model: str = FALLBACK_MODEL,
     instructions: str = DEFAULT_INSTRUCTIONS,
     max_tool_rounds: int = 10,
     subagent_max_workers: int = DEFAULT_SUBAGENT_MAX_WORKERS,
@@ -206,6 +213,7 @@ def build_default_components(
             child = AgentLoop(
                 client,
                 model=model,
+                fallback_model=fallback_model,
                 instructions=instructions + _SUBAGENT_INSTRUCTIONS_SUFFIX,
                 max_tool_rounds=max_tool_rounds,
                 tool_registry=child_components.tool_registry,
@@ -379,6 +387,7 @@ def create_default_agent(
         hooks=hooks,
         todo_reminder_tool_calls=selected.todo_reminder_tool_calls,
         model=selected.model,
+        fallback_model=selected.fallback_model,
         max_tool_rounds=selected.max_tool_rounds,
         subagent_max_workers=selected.subagent_max_workers,
         subagent_max_tasks=selected.subagent_max_tasks,
@@ -387,6 +396,7 @@ def create_default_agent(
     agent = AgentLoop(
         client,
         model=selected.model,
+        fallback_model=selected.fallback_model,
         max_tool_rounds=selected.max_tool_rounds,
         tool_registry=components.tool_registry,
         hooks=components.hooks,

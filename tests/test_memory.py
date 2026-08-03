@@ -18,7 +18,7 @@ from myagent.memory import (
     memory_tools,
 )
 from myagent.tooling import FunctionTool, ToolRegistry
-from tests.fakes import FakeResponses, function_call, response
+from tests.fakes import FakeAPIError, FakeResponses, function_call, response
 
 
 def _small_config(**overrides: int) -> MemoryConfig:
@@ -554,6 +554,143 @@ class HistoryCompactionTests(unittest.TestCase):
                     for item in agent.history
                 )
             )
+
+    def test_context_limit_after_normal_compaction_summarizes_complete_history(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            memory = ContextMemory(
+                ToolResultStore(temporary_directory),
+                _small_config(recent_user_turns=1),
+            )
+            responses = FakeResponses(
+                [
+                    response([], "ordinary partial-history summary"),
+                    FakeAPIError(
+                        400,
+                        body={"error": {"code": "context_length_exceeded"}},
+                    ),
+                    response([], "emergency whole-history summary"),
+                    response([], "main answer"),
+                ]
+            )
+            agent = AgentLoop(
+                SimpleNamespace(responses=responses),
+                tool_registry=_tool("noop", {"ok": True}),
+                context_memory=memory,
+            )
+            first = {"role": "user", "content": "first task"}
+            old_conclusion = {
+                "type": "message",
+                "role": "assistant",
+                "content": "old conclusion " + "x" * 800,
+            }
+            agent.history.extend([first, old_conclusion])
+            memory.record_user_turn([first])
+            memory.mark_request_succeeded()
+            memory.record_response([old_conclusion])
+            memory.mark_request_succeeded()
+
+            self.assertEqual(agent.run("current task"), "main answer")
+
+            self.assertEqual(len(responses.requests), 4)
+            normal_summary, failed_main, emergency_summary, retried_main = (
+                responses.requests
+            )
+            self.assertEqual(normal_summary["tools"], [])
+            self.assertNotEqual(failed_main["tools"], [])
+            self.assertEqual(emergency_summary["tools"], [])
+            emergency_source = emergency_summary["input"][0]["content"]
+            self.assertIn("first task", emergency_source)
+            self.assertIn("current task", emergency_source)
+            self.assertIn("ordinary partial-history summary", emergency_source)
+            self.assertEqual(len(retried_main["input"]), 1)
+            self.assertIn(
+                "emergency whole-history summary",
+                retried_main["input"][0]["content"],
+            )
+            self.assertEqual(memory.summary_count, 1)
+
+    def test_emergency_summary_failure_preserves_history_and_blocks(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            memory = ContextMemory(
+                ToolResultStore(temporary_directory),
+                _small_config(),
+            )
+            user = {"role": "user", "content": "current task"}
+            call_item = function_call("open_call", "noop", "{}")
+            history: list[object] = [user, call_item]
+            memory.record_user_turn([user])
+            memory.record_response([call_item])
+            history_before = list(history)
+            blocks_before = list(memory._blocks)
+            open_exchange_before = memory._open_exchange
+            managed_before = set(memory._managed_output_ids)
+
+            def fail(_source: str, _max_chars: int) -> str:
+                raise RuntimeError("summary request failed")
+
+            with self.assertRaisesRegex(RuntimeError, "summary request failed"):
+                memory.emergency_compact(history, fail)
+
+            self.assertEqual(history, history_before)
+            self.assertTrue(
+                all(
+                    current is previous
+                    for current, previous in zip(memory._blocks, blocks_before)
+                )
+            )
+            self.assertIs(memory._open_exchange, open_exchange_before)
+            self.assertEqual(memory._managed_output_ids, managed_before)
+
+    def test_second_context_limit_does_not_trigger_another_emergency_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            memory = ContextMemory(ToolResultStore(temporary_directory))
+            context_error = lambda: FakeAPIError(
+                400,
+                code="context_length_exceeded",
+            )
+            responses = FakeResponses(
+                [
+                    context_error(),
+                    response([], "emergency summary"),
+                    context_error(),
+                ]
+            )
+            agent = AgentLoop(
+                SimpleNamespace(responses=responses),
+                tool_registry=ToolRegistry(),
+                context_memory=memory,
+            )
+
+            with self.assertRaises(FakeAPIError):
+                agent.run("current task")
+
+            self.assertEqual(len(responses.requests), 3)
+            self.assertEqual(
+                sum(
+                    "Compress historical data" in request["instructions"]
+                    for request in responses.requests
+                ),
+                1,
+            )
+            self.assertEqual(memory.summary_count, 1)
+
+    def test_other_400_error_does_not_trigger_emergency_compaction(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            memory = ContextMemory(ToolResultStore(temporary_directory))
+            responses = FakeResponses(
+                [FakeAPIError(400, body={"error": {"code": "bad_request"}})]
+            )
+            agent = AgentLoop(
+                SimpleNamespace(responses=responses),
+                tool_registry=ToolRegistry(),
+                context_memory=memory,
+            )
+
+            with self.assertRaises(FakeAPIError):
+                agent.run("current task")
+
+            self.assertEqual(len(responses.requests), 1)
+            self.assertEqual(memory.summary_count, 0)
 
 
 class DefaultMemoryIntegrationTests(unittest.TestCase):
