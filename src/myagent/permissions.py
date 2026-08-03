@@ -11,6 +11,13 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .hooks import PreToolUse
+from .long_term_memory import (
+    DELETE_MEMORY_TOOL,
+    LONG_TERM_MEMORY_TOOL_NAMES,
+    ORGANIZE_MEMORY_TOOL,
+    STORE_MEMORY_TOOL,
+    UPDATE_MEMORY_TOOL,
+)
 from .memory import LOAD_MEMORY_TOOL
 from .skills import (
     ADD_SKILL_TOOL,
@@ -33,6 +40,7 @@ DEFAULT_TOOL_ALLOWLIST = frozenset(
         "get_todo_list",
         "record_todo_verification",
         LOAD_MEMORY_TOOL,
+        *LONG_TERM_MEMORY_TOOL_NAMES,
         *SKILL_TOOL_NAMES,
         *SUBAGENT_TOOL_NAMES,
     }
@@ -46,6 +54,14 @@ _SENSITIVE_SKILL_TOOLS = {
     ADD_SKILL_TOOL: "adding a Skill persists instructions in the workspace",
     UPDATE_SKILL_TOOL: "updating a Skill overwrites persistent instructions",
     DELETE_SKILL_TOOL: "deleting a Skill removes persistent instructions",
+}
+_SENSITIVE_LONG_TERM_MEMORY_TOOLS = {
+    STORE_MEMORY_TOOL: "storing a memory persistently changes workspace state",
+    UPDATE_MEMORY_TOOL: "updating a memory replaces persistent workspace state",
+    DELETE_MEMORY_TOOL: "deleting a memory removes persistent workspace state",
+    ORGANIZE_MEMORY_TOOL: (
+        "organizing memories can update and delete multiple persistent entries"
+    ),
 }
 _SENSITIVE_COMMANDS = {
     "chmod",
@@ -312,6 +328,12 @@ class DefaultPermissionPolicy:
             return PermissionDecision(
                 PermissionLevel.REQUIRE_APPROVAL,
                 _SENSITIVE_SKILL_TOOLS[tool_name],
+            )
+
+        if tool_name in _SENSITIVE_LONG_TERM_MEMORY_TOOLS:
+            return PermissionDecision(
+                PermissionLevel.REQUIRE_APPROVAL,
+                _SENSITIVE_LONG_TERM_MEMORY_TOOLS[tool_name],
             )
 
         if tool_name == "bash":
