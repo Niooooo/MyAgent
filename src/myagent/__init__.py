@@ -17,6 +17,17 @@ from .hooks import (
     UserPromptSubmit,
 )
 from .memory import ContextMemory, MemoryConfig, ToolResultStore, memory_tools
+from .long_term_memory import (
+    ExtractedMemory,
+    LongTermMemoryStore,
+    LongTermMemoryStoreError,
+    MemoryMetadata,
+    MemoryOrganizationResult,
+    MemoryOrganizationStatus,
+    MemoryUpdateResult,
+    OrganizationDeletion,
+    long_term_memory_tools,
+)
 from .permissions import (
     ApprovalRequest,
     DefaultPermissionPolicy,
@@ -50,6 +61,14 @@ __all__ = [
     "HookRegistry",
     "HookRejectedError",
     "InstructionsProvider",
+    "ExtractedMemory",
+    "LongTermMemoryStore",
+    "LongTermMemoryStoreError",
+    "MemoryMetadata",
+    "MemoryOrganizationResult",
+    "MemoryOrganizationStatus",
+    "MemoryUpdateResult",
+    "OrganizationDeletion",
     "ContextMemory",
     "MemoryConfig",
     "PermissionDecision",
@@ -75,6 +94,7 @@ __all__ = [
     "UserPromptSubmit",
     "create_default_agent",
     "memory_tools",
+    "long_term_memory_tools",
     "render_skill_catalog",
     "skill_tools",
 ]

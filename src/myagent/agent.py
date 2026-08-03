@@ -20,6 +20,7 @@ from .memory import ContextMemory, HISTORY_COMPACTION_INSTRUCTIONS
 from .tooling import ToolRegistry, ToolResult
 
 if TYPE_CHECKING:
+    from .long_term_memory import LongTermMemoryStore
     from .permissions import ApprovalCallback
     from .skills import SkillStore
     from .todo import TodoList
@@ -137,6 +138,7 @@ class AgentLoop:
         self._close_lock = Lock()
         self._closed = False
         self.skill_store: SkillStore | None = None
+        self.long_term_memory_store: LongTermMemoryStore | None = None
         self.context_memory: ContextMemory | None = context_memory
         if tool_registry is not None:
             if hooks is not None and tool_registry.hooks is not hooks:
@@ -165,6 +167,7 @@ class AgentLoop:
             )
             self.todo_list = components.todo_list
             self.skill_store = components.skill_store
+            self.long_term_memory_store = components.long_term_memory_store
             self.context_memory = components.context_memory
             self.tool_registry = components.tool_registry
             self.instructions_provider = _combine_instructions_providers(

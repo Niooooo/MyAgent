@@ -17,6 +17,7 @@ from .agent import (
 )
 from .filesystem import WorkspaceFiles, filesystem_tools
 from .hooks import HookRegistry, PreToolUse
+from .long_term_memory import LongTermMemoryStore, long_term_memory_tools
 from .memory import (
     ContextMemory,
     MemoryConfig,
@@ -87,6 +88,7 @@ class DefaultAgentComponents:
     hooks: HookRegistry
     todo_list: TodoList
     skill_store: SkillStore | None = None
+    long_term_memory_store: LongTermMemoryStore | None = None
     instructions_provider: InstructionsProvider | None = None
     context_memory: ContextMemory | None = None
     tool_result_store: ToolResultStore | None = None
@@ -130,6 +132,7 @@ def build_default_components(
     subagent_max_workers: int = DEFAULT_SUBAGENT_MAX_WORKERS,
     subagent_max_tasks: int = DEFAULT_SUBAGENT_MAX_TASKS,
     skill_store: SkillStore | None = None,
+    long_term_memory_store: LongTermMemoryStore | None = None,
     memory_config: MemoryConfig | None = None,
     tool_result_store: ToolResultStore | None = None,
 ) -> DefaultAgentComponents:
@@ -141,6 +144,13 @@ def build_default_components(
     if skill_store is not None and skill_store.workspace_root != workspace_root:
         raise ValueError("skill_store must use the configured workspace root")
     if (
+        long_term_memory_store is not None
+        and long_term_memory_store.workspace_root != workspace_root
+    ):
+        raise ValueError(
+            "long_term_memory_store must use the configured workspace root"
+        )
+    if (
         tool_result_store is not None
         and tool_result_store.workspace_root != workspace_root
     ):
@@ -151,6 +161,9 @@ def build_default_components(
     if not isinstance(selected_memory_config, MemoryConfig):
         raise TypeError("memory_config must be a MemoryConfig")
     shared_skill_store = skill_store or SkillStore(workspace_root)
+    shared_long_term_memory_store = (
+        long_term_memory_store or LongTermMemoryStore(workspace_root)
+    )
     shared_tool_result_store = tool_result_store or ToolResultStore(workspace_root)
     hook_registry = hooks if hooks is not None else HookRegistry()
     child_hook_template = hook_registry.clone()
@@ -186,6 +199,7 @@ def build_default_components(
                 todo_list=TodoList(),
                 todo_reminder_tool_calls=reminder_interval,
                 skill_store=shared_skill_store,
+                long_term_memory_store=shared_long_term_memory_store,
                 memory_config=selected_memory_config,
                 tool_result_store=shared_tool_result_store,
             )
@@ -201,6 +215,7 @@ def build_default_components(
             )
             child.todo_list = child_components.todo_list
             child.skill_store = child_components.skill_store
+            child.long_term_memory_store = child_components.long_term_memory_store
             return child
 
         manager = SubAgentManager(
@@ -220,6 +235,7 @@ def build_default_components(
             todo_list=todo_list if todo_list is not None else TodoList(),
             todo_reminder_tool_calls=reminder_interval,
             skill_store=shared_skill_store,
+            long_term_memory_store=shared_long_term_memory_store,
             memory_config=selected_memory_config,
             tool_result_store=shared_tool_result_store,
             additional_tools=management_tools,
@@ -236,6 +252,7 @@ def build_default_components(
         hooks=components.hooks,
         todo_list=components.todo_list,
         skill_store=components.skill_store,
+        long_term_memory_store=components.long_term_memory_store,
         instructions_provider=components.instructions_provider,
         context_memory=components.context_memory,
         tool_result_store=components.tool_result_store,
@@ -253,6 +270,7 @@ def _build_standard_components(
     todo_list: TodoList,
     todo_reminder_tool_calls: int,
     skill_store: SkillStore,
+    long_term_memory_store: LongTermMemoryStore,
     memory_config: MemoryConfig,
     tool_result_store: ToolResultStore,
     additional_tools: Iterable[FunctionTool] = (),
@@ -276,6 +294,7 @@ def _build_standard_components(
             *filesystem_tools(workspace),
             *todo_tools(todo_list),
             *skill_tools(skill_store),
+            *long_term_memory_tools(long_term_memory_store),
             *memory_tools(
                 tool_result_store,
                 max_chars=memory_config.load_memory_max_chars,
@@ -296,6 +315,7 @@ def _build_standard_components(
         hooks=hooks,
         todo_list=todo_list,
         skill_store=skill_store,
+        long_term_memory_store=long_term_memory_store,
         instructions_provider=instructions_provider,
         context_memory=ContextMemory(tool_result_store, memory_config),
         tool_result_store=tool_result_store,
@@ -377,4 +397,5 @@ def create_default_agent(
     # Keep the state discoverable on the public AgentLoop compatibility surface.
     agent.todo_list = components.todo_list
     agent.skill_store = components.skill_store
+    agent.long_term_memory_store = components.long_term_memory_store
     return agent
