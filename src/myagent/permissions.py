@@ -34,9 +34,12 @@ from .tasks import (
 )
 
 
+BACKGROUND_BASH_TOOL = "run_bash_in_background"
+
 DEFAULT_TOOL_ALLOWLIST = frozenset(
     {
         "bash",
+        BACKGROUND_BASH_TOOL,
         "read_file",
         "write_file",
         "edit_file",
@@ -354,7 +357,7 @@ class DefaultPermissionPolicy:
                 _SENSITIVE_TASK_TOOLS[tool_name],
             )
 
-        if tool_name == "bash":
+        if tool_name in {"bash", BACKGROUND_BASH_TOOL}:
             command = arguments.get("command")
             if isinstance(command, str):
                 return classify_bash_command(command)

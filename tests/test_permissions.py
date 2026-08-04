@@ -3,6 +3,7 @@ import unittest
 from myagent.tooling import FunctionTool, ToolRegistry
 from myagent.permissions import (
     ApprovalRequest,
+    BACKGROUND_BASH_TOOL,
     DefaultPermissionPolicy,
     PermissionLevel,
     PermissionManager,
@@ -112,6 +113,27 @@ class PermissionManagerTests(unittest.TestCase):
 
         self.assertEqual(decision.level, PermissionLevel.DENY)
         self.assertEqual(requests, [])
+
+    def test_background_bash_uses_the_same_command_policy(self) -> None:
+        requests = []
+        manager = PermissionManager(
+            self.policy,
+            lambda request: requests.append(request) or False,
+        )
+
+        dangerous = manager.authorize(
+            BACKGROUND_BASH_TOOL,
+            {"command": "rm -rf directory", "independent_work": "read docs"},
+        )
+        unapproved = manager.authorize(
+            BACKGROUND_BASH_TOOL,
+            {"command": "rm note.txt", "independent_work": "read docs"},
+        )
+
+        self.assertEqual(dangerous.level, PermissionLevel.DENY)
+        self.assertEqual(unapproved.level, PermissionLevel.DENY)
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0].tool_name, BACKGROUND_BASH_TOOL)
 
     def test_non_allowlisted_tool_is_denied(self) -> None:
         decision = PermissionManager(self.policy).authorize("network", {})

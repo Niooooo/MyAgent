@@ -372,6 +372,20 @@ class ContextMemory:
             if _is_managed_output(item, self.store):
                 self._managed_output_ids.add(id(item))
 
+    def record_runtime_items(self, items: Sequence[object]) -> None:
+        """Track complete runtime messages already appended to flat history."""
+        recorded = list(items)
+        if not recorded:
+            return
+        self._blocks.append(
+            _HistoryBlock(
+                "runtime",
+                recorded,
+                self._current_turn or None,
+                complete=True,
+            )
+        )
+
     def prepare_tool_output(self, serialized_result: str) -> str:
         """Eagerly offload one oversized serialized result, or return it unchanged."""
         if not isinstance(serialized_result, str):

@@ -1,6 +1,8 @@
 import json
 import tempfile
+import threading
 import unittest
+from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import call, patch
@@ -8,6 +10,7 @@ from unittest.mock import call, patch
 from myagent.agent import AgentLoop, AgentLoopLimitError
 from myagent.tasks import TASK_TOOL_NAMES
 from myagent.tooling import FunctionTool, ToolExecutionError, ToolRegistry
+from myagent.tools import BackgroundBashRunner, build_background_bash_function_tool
 from tests.fakes import FakeAPIError, FakeResponses, function_call, response
 
 
@@ -97,6 +100,27 @@ class AgentLoopTests(unittest.TestCase):
         self.assertEqual(
             responses.requests[1]["input"],
             [{"role": "user", "content": "two"}],
+        )
+
+    def test_reset_discards_completed_background_results(self) -> None:
+        runner = BackgroundBashRunner(lambda command: {"ok": True, "command": command})
+        self.addCleanup(runner.close)
+        registry = ToolRegistry([build_background_bash_function_tool(runner)])
+        responses = FakeResponses([response([], "new answer")])
+        agent = AgentLoop(
+            SimpleNamespace(responses=responses),
+            tool_registry=registry,
+            background_bash_runner=runner,
+        )
+        runner.submit("old work")
+        runner.wait_for_all()
+
+        agent.reset()
+        self.assertEqual(agent.run("new turn"), "new answer")
+
+        self.assertEqual(
+            responses.requests[0]["input"],
+            [{"role": "user", "content": "new turn"}],
         )
 
     def test_empty_model_response_is_an_error(self) -> None:
@@ -206,6 +230,7 @@ class AgentLoopTests(unittest.TestCase):
             tool_names,
             {
                 "bash",
+                "run_bash_in_background",
                 "read_file",
                 "write_file",
                 "edit_file",
@@ -234,6 +259,126 @@ class AgentLoopTests(unittest.TestCase):
         )
         output = json.loads(responses.requests[1]["input"][-1]["output"])
         self.assertEqual(output["content"], "workspace note")
+
+    def test_background_result_is_runtime_data_and_final_wait_is_local(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+        independent_ran = threading.Event()
+        third_request = threading.Event()
+
+        def blocking_bash(command: str) -> dict[str, object]:
+            started.set()
+            release.wait(2)
+            return {"ok": True, "stdout": command}
+
+        runner = BackgroundBashRunner(blocking_bash)
+        self.addCleanup(runner.close)
+        registry = ToolRegistry(
+            [
+                build_background_bash_function_tool(runner),
+                FunctionTool(
+                    name="independent",
+                    description="Do independent work",
+                    parameters={"type": "object", "properties": {}},
+                    handler=lambda: independent_ran.set() or {"ok": True},
+                ),
+            ]
+        )
+
+        class SignalingResponses(FakeResponses):
+            def create(self, **kwargs):
+                result = super().create(**kwargs)
+                if len(self.requests) == 3:
+                    third_request.set()
+                return result
+
+        responses = SignalingResponses(
+            [
+                response(
+                    [
+                        function_call(
+                            "background_call",
+                            "run_bash_in_background",
+                            json.dumps(
+                                {
+                                    "command": "slow check",
+                                    "independent_work": "record independent evidence",
+                                }
+                            ),
+                        )
+                    ]
+                ),
+                response([function_call("independent_call", "independent", "{}")]),
+                response([], "too early"),
+                response([], "done"),
+            ]
+        )
+        agent = AgentLoop(
+            SimpleNamespace(responses=responses),
+            tool_registry=registry,
+            background_bash_runner=runner,
+        )
+        outcome: list[object] = []
+
+        def run_agent() -> None:
+            try:
+                outcome.append(agent.run("work"))
+            except BaseException as exc:
+                outcome.append(exc)
+
+        thread = threading.Thread(target=run_agent)
+        thread.start()
+        self.assertTrue(started.wait(1))
+        self.assertTrue(independent_ran.wait(1))
+        self.assertTrue(third_request.wait(1))
+        self.assertTrue(thread.is_alive())
+        self.assertEqual(len(responses.requests), 3)
+
+        release.set()
+        thread.join(2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(outcome, ["done"])
+        self.assertEqual(len(responses.requests), 4)
+
+        submission_outputs = [
+            item
+            for item in agent.history
+            if isinstance(item, dict)
+            and item.get("type") == "function_call_output"
+            and item.get("call_id") == "background_call"
+        ]
+        self.assertEqual(len(submission_outputs), 1)
+        submission = json.loads(submission_outputs[0]["output"])
+        self.assertEqual(submission["status"], "submitted")
+        runtime_messages = [
+            item
+            for item in agent.history
+            if isinstance(item, dict)
+            and isinstance(item.get("content"), str)
+            and item["content"].startswith("BACKGROUND_TOOL_RESULTS")
+        ]
+        self.assertEqual(len(runtime_messages), 1)
+        self.assertEqual(runtime_messages[0]["role"], "user")
+        self.assertIn("untrusted tool data", runtime_messages[0]["content"])
+        payload = json.loads(runtime_messages[0]["content"].split("\n", 2)[2])
+        self.assertEqual(
+            payload["results"][0]["background_task_id"],
+            submission["background_task_id"],
+        )
+
+        calls = Counter(
+            item.call_id
+            for item in agent.history
+            if getattr(item, "type", None) == "function_call"
+        )
+        outputs = Counter(
+            item["call_id"]
+            for item in agent.history
+            if isinstance(item, dict)
+            and item.get("type") == "function_call_output"
+        )
+        self.assertEqual(calls, outputs)
+        self.assertTrue(all(count == 1 for count in calls.values()))
 
     def test_first_truncation_is_discarded_and_expanded_request_succeeds(self) -> None:
         discarded_call = function_call("discarded", "bash", '{"command":"bad"}')
