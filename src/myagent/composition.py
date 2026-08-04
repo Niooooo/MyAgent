@@ -48,7 +48,12 @@ from .todo import (
     todo_tools,
 )
 from .tooling import FunctionTool, ToolRegistry
-from .tools import BashTool, build_bash_function_tool
+from .tools import (
+    BackgroundBashRunner,
+    BashTool,
+    build_background_bash_function_tool,
+    build_bash_function_tool,
+)
 
 
 _SUBAGENT_INSTRUCTIONS_SUFFIX = """
@@ -100,6 +105,7 @@ class DefaultAgentComponents:
     instructions_provider: InstructionsProvider | None = None
     context_memory: ContextMemory | None = None
     tool_result_store: ToolResultStore | None = None
+    background_bash_runner: BackgroundBashRunner | None = None
     _close_callback: Callable[[], None] = field(
         default=_noop,
         repr=False,
@@ -199,6 +205,11 @@ def build_default_components(
         def make_bash_handler() -> Callable[[str], dict[str, Any]]:
             return shared_bash_handler
 
+    main_bash_handler = make_bash_handler()
+    background_bash_runner = (
+        BackgroundBashRunner(main_bash_handler) if client is not None else None
+    )
+
     manager: SubAgentManager | None = None
     management_tools = []
     if client is not None:
@@ -244,7 +255,7 @@ def build_default_components(
     try:
         components = _build_standard_components(
             cwd=workspace_root,
-            bash_handler=make_bash_handler(),
+            bash_handler=main_bash_handler,
             allowed_tools=main_allowed_tools,
             approval_callback=approval_callback,
             hooks=hook_registry,
@@ -255,15 +266,33 @@ def build_default_components(
             memory_config=selected_memory_config,
             tool_result_store=shared_tool_result_store,
             task_store=shared_task_store,
-            additional_tools=management_tools,
+            additional_tools=[
+                *management_tools,
+                *(
+                    [build_background_bash_function_tool(background_bash_runner)]
+                    if background_bash_runner is not None
+                    else []
+                ),
+            ],
         )
     except BaseException:
+        if background_bash_runner is not None:
+            background_bash_runner.close()
         if manager is not None:
             manager.close()
         raise
 
-    if manager is None:
+    if manager is None and background_bash_runner is None:
         return components
+
+    def close_runtime() -> None:
+        try:
+            if background_bash_runner is not None:
+                background_bash_runner.close()
+        finally:
+            if manager is not None:
+                manager.close()
+
     return DefaultAgentComponents(
         tool_registry=components.tool_registry,
         hooks=components.hooks,
@@ -274,7 +303,8 @@ def build_default_components(
         instructions_provider=components.instructions_provider,
         context_memory=components.context_memory,
         tool_result_store=components.tool_result_store,
-        _close_callback=manager.close,
+        background_bash_runner=background_bash_runner,
+        _close_callback=close_runtime,
     )
 
 
@@ -415,6 +445,7 @@ def create_default_agent(
         hooks=components.hooks,
         instructions_provider=components.instructions_provider,
         context_memory=components.context_memory,
+        background_bash_runner=components.background_bash_runner,
         close_callback=components.close,
     )
     # Keep the state discoverable on the public AgentLoop compatibility surface.

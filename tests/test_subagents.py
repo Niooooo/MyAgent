@@ -94,6 +94,10 @@ class SubAgentIntegrationTests(unittest.TestCase):
 
         self.assertEqual(answer, "parent final text")
         self.assertEqual(commands, ["pwd"])
+        self.assertNotIn(
+            "run_bash_in_background",
+            {definition["name"] for definition in responses.requests[1]["tools"]},
+        )
         self.assertNotIn(child_reasoning, agent.history)
         self.assertNotIn(child_call, agent.history)
         self.assertFalse(

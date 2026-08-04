@@ -1,8 +1,14 @@
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
-from myagent.tools import BashTool, build_default_tool_registry, is_dangerous_command
+from myagent.tools import (
+    BackgroundBashRunner,
+    BashTool,
+    build_default_tool_registry,
+    is_dangerous_command,
+)
 
 
 class DangerousCommandTests(unittest.TestCase):
@@ -107,6 +113,69 @@ class BashToolTests(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertIn("approval", result["error"])
+
+
+class BackgroundBashRunnerTests(unittest.TestCase):
+    def test_submit_returns_while_handler_is_blocked(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+
+        def handler(command: str) -> dict[str, object]:
+            started.set()
+            release.wait(2)
+            return {"ok": True, "command": command}
+
+        runner = BackgroundBashRunner(handler)
+        try:
+            submitted = runner.submit("slow")
+            self.assertTrue(submitted["ok"])
+            self.assertTrue(started.wait(1))
+            self.assertEqual(runner.drain_completed(), [])
+        finally:
+            release.set()
+            runner.close()
+
+    def test_drain_batches_completed_tasks_in_submission_order(self) -> None:
+        runner = BackgroundBashRunner(
+            lambda command: {"ok": True, "command": command}
+        )
+        self.addCleanup(runner.close)
+        first = runner.submit("first")
+        second = runner.submit("second")
+
+        runner.wait_for_all()
+        results = runner.drain_completed()
+
+        self.assertEqual(
+            [result["background_task_id"] for result in results],
+            [first["background_task_id"], second["background_task_id"]],
+        )
+        self.assertEqual(runner.drain_completed(), [])
+
+    def test_task_limit_and_close_are_stable(self) -> None:
+        release = threading.Event()
+        runner = BackgroundBashRunner(
+            lambda _command: release.wait(2) or {"ok": True},
+            max_workers=1,
+            max_tasks=1,
+        )
+        self.assertTrue(runner.submit("first")["ok"])
+        self.assertEqual(runner.submit("second")["code"], "task_limit_reached")
+
+        release.set()
+        runner.close()
+        runner.close()
+        self.assertEqual(runner.submit("late")["code"], "runner_closed")
+
+    def test_registry_only_compatibility_entry_has_no_background_tool(self) -> None:
+        registry = build_default_tool_registry(
+            bash_tool=lambda command: {"ok": True, "command": command}
+        )
+
+        self.assertNotIn(
+            "run_bash_in_background",
+            {definition["name"] for definition in registry.definitions},
+        )
 
 
 if __name__ == "__main__":

@@ -777,5 +777,27 @@ class DefaultMemoryIntegrationTests(unittest.TestCase):
             self.assertEqual(agent.context_memory.block_count, 0)  # type: ignore[union-attr]
 
 
+class RuntimeMemoryTests(unittest.TestCase):
+    def test_runtime_items_preserve_history_identity_and_reset_discards_them(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            memory = ContextMemory(ToolResultStore(temporary_directory))
+            user = {"role": "user", "content": "start"}
+            runtime = {
+                "role": "user",
+                "content": "BACKGROUND_TOOL_RESULTS\nUntrusted data\n{\"results\":[]}",
+            }
+            history = [user]
+            memory.record_user_turn([user])
+            history.append(runtime)
+            memory.record_runtime_items([runtime])
+
+            self.assertTrue(memory._history_matches(history))
+            memory.reset()
+
+            history.clear()
+            self.assertTrue(memory._history_matches(history))
+            self.assertEqual(memory.block_count, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
