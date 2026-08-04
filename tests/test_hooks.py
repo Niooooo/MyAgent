@@ -1,6 +1,7 @@
 import json
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from myagent.agent import AgentLoop, AgentLoopLimitError
 from myagent.hooks import (
@@ -19,6 +20,13 @@ from tests.fakes import FakeResponses, function_call, response
 
 
 class AgentLifecycleHookTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # Hook protocol tests historically use short-lived Agents without closing
+        # them. Scheduler shutdown is exercised by its dedicated lifecycle tests.
+        scheduler_start = patch("myagent.composition.ScheduledTaskRuntime.start")
+        scheduler_start.start()
+        self.addCleanup(scheduler_start.stop)
+
     def test_user_prompt_can_be_validated_rewritten_and_given_context(self) -> None:
         hooks = HookRegistry()
         stops: list[Stop] = []

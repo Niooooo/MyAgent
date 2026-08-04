@@ -40,6 +40,11 @@ from .subagents import (
     SubAgentManager,
     subagent_tools,
 )
+from .scheduled_tasks import (
+    SCHEDULED_TASK_TOOL_NAMES,
+    ScheduledTaskRuntime,
+    scheduled_task_tools,
+)
 from .tasks import TaskStore, task_tools
 from .todo import (
     DEFAULT_TODO_REMINDER_TOOL_CALLS,
@@ -106,6 +111,7 @@ class DefaultAgentComponents:
     context_memory: ContextMemory | None = None
     tool_result_store: ToolResultStore | None = None
     background_bash_runner: BackgroundBashRunner | None = None
+    scheduled_task_runtime: ScheduledTaskRuntime | None = None
     _close_callback: Callable[[], None] = field(
         default=_noop,
         repr=False,
@@ -212,6 +218,7 @@ def build_default_components(
 
     manager: SubAgentManager | None = None
     management_tools = []
+    scheduled_task_runtime: ScheduledTaskRuntime | None = None
     if client is not None:
         def create_subagent() -> AgentLoop:
             child_components = _build_standard_components(
@@ -228,17 +235,22 @@ def build_default_components(
                 tool_result_store=shared_tool_result_store,
                 task_store=shared_task_store,
             )
-            child = AgentLoop(
-                client,
-                model=model,
-                fallback_model=fallback_model,
-                instructions=instructions + _SUBAGENT_INSTRUCTIONS_SUFFIX,
-                max_tool_rounds=max_tool_rounds,
-                tool_registry=child_components.tool_registry,
-                hooks=child_components.hooks,
-                instructions_provider=child_components.instructions_provider,
-                context_memory=child_components.context_memory,
-            )
+            try:
+                child = AgentLoop(
+                    client,
+                    model=model,
+                    fallback_model=fallback_model,
+                    instructions=instructions + _SUBAGENT_INSTRUCTIONS_SUFFIX,
+                    max_tool_rounds=max_tool_rounds,
+                    tool_registry=child_components.tool_registry,
+                    hooks=child_components.hooks,
+                    instructions_provider=child_components.instructions_provider,
+                    context_memory=child_components.context_memory,
+                    close_callback=child_components.close,
+                )
+            except BaseException:
+                child_components.close()
+                raise
             child.todo_list = child_components.todo_list
             child.skill_store = child_components.skill_store
             child.long_term_memory_store = child_components.long_term_memory_store
@@ -276,22 +288,70 @@ def build_default_components(
             ],
         )
     except BaseException:
-        if background_bash_runner is not None:
-            background_bash_runner.close()
-        if manager is not None:
-            manager.close()
+        try:
+            if scheduled_task_runtime is not None:
+                scheduled_task_runtime.close()
+        finally:
+            try:
+                if background_bash_runner is not None:
+                    background_bash_runner.close()
+            finally:
+                if manager is not None:
+                    manager.close()
         raise
 
-    if manager is None and background_bash_runner is None:
+    if client is not None:
+        try:
+            schedulable_tool_names = {
+                definition["name"]
+                for definition in components.tool_registry.definitions
+            }.difference(SCHEDULED_TASK_TOOL_NAMES)
+
+            def execute_scheduled_tool(tool_name: str, tool_arguments: str) -> object:
+                return components.tool_registry.execute(
+                    tool_name,
+                    tool_arguments,
+                    call_id=None,
+                )
+
+            scheduled_task_runtime = ScheduledTaskRuntime(
+                execute_scheduled_tool,
+                schedulable_tool_names,
+            )
+            for tool in scheduled_task_tools(scheduled_task_runtime):
+                components.tool_registry.register(tool)
+            scheduled_task_runtime.start()
+        except BaseException:
+            try:
+                if scheduled_task_runtime is not None:
+                    scheduled_task_runtime.close()
+            finally:
+                try:
+                    if background_bash_runner is not None:
+                        background_bash_runner.close()
+                finally:
+                    if manager is not None:
+                        manager.close()
+            raise
+
+    if (
+        manager is None
+        and background_bash_runner is None
+        and scheduled_task_runtime is None
+    ):
         return components
 
     def close_runtime() -> None:
         try:
-            if background_bash_runner is not None:
-                background_bash_runner.close()
+            if scheduled_task_runtime is not None:
+                scheduled_task_runtime.close()
         finally:
-            if manager is not None:
-                manager.close()
+            try:
+                if background_bash_runner is not None:
+                    background_bash_runner.close()
+            finally:
+                if manager is not None:
+                    manager.close()
 
     return DefaultAgentComponents(
         tool_registry=components.tool_registry,
@@ -304,6 +364,7 @@ def build_default_components(
         context_memory=components.context_memory,
         tool_result_store=components.tool_result_store,
         background_bash_runner=background_bash_runner,
+        scheduled_task_runtime=scheduled_task_runtime,
         _close_callback=close_runtime,
     )
 
@@ -384,11 +445,15 @@ def _split_allowed_tools(
     allowed_tools: Iterable[str] | None,
 ) -> tuple[frozenset[str] | None, frozenset[str]]:
     if allowed_tools is None:
-        return None, DEFAULT_TOOL_ALLOWLIST.difference(SUBAGENT_TOOL_NAMES)
+        return None, DEFAULT_TOOL_ALLOWLIST.difference(
+            SUBAGENT_TOOL_NAMES | SCHEDULED_TASK_TOOL_NAMES
+        )
     if isinstance(allowed_tools, str):
         raise TypeError("allowed_tools must be an iterable of tool names, not a string")
     selected = frozenset(allowed_tools)
-    return selected, selected.difference(SUBAGENT_TOOL_NAMES)
+    return selected, selected.difference(
+        SUBAGENT_TOOL_NAMES | SCHEDULED_TASK_TOOL_NAMES
+    )
 
 
 def build_default_tool_registry(
@@ -436,21 +501,27 @@ def create_default_agent(
         subagent_max_tasks=selected.subagent_max_tasks,
         memory_config=selected.memory,
     )
-    agent = AgentLoop(
-        client,
-        model=selected.model,
-        fallback_model=selected.fallback_model,
-        max_tool_rounds=selected.max_tool_rounds,
-        tool_registry=components.tool_registry,
-        hooks=components.hooks,
-        instructions_provider=components.instructions_provider,
-        context_memory=components.context_memory,
-        background_bash_runner=components.background_bash_runner,
-        close_callback=components.close,
-    )
+    try:
+        agent = AgentLoop(
+            client,
+            model=selected.model,
+            fallback_model=selected.fallback_model,
+            max_tool_rounds=selected.max_tool_rounds,
+            tool_registry=components.tool_registry,
+            hooks=components.hooks,
+            instructions_provider=components.instructions_provider,
+            context_memory=components.context_memory,
+            background_bash_runner=components.background_bash_runner,
+            scheduled_task_runtime=components.scheduled_task_runtime,
+            close_callback=components.close,
+        )
+    except BaseException:
+        components.close()
+        raise
     # Keep the state discoverable on the public AgentLoop compatibility surface.
     agent.todo_list = components.todo_list
     agent.skill_store = components.skill_store
     agent.long_term_memory_store = components.long_term_memory_store
     agent.task_store = components.task_store
+    agent.scheduled_task_runtime = components.scheduled_task_runtime
     return agent

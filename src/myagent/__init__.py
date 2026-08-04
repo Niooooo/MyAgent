@@ -38,6 +38,11 @@ from .permissions import (
     PermissionPolicy,
 )
 from .subagents import SubAgentManager
+from .scheduled_tasks import (
+    ScheduledTask,
+    ScheduledTaskRuntime,
+    scheduled_task_tools,
+)
 from .skills import (
     Skill,
     SkillStore,
@@ -82,6 +87,8 @@ __all__ = [
     "Stop",
     "StopReason",
     "SubAgentManager",
+    "ScheduledTask",
+    "ScheduledTaskRuntime",
     "Skill",
     "SkillStore",
     "SkillStoreError",
@@ -102,5 +109,6 @@ __all__ = [
     "long_term_memory_tools",
     "render_skill_catalog",
     "skill_tools",
+    "scheduled_task_tools",
     "task_tools",
 ]

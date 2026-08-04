@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import call, patch
 
 from myagent.agent import AgentLoop, AgentLoopLimitError
+from myagent.scheduled_tasks import SCHEDULED_TASK_TOOL_NAMES
 from myagent.tasks import TASK_TOOL_NAMES
 from myagent.tooling import FunctionTool, ToolExecutionError, ToolRegistry
 from myagent.tools import BackgroundBashRunner, build_background_bash_function_tool
@@ -15,6 +16,15 @@ from tests.fakes import FakeAPIError, FakeResponses, function_call, response
 
 
 class AgentLoopTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # These protocol tests do not exercise scheduler lifecycle and historically
+        # construct short-lived default Agents without closing each one. Prevent
+        # unrelated non-daemon scheduler workers here; lifecycle is covered in the
+        # dedicated scheduled-task integration tests.
+        scheduler_start = patch("myagent.composition.ScheduledTaskRuntime.start")
+        scheduler_start.start()
+        self.addCleanup(scheduler_start.stop)
+
     def test_normal_request_uses_default_output_limit(self) -> None:
         responses = FakeResponses([response([], "done")])
         agent = AgentLoop(
@@ -255,6 +265,7 @@ class AgentLoopTests(unittest.TestCase):
                 "run_subagent",
                 "fork_subagent",
                 "collect_subagent",
+                *SCHEDULED_TASK_TOOL_NAMES,
             },
         )
         output = json.loads(responses.requests[1]["input"][-1]["output"])

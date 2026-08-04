@@ -19,6 +19,12 @@ from .long_term_memory import (
     UPDATE_MEMORY_TOOL,
 )
 from .memory import LOAD_MEMORY_TOOL
+from .scheduled_tasks import (
+    DELETE_SCHEDULED_TASK_TOOL,
+    REGISTER_ONE_TIME_TASK_TOOL,
+    REGISTER_SCHEDULED_TASK_TOOL,
+    SCHEDULED_TASK_TOOL_NAMES,
+)
 from .skills import (
     ADD_SKILL_TOOL,
     DELETE_SKILL_TOOL,
@@ -53,6 +59,7 @@ DEFAULT_TOOL_ALLOWLIST = frozenset(
         *SKILL_TOOL_NAMES,
         *TASK_TOOL_NAMES,
         *SUBAGENT_TOOL_NAMES,
+        *SCHEDULED_TASK_TOOL_NAMES,
     }
 )
 
@@ -77,6 +84,17 @@ _SENSITIVE_TASK_TOOLS = {
     CREATE_TASK_TOOL: "creating a task persists workspace task state",
     CLAIM_TASK_TOOL: "claiming a task changes persistent workspace task state",
     COMPLETE_TASK_TOOL: "completing a task changes persistent workspace task state",
+}
+_SENSITIVE_SCHEDULED_TASK_TOOLS = {
+    REGISTER_SCHEDULED_TASK_TOOL: (
+        "registering a recurring schedule changes in-process background execution state"
+    ),
+    REGISTER_ONE_TIME_TASK_TOOL: (
+        "registering a one-time schedule changes in-process background execution state"
+    ),
+    DELETE_SCHEDULED_TASK_TOOL: (
+        "deleting a schedule changes in-process background execution state"
+    ),
 }
 _SENSITIVE_COMMANDS = {
     "chmod",
@@ -355,6 +373,12 @@ class DefaultPermissionPolicy:
             return PermissionDecision(
                 PermissionLevel.REQUIRE_APPROVAL,
                 _SENSITIVE_TASK_TOOLS[tool_name],
+            )
+
+        if tool_name in _SENSITIVE_SCHEDULED_TASK_TOOLS:
+            return PermissionDecision(
+                PermissionLevel.REQUIRE_APPROVAL,
+                _SENSITIVE_SCHEDULED_TASK_TOOLS[tool_name],
             )
 
         if tool_name in {"bash", BACKGROUND_BASH_TOOL}:
