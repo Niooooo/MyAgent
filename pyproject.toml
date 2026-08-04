@@ -9,6 +9,7 @@ description = "An OpenAI Responses API agent loop with local shell and file tool
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "croniter>=6.2.4,<7",
     "openai>=1.66.0,<3",
 ]
 

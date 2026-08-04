@@ -26,6 +26,7 @@ from .tools import BackgroundBashRunner
 if TYPE_CHECKING:
     from .long_term_memory import LongTermMemoryStore
     from .permissions import ApprovalCallback
+    from .scheduled_tasks import ScheduledTaskRuntime
     from .skills import SkillStore
     from .tasks import TaskStore
     from .todo import TodoList
@@ -122,6 +123,7 @@ class AgentLoop:
         todo_list: TodoList | None = None,
         todo_reminder_tool_calls: int | None = None,
         background_bash_runner: BackgroundBashRunner | None = None,
+        scheduled_task_runtime: ScheduledTaskRuntime | None = None,
         close_callback: Callable[[], None] | None = None,
     ) -> None:
         if max_tool_rounds < 0:
@@ -147,6 +149,17 @@ class AgentLoop:
         if tool_registry is None and background_bash_runner is not None:
             raise ValueError(
                 "background_bash_runner requires an explicit tool_registry"
+            )
+        if scheduled_task_runtime is not None:
+            from .scheduled_tasks import ScheduledTaskRuntime
+
+            if not isinstance(scheduled_task_runtime, ScheduledTaskRuntime):
+                raise TypeError(
+                    "scheduled_task_runtime must be a ScheduledTaskRuntime"
+                )
+        if tool_registry is None and scheduled_task_runtime is not None:
+            raise ValueError(
+                "scheduled_task_runtime requires an explicit tool_registry"
             )
         if tool_registry is not None and any(
             value is not None
@@ -178,6 +191,7 @@ class AgentLoop:
         self.task_store: TaskStore | None = None
         self.context_memory: ContextMemory | None = context_memory
         self.background_bash_runner = background_bash_runner
+        self.scheduled_task_runtime = scheduled_task_runtime
         if tool_registry is not None:
             if hooks is not None and tool_registry.hooks is not hooks:
                 raise ValueError(
@@ -210,6 +224,7 @@ class AgentLoop:
             self.task_store = components.task_store
             self.context_memory = components.context_memory
             self.background_bash_runner = components.background_bash_runner
+            self.scheduled_task_runtime = components.scheduled_task_runtime
             self.tool_registry = components.tool_registry
             self.instructions_provider = _combine_instructions_providers(
                 self.instructions_provider,

@@ -30,9 +30,12 @@ composition.create_default_agent
         |-- ToolRegistry <---- HookRegistry
         |       |              |-- PermissionHook（首个 PreToolUse）
         |       |              `-- TodoReminder
-        |       `-- Bash / Filesystem / TODO / Task / Skill / Memory / SubAgent FunctionTools
+        |       `-- Bash / Filesystem / TODO / Task / Skill / Memory / SubAgent / Scheduled FunctionTools
         |-- SubAgentManager（有界 ThreadPoolExecutor）
-        |       `-- 新 AgentLoop -> 共享 Stores、独立 ContextMemory、不含 SubAgent tools
+        |       `-- 新 AgentLoop -> 共享 Stores、独立 ContextMemory、不含管理 tools
+        |-- ScheduledTaskRuntime（进程内注册表 + 重复/一次性调度）
+        |       |-- 每秒扫描 -> 有界 ready_at 优先队列（最多 100）
+        |       `-- 单消费者 -> 主 ToolRegistry.execute（call_id=None）
         `-- TodoList（每个 Agent 实例独立）
 ```
 
@@ -60,6 +63,7 @@ AgentLoop -> Responses API -> function_call
 | `todo.py` | 实例级 TODO 状态、版本化验证、TODO tools 和 Hook 驱动提醒 |
 | `tasks.py` | workspace 级持久化任务 DAG、生命周期/owner 规则、并发认领、原子提交及六个 FunctionTool |
 | `subagents.py` | 同步子 Agent、后台 Fork、结果状态/收取、有界并发和 executor 关闭 |
+| `scheduled_tasks.py` | 进程内重复 cron 与一次性注册、去重、抖动、有界延迟队列、串行消费及三个 FunctionTool |
 
 应用入口推荐使用 `create_default_agent(client, config=AgentConfig(...))`。现有的 `AgentLoop(client, bash_tool=..., workspace_root=..., ...)` 构造方式与 `myagent.tools.build_default_tool_registry` 导入路径仍作为兼容入口保留；它们最终也委托给同一个 composition root。
 
@@ -90,6 +94,9 @@ AgentLoop -> Responses API -> function_call
 | `run_subagent` | 阻塞运行一个全新的子 Agent，只返回最终文本 |
 | `fork_subagent` | 在有界后台线程池启动独立子 Agent，立即返回 `fork_id` |
 | `collect_subagent` | 轮询或限时等待 Fork；终态结果只可收取一次 |
+| `register_scheduled_task` | 注册重复执行的进程内五字段 cron 任务；返回 32 位十六进制 ID；逐次审批 |
+| `register_one_time_task` | 注册在带时区 ISO 8601 时刻执行一次的任务；逐次审批 |
+| `delete_scheduled_task` | 删除定时任务并使尚未开始的旧排队项失效；逐次审批 |
 
 文件类工具统一限制在启动 `myagent` 时的工作目录内。工具定义、权限检查和执行都经过 `ToolRegistry` 的唯一入口；新增工具时只需提供 schema 与 handler，不需要继续扩展 Agent Loop 的条件分支。
 
@@ -253,6 +260,16 @@ Task system 与 TODO 是两种不同的状态：TODO 属于单个 Agent 实例�
 
 任务文件使用 UTF-8 JSON、同目录临时文件、flush/fsync 和 `os.replace` 原子替换；只读操作不会创建任务目录。当前锁只承诺共享 `TaskStore` 实例内的线程安全，不提供多进程锁或分布式一致性。`create_task`、`claim_task`、`complete_task` 每次调用都需要用户审批；`is_task_executable`、`list_tasks`、`get_task` 默认只读允许。审批缺失或被拒绝时 handler 不会执行，也不会创建任务存储目录。`agent.reset()` 只重置原有内存会话状态，不清空持久化任务。
 
+## 进程内定时任务
+
+定时任务分为两种：`register_scheduled_task` 使用标准五字段 `minute hour day-of-month month day-of-week` cron 重复执行；`register_one_time_task` 接收带时区的未来 ISO 8601 `run_at`，在到期后只执行一次。两者都接收当前可见的目标工具名，以及编码为字符串的 JSON object 参数；cron 不支持秒、年份、每任务时区或 `@daily` 等别名。参数会在注册时解析并保存为规范化字符串快照。运行时使用进程当前本地时区，每秒扫描一次；重复任务把当前时间归一到分钟桶，同一注册在同一分钟最多成功入队一次，一次性任务则在成功开始执行时自动移除。
+
+每次匹配都会产生 0–30 秒抖动，并以 monotonic `ready_at` 进入最多 100 项的有界优先队列；注册表也最多 100 项。队列满时扫描不阻塞，也不提前提交该分钟的去重状态，因此容量释放后同一分钟可以重试。单一消费线程只在 `ready_at` 到达后串行执行；删除会原子移除注册和去重状态，消费前的最终快照校验会跳过该任务尚未开始的旧排队项，但不会中断已经开始的执行。
+
+触发时，单消费者直接调用主 Agent 已有的 `ToolRegistry.execute(tool_name, tool_arguments, call_id=None)`；目标工具仍逐次经过当前 allowlist、`PermissionHook`、`PreToolUse`、handler 和 `PostToolUse`，注册时的批准不会成为未来执行的永久授权。后台触发不是 Responses API function call，因此不会创建 `AgentLoop`、不会发起 Responses 请求、不会生成 `function_call_output`，也不会写入主 Agent history。
+
+注册数据、分钟去重和排队项都只存在于当前进程，不跨重启持久化，也不与 `.myagent/tasks/tasks.json` 的 DAG Task system 合并。`agent.reset()` 保留同一进程内的注册；`agent.close()` 先关闭调度器、放弃未开始项并等待正在执行的任务结束，再关闭其他后台资源。
+
 ## 环境要求
 
 - Python 3.11+
@@ -334,9 +351,9 @@ CLI 会读取当前工作目录中的 `myagent.config.json`。它可以同时配
 
 工具执行前会按以下顺序经过独立的权限层：
 
-1. **工具白名单**：默认只暴露并允许内置 Shell、文件、TODO、Task、Skill、Memory 和主 Agent 的 SubAgent 管理工具。不在白名单中的工具即使已经注册，也不会发送给模型，并且直接调用同样会被拒绝。
+1. **工具白名单**：默认只暴露并允许内置 Shell、文件、TODO、Task、Skill、Memory，以及主 Agent 的 SubAgent 和定时任务管理工具。不在白名单中的工具即使已经注册，也不会发送给模型，并且直接调用同样会被拒绝。
 2. **永远禁止**：递归且强制删除的 `rm` 命令（例如 `rm -rf`、`rm -fr`、`rm -r -f` 和 `rm --recursive --force`）直接拒绝，审批回调不能将其放行。
-3. **逐次审批**：普通 `rm`、明确的删除/覆盖类 Shell 命令、Shell 输出重定向、`write_file`、`edit_file`、`create_task`、`claim_task`、`complete_task`、`add_skill`、`update_skill` 和 `delete_skill` 会展示工具名、原因和完整参数。只有用户对本次调用输入 `y` 或 `yes` 后才会执行；直接回车、拒绝、审批回调异常、输入中断或未配置审批器都会拒绝。
+3. **逐次审批**：普通 `rm`、明确的删除/覆盖类 Shell 命令、Shell 输出重定向、`write_file`、`edit_file`、`create_task`、`claim_task`、`complete_task`、`add_skill`、`update_skill`、`delete_skill`、`register_scheduled_task`、`register_one_time_task` 和 `delete_scheduled_task` 会展示工具名、原因和完整参数。只有用户对本次调用输入 `y` 或 `yes` 后才会执行；直接回车、拒绝、审批回调异常、输入中断或未配置审批器都会拒绝。
 
 通过 Python 创建 Agent 时，可以缩小工具白名单并注入自己的审批 UI：
 
