@@ -26,6 +26,12 @@ from .skills import (
     UPDATE_SKILL_TOOL,
 )
 from .subagents import SUBAGENT_TOOL_NAMES
+from .tasks import (
+    CLAIM_TASK_TOOL,
+    COMPLETE_TASK_TOOL,
+    CREATE_TASK_TOOL,
+    TASK_TOOL_NAMES,
+)
 
 
 DEFAULT_TOOL_ALLOWLIST = frozenset(
@@ -42,6 +48,7 @@ DEFAULT_TOOL_ALLOWLIST = frozenset(
         LOAD_MEMORY_TOOL,
         *LONG_TERM_MEMORY_TOOL_NAMES,
         *SKILL_TOOL_NAMES,
+        *TASK_TOOL_NAMES,
         *SUBAGENT_TOOL_NAMES,
     }
 )
@@ -62,6 +69,11 @@ _SENSITIVE_LONG_TERM_MEMORY_TOOLS = {
     ORGANIZE_MEMORY_TOOL: (
         "organizing memories can update and delete multiple persistent entries"
     ),
+}
+_SENSITIVE_TASK_TOOLS = {
+    CREATE_TASK_TOOL: "creating a task persists workspace task state",
+    CLAIM_TASK_TOOL: "claiming a task changes persistent workspace task state",
+    COMPLETE_TASK_TOOL: "completing a task changes persistent workspace task state",
 }
 _SENSITIVE_COMMANDS = {
     "chmod",
@@ -334,6 +346,12 @@ class DefaultPermissionPolicy:
             return PermissionDecision(
                 PermissionLevel.REQUIRE_APPROVAL,
                 _SENSITIVE_LONG_TERM_MEMORY_TOOLS[tool_name],
+            )
+
+        if tool_name in _SENSITIVE_TASK_TOOLS:
+            return PermissionDecision(
+                PermissionLevel.REQUIRE_APPROVAL,
+                _SENSITIVE_TASK_TOOLS[tool_name],
             )
 
         if tool_name == "bash":

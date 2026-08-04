@@ -23,13 +23,14 @@ composition.create_default_agent
         |-- shared SkillStore <---- .myagent/skills/*.md
         |       `-- dynamic Catalog provider（每次请求重新读取）
         |-- shared ToolResultStore <---- .myagent/memory/tool-results/*.json
+        |-- shared TaskStore <---- .myagent/tasks/tasks.json
         |-- AgentLoop
         |       |-- 基础 instructions + metadata-only Skill Catalog
         |       `-- 独立 ContextMemory（history 块与压缩状态）
         |-- ToolRegistry <---- HookRegistry
         |       |              |-- PermissionHook（首个 PreToolUse）
         |       |              `-- TodoReminder
-        |       `-- Bash / Filesystem / TODO / Skill / Memory / SubAgent FunctionTools
+        |       `-- Bash / Filesystem / TODO / Task / Skill / Memory / SubAgent FunctionTools
         |-- SubAgentManager（有界 ThreadPoolExecutor）
         |       `-- 新 AgentLoop -> 共享 Stores、独立 ContextMemory、不含 SubAgent tools
         `-- TodoList（每个 Agent 实例独立）
@@ -47,7 +48,7 @@ AgentLoop -> Responses API -> function_call
 | 模块 | 职责 |
 | --- | --- |
 | `cli.py` | 命令行参数、环境变量配置、OpenAI 客户端创建和终端输入输出 |
-| `composition.py` | 唯一的默认 composition root；创建并连接 Agent、Registry、Hook、权限、TODO 和本地工具 |
+| `composition.py` | 唯一的默认 composition root；创建并连接 Agent、Registry、Hook、权限、独立 TODO、共享 Store 和本地工具 |
 | `agent.py` | Responses API 循环、跨轮历史、工具结果回传、轮数上限、`reset()` 与运行生命周期 |
 | `tooling.py` | `FunctionTool`、注册顺序、参数解析/签名校验、Pre/handler/Post 执行流水线和结构化错误 |
 | `hooks.py` | `UserPromptSubmit`、`PreToolUse`、`PostToolUse`、`Stop` 事件及同步注册表 |
@@ -57,6 +58,7 @@ AgentLoop -> Responses API -> function_call
 | `skills.py` | Skill 格式、严格 front matter 解析、校验、Catalog、原子持久化及四个 FunctionTool |
 | `memory.py` | 大型工具结果持久化、引用分段读取、确定性工具摘要和原子历史块压缩 |
 | `todo.py` | 实例级 TODO 状态、版本化验证、TODO tools 和 Hook 驱动提醒 |
+| `tasks.py` | workspace 级持久化任务 DAG、生命周期/owner 规则、并发认领、原子提交及六个 FunctionTool |
 | `subagents.py` | 同步子 Agent、后台 Fork、结果状态/收取、有界并发和 executor 关闭 |
 
 应用入口推荐使用 `create_default_agent(client, config=AgentConfig(...))`。现有的 `AgentLoop(client, bash_tool=..., workspace_root=..., ...)` 构造方式与 `myagent.tools.build_default_tool_registry` 导入路径仍作为兼容入口保留；它们最终也委托给同一个 composition root。
@@ -74,6 +76,12 @@ AgentLoop -> Responses API -> function_call
 | `update_todo_list` | 创建或整体更新全局 TODO List |
 | `get_todo_list` | 读取 TODO List 与验证状态 |
 | `record_todo_verification` | 在实际验证后记录具体证据 |
+| `create_task` | 创建 workspace 持久化 DAG 任务；依赖必须已存在；逐次审批 |
+| `is_task_executable` | 判断任务当前是否可认领，并返回原因与阻塞依赖 |
+| `claim_task` | 用显式 Agent 标签原子认领可执行任务；逐次审批 |
+| `complete_task` | 由精确匹配的 owner 完成已认领任务；逐次审批 |
+| `list_tasks` | 按 ID 稳定返回全部任务摘要与当前阻塞状态 |
+| `get_task` | 返回一个任务的全部持久化字段、完整依赖和可执行性 |
 | `load_skill` | 按 Catalog 中的精确名称加载一个 Skill 的完整正文 |
 | `add_skill` | 创建一个新 Skill，不覆盖同名文件；逐次审批 |
 | `update_skill` | 完整替换已有 Skill 的 description 和正文；逐次审批 |
@@ -160,11 +168,11 @@ ContextMemory 只控制 Responses 输入的体积，不实现用户画像或语�
 
 `collect_subagent` 在任务未完成时返回 `running`；等待超时会返回 `code=timeout`，但不会取消仍在运行的任务；完成时返回 `status=completed` 和唯一的 `output` 文本；失败只返回有界错误摘要。终态只可收取一次，再次收取会得到 `status=cleaned`，从未存在的 ID 则为 `status=unknown`。
 
-每次同步调用和 Fork 都创建新的 `AgentLoop`、history、`ContextMemory`、`ToolRegistry`、`PermissionManager`、`TodoList` 和 `TodoReminder`，但共享工作区级 `SkillStore` 与 `ToolResultStore`。子 Agent 不继承主 Agent 或其他子 Agent 的对话 history，只接收显式 `task`。其 reasoning、Responses `output`、工具参数、中间结果和完整 history 不会进入管理器记录或主 Agent history；成功边界只保留最终文本。
+每次同步调用和 Fork 都创建新的 `AgentLoop`、history、`ContextMemory`、`ToolRegistry`、`PermissionManager`、`TodoList` 和 `TodoReminder`，但共享工作区级 `SkillStore`、`TaskStore` 与 `ToolResultStore`。子 Agent 不继承主 Agent 或其他子 Agent 的对话 history，只接收显式 `task`。其 reasoning、Responses `output`、工具参数、中间结果和完整 history 不会进入管理器记录或主 Agent history；成功边界只保留最终文本。
 
 子 Agent 的普通工具仍完整经过 JSON/签名校验、首个 `PermissionHook`、其他 `PreToolUse`、handler 和 `PostToolUse`，并保留原始 `call_id`。它自身也会触发 `UserPromptSubmit` 和 `Stop`。但三种 SubAgent 管理工具不会注册到子 Registry：schemas 中不可见，伪造 `function_call` 也只会得到 `Unknown tool`，因此不能递归委派。自定义 `allowed_tools` 会先应用，再额外排除整个管理工具族。
 
-后台执行默认最多 4 个 worker，并最多保留 16 个尚未收取的 Fork 记录；达到记录上限后必须先收取终态任务。共享的用户 Hook 和终端逐次审批通过 Hook 执行锁串行化，避免多个后台线程的 `input()` 交错；注入的 Bash handler 也会被串行保护，Skill 文件复合操作由共享 Store 的 `RLock` 保护。默认运行时不会自动批准任何敏感调用。
+后台执行默认最多 4 个 worker，并最多保留 16 个尚未收取的 Fork 记录；达到记录上限后必须先收取终态任务。共享的用户 Hook 和终端逐次审批通过 Hook 执行锁串行化，避免多个后台线程的 `input()` 交错；注入的 Bash handler 也会被串行保护，Skill 与 Task 文件复合操作由各自共享 Store 的 `RLock` 保护。默认运行时不会自动批准任何敏感调用。
 
 程序化使用结束后应调用 `agent.close()`；CLI 的所有退出路径都会自动调用它。关闭过程拒绝新任务、取消尚未启动的 Future、等待正在执行的子 Agent 收尾，并清理内存状态，因此进程退出可能等待已开始的 API 请求或工具调用完成。TODO、Fork 状态和已收取标记都只保存在当前进程内，重启后不会恢复。
 
@@ -234,6 +242,16 @@ TODO 提醒通过已有 Hook 接入，不在 Agent Loop 中增加工具名分支
 - 当所有任务都标记为 `completed`、但当前列表版本还没有验证证据时，每次相关工具结果以及下一轮用户输入前都会注入验证提醒。模型实际运行测试或检查后，必须调用 `record_todo_verification` 记录具体命令与结果，才能消除提醒。
 
 验证是列表级元数据，不会引入第四种任务状态。TODO List 当前不写入磁盘；重启进程后会重新开始。
+
+## 持久化 Task system
+
+Task system 与 TODO 是两种不同的状态：TODO 属于单个 Agent 实例，只在进程内保存，用于当前执行计划、进度提醒和完成前验证；Task system 属于整个 workspace，保存于 `.myagent/tasks/tasks.json`，跨 Agent 重建与进程重启存在，并由父 Agent、同步子 Agent 和后台子 Agent 共享同一个 `TaskStore`。各 Agent 的 TODO、history、Hook 和 `ContextMemory` 仍然互相隔离。
+
+每个持久化任务的状态只允许 `pending -> in_progress -> completed`，其中 `completed` 是终态。新任务必须引用已经存在的依赖，依赖创建后不可修改；Store 每次读取和提交前都会验证完整快照的 ID、字段、状态-owner 不变量、依赖引用和整图无环性。任务仅在自身为 `pending`、owner 为 `null` 且所有依赖均为 `completed` 时可执行，也就是当前可被认领；`is_task_executable` 和 `claim_task` 共享这一条内部规则。
+
+`claim_task` 在同一个进程内共享 Store 的 `RLock` 中完成读取、判定和原子提交，避免父子 Agent 线程双重认领；`complete_task` 要求传入的 owner 与认领标签区分大小写地精确匹配。owner 是调用方显式传入的协作元数据，当前系统不提供可认证的 Agent identity。相同 owner 重试 claim 或 complete 是不改写文件的幂等成功。
+
+任务文件使用 UTF-8 JSON、同目录临时文件、flush/fsync 和 `os.replace` 原子替换；只读操作不会创建任务目录。当前锁只承诺共享 `TaskStore` 实例内的线程安全，不提供多进程锁或分布式一致性。`create_task`、`claim_task`、`complete_task` 每次调用都需要用户审批；`is_task_executable`、`list_tasks`、`get_task` 默认只读允许。审批缺失或被拒绝时 handler 不会执行，也不会创建任务存储目录。`agent.reset()` 只重置原有内存会话状态，不清空持久化任务。
 
 ## 环境要求
 
@@ -316,9 +334,9 @@ CLI 会读取当前工作目录中的 `myagent.config.json`。它可以同时配
 
 工具执行前会按以下顺序经过独立的权限层：
 
-1. **工具白名单**：默认只暴露并允许内置 Shell、文件、TODO、Skill 和主 Agent 的 SubAgent 管理工具。不在白名单中的工具即使已经注册，也不会发送给模型，并且直接调用同样会被拒绝。
+1. **工具白名单**：默认只暴露并允许内置 Shell、文件、TODO、Task、Skill、Memory 和主 Agent 的 SubAgent 管理工具。不在白名单中的工具即使已经注册，也不会发送给模型，并且直接调用同样会被拒绝。
 2. **永远禁止**：递归且强制删除的 `rm` 命令（例如 `rm -rf`、`rm -fr`、`rm -r -f` 和 `rm --recursive --force`）直接拒绝，审批回调不能将其放行。
-3. **逐次审批**：普通 `rm`、明确的删除/覆盖类 Shell 命令、Shell 输出重定向、`write_file`、`edit_file`、`add_skill`、`update_skill` 和 `delete_skill` 会展示工具名、原因和完整参数。只有用户对本次调用输入 `y` 或 `yes` 后才会执行；直接回车、拒绝、审批回调异常、输入中断或未配置审批器都会拒绝。
+3. **逐次审批**：普通 `rm`、明确的删除/覆盖类 Shell 命令、Shell 输出重定向、`write_file`、`edit_file`、`create_task`、`claim_task`、`complete_task`、`add_skill`、`update_skill` 和 `delete_skill` 会展示工具名、原因和完整参数。只有用户对本次调用输入 `y` 或 `yes` 后才会执行；直接回车、拒绝、审批回调异常、输入中断或未配置审批器都会拒绝。
 
 通过 Python 创建 Agent 时，可以缩小工具白名单并注入自己的审批 UI：
 

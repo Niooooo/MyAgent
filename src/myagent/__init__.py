@@ -46,6 +46,7 @@ from .skills import (
     render_skill_catalog,
     skill_tools,
 )
+from .tasks import Task, TaskStatus, TaskStore, TaskStoreError, task_tools
 from .todo import TodoItem, TodoList, TodoReminder, TodoStatus
 from .tooling import FunctionTool, ToolRegistry
 
@@ -87,6 +88,10 @@ __all__ = [
     "SkillSummary",
     "ToolRegistry",
     "ToolResultStore",
+    "Task",
+    "TaskStatus",
+    "TaskStore",
+    "TaskStoreError",
     "TodoItem",
     "TodoList",
     "TodoReminder",
@@ -97,4 +102,5 @@ __all__ = [
     "long_term_memory_tools",
     "render_skill_catalog",
     "skill_tools",
+    "task_tools",
 ]

@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import call, patch
 
 from myagent.agent import AgentLoop, AgentLoopLimitError
+from myagent.tasks import TASK_TOOL_NAMES
 from myagent.tooling import FunctionTool, ToolExecutionError, ToolRegistry
 from tests.fakes import FakeAPIError, FakeResponses, function_call, response
 
@@ -213,6 +214,7 @@ class AgentLoopTests(unittest.TestCase):
                 "update_todo_list",
                 "get_todo_list",
                 "record_todo_verification",
+                *TASK_TOOL_NAMES,
                 "load_memory",
                 "store_memory",
                 "search_memory_entries",

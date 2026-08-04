@@ -64,6 +64,7 @@ class DefaultCompositionTests(unittest.TestCase):
         self.assertIs(agent.hooks, hooks)
         self.assertIs(agent.tool_registry.hooks, hooks)
         self.assertIsNotNone(agent.todo_list)
+        self.assertIsNotNone(agent.task_store)
         self.assertIsNotNone(agent.context_memory)
         self.assertIs(agent.context_memory.config, memory)
         agent.close()

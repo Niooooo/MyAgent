@@ -40,6 +40,7 @@ from .subagents import (
     SubAgentManager,
     subagent_tools,
 )
+from .tasks import TaskStore, task_tools
 from .todo import (
     DEFAULT_TODO_REMINDER_TOOL_CALLS,
     TodoList,
@@ -93,6 +94,7 @@ class DefaultAgentComponents:
     tool_registry: ToolRegistry
     hooks: HookRegistry
     todo_list: TodoList
+    task_store: TaskStore | None = None
     skill_store: SkillStore | None = None
     long_term_memory_store: LongTermMemoryStore | None = None
     instructions_provider: InstructionsProvider | None = None
@@ -142,6 +144,7 @@ def build_default_components(
     long_term_memory_store: LongTermMemoryStore | None = None,
     memory_config: MemoryConfig | None = None,
     tool_result_store: ToolResultStore | None = None,
+    task_store: TaskStore | None = None,
 ) -> DefaultAgentComponents:
     """Create and connect the standard tools, policies, state, and hooks."""
     if max_tool_rounds < 0:
@@ -162,6 +165,8 @@ def build_default_components(
         and tool_result_store.workspace_root != workspace_root
     ):
         raise ValueError("tool_result_store must use the configured workspace root")
+    if task_store is not None and task_store.workspace_root != workspace_root:
+        raise ValueError("task_store must use the configured workspace root")
     selected_memory_config = (
         memory_config if memory_config is not None else MemoryConfig()
     )
@@ -172,6 +177,7 @@ def build_default_components(
         long_term_memory_store or LongTermMemoryStore(workspace_root)
     )
     shared_tool_result_store = tool_result_store or ToolResultStore(workspace_root)
+    shared_task_store = task_store or TaskStore(workspace_root)
     hook_registry = hooks if hooks is not None else HookRegistry()
     child_hook_template = hook_registry.clone()
     reminder_interval = (
@@ -209,6 +215,7 @@ def build_default_components(
                 long_term_memory_store=shared_long_term_memory_store,
                 memory_config=selected_memory_config,
                 tool_result_store=shared_tool_result_store,
+                task_store=shared_task_store,
             )
             child = AgentLoop(
                 client,
@@ -224,6 +231,7 @@ def build_default_components(
             child.todo_list = child_components.todo_list
             child.skill_store = child_components.skill_store
             child.long_term_memory_store = child_components.long_term_memory_store
+            child.task_store = child_components.task_store
             return child
 
         manager = SubAgentManager(
@@ -246,6 +254,7 @@ def build_default_components(
             long_term_memory_store=shared_long_term_memory_store,
             memory_config=selected_memory_config,
             tool_result_store=shared_tool_result_store,
+            task_store=shared_task_store,
             additional_tools=management_tools,
         )
     except BaseException:
@@ -259,6 +268,7 @@ def build_default_components(
         tool_registry=components.tool_registry,
         hooks=components.hooks,
         todo_list=components.todo_list,
+        task_store=components.task_store,
         skill_store=components.skill_store,
         long_term_memory_store=components.long_term_memory_store,
         instructions_provider=components.instructions_provider,
@@ -281,6 +291,7 @@ def _build_standard_components(
     long_term_memory_store: LongTermMemoryStore,
     memory_config: MemoryConfig,
     tool_result_store: ToolResultStore,
+    task_store: TaskStore,
     additional_tools: Iterable[FunctionTool] = (),
 ) -> DefaultAgentComponents:
     """Build one isolated ordinary capability set and its guarded registry."""
@@ -301,6 +312,7 @@ def _build_standard_components(
             build_bash_function_tool(bash_handler),
             *filesystem_tools(workspace),
             *todo_tools(todo_list),
+            *task_tools(task_store),
             *skill_tools(skill_store),
             *long_term_memory_tools(long_term_memory_store),
             *memory_tools(
@@ -322,6 +334,7 @@ def _build_standard_components(
         tool_registry=tool_registry,
         hooks=hooks,
         todo_list=todo_list,
+        task_store=task_store,
         skill_store=skill_store,
         long_term_memory_store=long_term_memory_store,
         instructions_provider=instructions_provider,
@@ -408,4 +421,5 @@ def create_default_agent(
     agent.todo_list = components.todo_list
     agent.skill_store = components.skill_store
     agent.long_term_memory_store = components.long_term_memory_store
+    agent.task_store = components.task_store
     return agent
