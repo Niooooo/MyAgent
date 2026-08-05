@@ -20,6 +20,7 @@ from .hooks import (
     UserPromptSubmit,
 )
 from .memory import ContextMemory, HISTORY_COMPACTION_INSTRUCTIONS
+from .runtime_inbox import InboxReader
 from .tooling import ToolRegistry, ToolResult
 from .tools import BackgroundBashRunner
 
@@ -124,6 +125,7 @@ class AgentLoop:
         todo_reminder_tool_calls: int | None = None,
         background_bash_runner: BackgroundBashRunner | None = None,
         scheduled_task_runtime: ScheduledTaskRuntime | None = None,
+        inbox_reader: InboxReader | None = None,
         close_callback: Callable[[], None] | None = None,
     ) -> None:
         if max_tool_rounds < 0:
@@ -134,6 +136,8 @@ class AgentLoop:
             raise ValueError("fallback_model must be a non-empty string")
         if instructions_provider is not None and not callable(instructions_provider):
             raise TypeError("instructions_provider must be callable")
+        if inbox_reader is not None and not callable(inbox_reader):
+            raise TypeError("inbox_reader must be callable")
         if context_memory is not None and not isinstance(
             context_memory,
             ContextMemory,
@@ -192,6 +196,7 @@ class AgentLoop:
         self.context_memory: ContextMemory | None = context_memory
         self.background_bash_runner = background_bash_runner
         self.scheduled_task_runtime = scheduled_task_runtime
+        self.inbox_reader = inbox_reader
         if tool_registry is not None:
             if hooks is not None and tool_registry.hooks is not hooks:
                 raise ValueError(
@@ -225,6 +230,7 @@ class AgentLoop:
             self.context_memory = components.context_memory
             self.background_bash_runner = components.background_bash_runner
             self.scheduled_task_runtime = components.scheduled_task_runtime
+            self.inbox_reader = components.inbox_reader
             self.tool_registry = components.tool_registry
             self.instructions_provider = _combine_instructions_providers(
                 self.instructions_provider,
@@ -237,6 +243,7 @@ class AgentLoop:
     def run(self, user_input: str) -> str:
         """Process one user turn and return the model's final text."""
         tool_rounds = 0
+        inbox_drained = False
         output_text: str | None = None
         failure: BaseException | None = None
 
@@ -260,6 +267,11 @@ class AgentLoop:
                         self._drain_background_results()
                         output_text = None
                         continue
+                    if not inbox_drained:
+                        inbox_drained = True
+                        if self._drain_inbox():
+                            output_text = None
+                            continue
                     return output_text
 
                 self._ensure_tool_round_available(tool_rounds)
@@ -519,6 +531,20 @@ class AgentLoop:
         self.history.append(message)
         if self.context_memory is not None:
             self.context_memory.record_runtime_items([message])
+        return True
+
+    def _drain_inbox(self) -> bool:
+        reader = self.inbox_reader
+        if reader is None:
+            return False
+        batch = reader()
+        if batch is None or not batch.items:
+            return False
+        items = list(batch.items)
+        self.history.extend(items)
+        if self.context_memory is not None:
+            self.context_memory.record_runtime_items(items)
+        batch.acknowledge()
         return True
 
     def _emit_stop(self, event: Stop, failure: BaseException | None) -> None:
