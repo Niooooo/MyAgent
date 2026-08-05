@@ -25,8 +25,18 @@ from .memory import (
     ToolResultStore,
     memory_tools,
 )
+from .agent_team import (
+    AGENT_TEAM_TOOL_NAMES,
+    CREATE_TEAMMATE_TOOL,
+    MAIN_AGENT_NAME,
+    RUN_TEAMMATE_TOOL,
+    AgentTeamManager,
+    main_team_tools,
+    team_message_tool,
+)
 from .permissions import (
     ApprovalCallback,
+    ApprovalRequest,
     DEFAULT_TOOL_ALLOWLIST,
     DefaultPermissionPolicy,
     PermissionHook,
@@ -40,6 +50,7 @@ from .subagents import (
     SubAgentManager,
     subagent_tools,
 )
+from .runtime_inbox import InboxReader
 from .scheduled_tasks import (
     SCHEDULED_TASK_TOOL_NAMES,
     ScheduledTaskRuntime,
@@ -67,6 +78,14 @@ You are an isolated sub-agent. Complete only the task supplied in this user turn
 You may use the ordinary local tools that are visible to you, but you cannot create,
 fork, query, collect, or manage other sub-agents. Return a concise final answer to the
 parent agent; internal reasoning and tool activity are not part of that answer.
+"""
+
+_TEAMMATE_INSTRUCTIONS_SUFFIX = """
+
+You are the persistent Agent Team member named {name}. Your role is: {role}
+Retain useful context across assigned turns. You may message another Team member with
+send_team_message, whose sender identity is bound by the runtime. You cannot create or
+run teammates or manage isolated sub-agents.
 """
 
 
@@ -112,6 +131,8 @@ class DefaultAgentComponents:
     tool_result_store: ToolResultStore | None = None
     background_bash_runner: BackgroundBashRunner | None = None
     scheduled_task_runtime: ScheduledTaskRuntime | None = None
+    agent_team_manager: AgentTeamManager | None = None
+    inbox_reader: InboxReader | None = None
     _close_callback: Callable[[], None] = field(
         default=_noop,
         repr=False,
@@ -197,7 +218,9 @@ def build_default_components(
         if todo_reminder_tool_calls is None
         else todo_reminder_tool_calls
     )
-    main_allowed_tools, child_allowed_tools = _split_allowed_tools(allowed_tools)
+    main_allowed_tools, child_allowed_tools, teammate_allowed_tools = (
+        _split_allowed_tools(allowed_tools)
+    )
 
     if bash_tool is None:
         def make_bash_handler() -> Callable[[str], dict[str, Any]]:
@@ -217,6 +240,7 @@ def build_default_components(
     )
 
     manager: SubAgentManager | None = None
+    team_manager: AgentTeamManager | None = None
     management_tools = []
     scheduled_task_runtime: ScheduledTaskRuntime | None = None
     if client is not None:
@@ -264,6 +288,79 @@ def build_default_components(
         )
         management_tools = subagent_tools(manager)
 
+        def create_teammate_agent(
+            name: str,
+            role: str,
+            inbox_reader: InboxReader,
+        ) -> AgentLoop:
+            if team_manager is None:
+                raise RuntimeError("Agent Team manager is unavailable")
+
+            def teammate_approval(request: ApprovalRequest) -> bool:
+                if approval_callback is None:
+                    return False
+                return approval_callback(
+                    ApprovalRequest(
+                        request.tool_name,
+                        request.arguments,
+                        f"Agent Team member {name}: {request.reason}",
+                    )
+                )
+
+            teammate_components = _build_standard_components(
+                cwd=workspace_root,
+                bash_handler=make_bash_handler(),
+                allowed_tools=teammate_allowed_tools,
+                approval_callback=(
+                    teammate_approval if approval_callback is not None else None
+                ),
+                hooks=child_hook_template.clone(),
+                todo_list=TodoList(),
+                todo_reminder_tool_calls=reminder_interval,
+                skill_store=shared_skill_store,
+                long_term_memory_store=shared_long_term_memory_store,
+                memory_config=selected_memory_config,
+                tool_result_store=shared_tool_result_store,
+                task_store=shared_task_store,
+                additional_tools=[team_message_tool(team_manager, name)],
+            )
+            try:
+                teammate = AgentLoop(
+                    client,
+                    model=model,
+                    fallback_model=fallback_model,
+                    instructions=(
+                        instructions
+                        + _TEAMMATE_INSTRUCTIONS_SUFFIX.format(name=name, role=role)
+                    ),
+                    max_tool_rounds=max_tool_rounds,
+                    tool_registry=teammate_components.tool_registry,
+                    hooks=teammate_components.hooks,
+                    instructions_provider=teammate_components.instructions_provider,
+                    context_memory=teammate_components.context_memory,
+                    inbox_reader=inbox_reader,
+                    close_callback=teammate_components.close,
+                )
+            except BaseException:
+                teammate_components.close()
+                raise
+            teammate.todo_list = teammate_components.todo_list
+            teammate.skill_store = teammate_components.skill_store
+            teammate.long_term_memory_store = teammate_components.long_term_memory_store
+            teammate.task_store = teammate_components.task_store
+            return teammate
+
+        try:
+            team_manager = AgentTeamManager(workspace_root, create_teammate_agent)
+        except BaseException:
+            try:
+                if background_bash_runner is not None:
+                    background_bash_runner.close()
+            finally:
+                manager.close()
+            raise
+        management_tools.extend(main_team_tools(team_manager))
+
     try:
         components = _build_standard_components(
             cwd=workspace_root,
@@ -298,6 +395,8 @@ def build_default_components(
             finally:
                 if manager is not None:
                     manager.close()
+                if team_manager is not None:
+                    team_manager.close()
         raise
 
     if client is not None:
@@ -332,12 +431,15 @@ def build_default_components(
                 finally:
                     if manager is not None:
                         manager.close()
+                    if team_manager is not None:
+                        team_manager.close()
             raise
 
     if (
         manager is None
         and background_bash_runner is None
         and scheduled_task_runtime is None
+        and team_manager is None
     ):
         return components
 
@@ -352,6 +454,8 @@ def build_default_components(
             finally:
                 if manager is not None:
                     manager.close()
+                if team_manager is not None:
+                    team_manager.close()
 
     return DefaultAgentComponents(
         tool_registry=components.tool_registry,
@@ -365,6 +469,12 @@ def build_default_components(
         tool_result_store=components.tool_result_store,
         background_bash_runner=background_bash_runner,
         scheduled_task_runtime=scheduled_task_runtime,
+        agent_team_manager=team_manager,
+        inbox_reader=(
+            team_manager.inbox_reader(MAIN_AGENT_NAME)
+            if team_manager is not None
+            else None
+        ),
         _close_callback=close_runtime,
     )
 
@@ -443,16 +553,30 @@ def _skill_catalog_provider(store: SkillStore) -> InstructionsProvider:
 
 def _split_allowed_tools(
     allowed_tools: Iterable[str] | None,
-) -> tuple[frozenset[str] | None, frozenset[str]]:
+) -> tuple[frozenset[str] | None, frozenset[str], frozenset[str]]:
     if allowed_tools is None:
-        return None, DEFAULT_TOOL_ALLOWLIST.difference(
-            SUBAGENT_TOOL_NAMES | SCHEDULED_TASK_TOOL_NAMES
+        return (
+            None,
+            DEFAULT_TOOL_ALLOWLIST.difference(
+                SUBAGENT_TOOL_NAMES
+                | SCHEDULED_TASK_TOOL_NAMES
+                | AGENT_TEAM_TOOL_NAMES
+            ),
+            DEFAULT_TOOL_ALLOWLIST.difference(
+                SUBAGENT_TOOL_NAMES
+                | SCHEDULED_TASK_TOOL_NAMES
+                | {CREATE_TEAMMATE_TOOL, RUN_TEAMMATE_TOOL}
+            ),
         )
     if isinstance(allowed_tools, str):
         raise TypeError("allowed_tools must be an iterable of tool names, not a string")
     selected = frozenset(allowed_tools)
     return selected, selected.difference(
-        SUBAGENT_TOOL_NAMES | SCHEDULED_TASK_TOOL_NAMES
+        SUBAGENT_TOOL_NAMES | SCHEDULED_TASK_TOOL_NAMES | AGENT_TEAM_TOOL_NAMES
+    ), selected.difference(
+        SUBAGENT_TOOL_NAMES
+        | SCHEDULED_TASK_TOOL_NAMES
+        | {CREATE_TEAMMATE_TOOL, RUN_TEAMMATE_TOOL}
     )
 
 
@@ -513,6 +637,7 @@ def create_default_agent(
             context_memory=components.context_memory,
             background_bash_runner=components.background_bash_runner,
             scheduled_task_runtime=components.scheduled_task_runtime,
+            inbox_reader=components.inbox_reader,
             close_callback=components.close,
         )
     except BaseException:
@@ -524,4 +649,5 @@ def create_default_agent(
     agent.long_term_memory_store = components.long_term_memory_store
     agent.task_store = components.task_store
     agent.scheduled_task_runtime = components.scheduled_task_runtime
+    agent.agent_team_manager = components.agent_team_manager
     return agent

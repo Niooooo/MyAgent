@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .hooks import PreToolUse
+from .agent_team import AGENT_TEAM_TOOL_NAMES, CREATE_TEAMMATE_TOOL
 from .long_term_memory import (
     DELETE_MEMORY_TOOL,
     LONG_TERM_MEMORY_TOOL_NAMES,
@@ -59,6 +60,7 @@ DEFAULT_TOOL_ALLOWLIST = frozenset(
         *SKILL_TOOL_NAMES,
         *TASK_TOOL_NAMES,
         *SUBAGENT_TOOL_NAMES,
+        *AGENT_TEAM_TOOL_NAMES,
         *SCHEDULED_TASK_TOOL_NAMES,
     }
 )
@@ -95,6 +97,9 @@ _SENSITIVE_SCHEDULED_TASK_TOOLS = {
     DELETE_SCHEDULED_TASK_TOOL: (
         "deleting a schedule changes in-process background execution state"
     ),
+}
+_SENSITIVE_AGENT_TEAM_TOOLS = {
+    CREATE_TEAMMATE_TOOL: "creating a teammate adds persistent in-process Agent state",
 }
 _SENSITIVE_COMMANDS = {
     "chmod",
@@ -379,6 +384,12 @@ class DefaultPermissionPolicy:
             return PermissionDecision(
                 PermissionLevel.REQUIRE_APPROVAL,
                 _SENSITIVE_SCHEDULED_TASK_TOOLS[tool_name],
+            )
+
+        if tool_name in _SENSITIVE_AGENT_TEAM_TOOLS:
+            return PermissionDecision(
+                PermissionLevel.REQUIRE_APPROVAL,
+                _SENSITIVE_AGENT_TEAM_TOOLS[tool_name],
             )
 
         if tool_name in {"bash", BACKGROUND_BASH_TOOL}:

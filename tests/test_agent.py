@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import call, patch
 
 from myagent.agent import AgentLoop, AgentLoopLimitError
+from myagent.agent_team import AGENT_TEAM_TOOL_NAMES
 from myagent.scheduled_tasks import SCHEDULED_TASK_TOOL_NAMES
 from myagent.tasks import TASK_TOOL_NAMES
 from myagent.tooling import FunctionTool, ToolExecutionError, ToolRegistry
@@ -265,6 +266,7 @@ class AgentLoopTests(unittest.TestCase):
                 "run_subagent",
                 "fork_subagent",
                 "collect_subagent",
+                *AGENT_TEAM_TOOL_NAMES,
                 *SCHEDULED_TASK_TOOL_NAMES,
             },
         )
