@@ -11,7 +11,11 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .hooks import PreToolUse
-from .agent_team import AGENT_TEAM_TOOL_NAMES, CREATE_TEAMMATE_TOOL
+from .agent_team import (
+    AGENT_TEAM_TOOL_NAMES,
+    CREATE_TEAMMATE_TOOL,
+    REQUEST_TEAMMATE_SHUTDOWN_TOOL,
+)
 from .long_term_memory import (
     DELETE_MEMORY_TOOL,
     LONG_TERM_MEMORY_TOOL_NAMES,
@@ -100,6 +104,9 @@ _SENSITIVE_SCHEDULED_TASK_TOOLS = {
 }
 _SENSITIVE_AGENT_TEAM_TOOLS = {
     CREATE_TEAMMATE_TOOL: "creating a teammate adds persistent in-process Agent state",
+    REQUEST_TEAMMATE_SHUTDOWN_TOOL: (
+        "requesting teammate shutdown changes persistent in-process Agent state"
+    ),
 }
 _SENSITIVE_COMMANDS = {
     "chmod",

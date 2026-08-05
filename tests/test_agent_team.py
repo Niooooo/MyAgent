@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from myagent.agent import AgentLoop
 from myagent.agent_team import AGENT_TEAM_TOOL_NAMES
 from myagent.composition import build_default_components
+from myagent.tasks import TaskStore
 from tests.fakes import FakeResponses, function_call, response
 
 
@@ -142,7 +143,10 @@ class AgentTeamTests(unittest.TestCase):
                 [{"role": "user", "content": "other"}],
             )
             member_tools = {item["name"] for item in responses.requests[3]["tools"]}
-            self.assertEqual(AGENT_TEAM_TOOL_NAMES & member_tools, {"send_team_message"})
+            self.assertEqual(
+                AGENT_TEAM_TOOL_NAMES & member_tools,
+                {"send_team_message", "request_plan_approval"},
+            )
             forged_output = json.loads(responses.requests[4]["input"][-1]["output"])
             self.assertEqual(forged_output["error"], "Unknown tool: create_teammate")
             self.assertIn("forgery handled", completion_text)
@@ -373,6 +377,579 @@ class AgentTeamTests(unittest.TestCase):
             self.assertEqual(
                 manager.run_teammate("late", "work")["code"], "manager_closed"
             )
+
+    def test_shutdown_requires_approval_and_waits_for_busy_member(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+        self.addCleanup(release.set)
+        approvals = iter([True, False, True])
+        responses = FakeResponses(
+            [
+                response([function_call("blocking", "bash", '{"command":"pwd"}')]),
+                response([], "finished first"),
+            ]
+        )
+
+        def blocking_bash(_command):
+            started.set()
+            release.wait(2)
+            return {"ok": True}
+
+        with tempfile.TemporaryDirectory() as root:
+            agent = self.make_agent(
+                responses,
+                root,
+                approval_callback=lambda _: next(approvals),
+                bash_tool=blocking_bash,
+            )
+            manager = agent.agent_team_manager
+            agent.tool_registry.execute(
+                "create_teammate", '{"name":"alice","role":"worker"}'
+            )
+            denied = agent.tool_registry.execute(
+                "request_teammate_shutdown",
+                '{"name":"alice","reason":"done"}',
+            )
+            self.assertEqual(denied["code"], "permission_denied")
+            self.assertEqual(manager.member_names, ("alice",))
+
+            agent.tool_registry.execute(
+                "run_teammate", '{"name":"alice","task":"finish"}'
+            )
+            self.assertTrue(started.wait(1))
+            requested = agent.tool_registry.execute(
+                "request_teammate_shutdown",
+                '{"name":"alice","reason":"done"}',
+            )
+            duplicate = manager.request_teammate_shutdown("alice", "again")
+            self.assertEqual(duplicate["request_id"], requested["request_id"])
+            self.assertTrue(duplicate["duplicate"])
+            rejected = agent.tool_registry.execute(
+                "run_teammate", '{"name":"alice","task":"late"}'
+            )
+            self.assertEqual(rejected["code"], "member_shutting_down")
+
+            release.set()
+            messages = self.wait_for_inbox(root, "main", 2)
+            completion = next(
+                item["message"]
+                for item in messages
+                if item["message"].startswith("AGENT_TEAM_TASK_RESULT")
+            )
+            shutdown = next(
+                item["message"]
+                for item in messages
+                if item["message"].startswith("AGENT_TEAM_PROTOCOL")
+            )
+            self.assertNotIn("next_task_claim", completion)
+            protocol = json.loads(shutdown.split("\n", 1)[1])
+            self.assertEqual(protocol["type"], "shutdown_completed")
+            self.assertEqual(protocol["request_id"], requested["request_id"])
+            self.assertEqual(manager.member_names, ())
+
+    def test_plan_approval_round_trip_and_failed_review_keeps_pending(self) -> None:
+        responses = FakeResponses(
+            [response([], "before response"), response([], "response received")]
+        )
+        with tempfile.TemporaryDirectory() as root:
+            agent = self.make_agent(responses, root, approval_callback=lambda _: True)
+            manager = agent.agent_team_manager
+            task = agent.tool_registry.execute(
+                "create_task",
+                json.dumps(
+                    {
+                        "name": "inspect",
+                        "summary": "inspect the implementation",
+                        "topic": "team",
+                        "dependencies": [],
+                    }
+                ),
+            )
+            agent.tool_registry.execute(
+                "create_teammate", '{"name":"alice","role":"worker"}'
+            )
+            teammate_registry = manager._members["alice"].agent.tool_registry
+            original_writer = manager._write_message
+            manager._write_message = lambda *_: {
+                "ok": False,
+                "code": "message_write_failed",
+                "error": "Agent Team message could not be saved",
+            }
+            failed_request = manager.request_plan_approval(
+                "alice", task["id"], "not saved"
+            )
+            self.assertEqual(failed_request["code"], "message_write_failed")
+            self.assertEqual(manager._pending_plan_approvals, {})
+            manager._write_message = original_writer
+            self.assertEqual(
+                agent.tool_registry.execute(
+                    "request_plan_approval",
+                    json.dumps({"task_id": task["id"], "plan": "forged"}),
+                )["code"],
+                "unknown_tool",
+            )
+            requested = teammate_registry.execute(
+                "request_plan_approval",
+                json.dumps({"task_id": task["id"], "plan": "inspect first"}),
+            )
+            self.assertFalse(requested["duplicate"])
+            duplicate = teammate_registry.execute(
+                "request_plan_approval",
+                json.dumps({"task_id": task["id"], "plan": "duplicate"}),
+            )
+            self.assertTrue(duplicate["duplicate"])
+            self.assertEqual(duplicate["request_id"], requested["request_id"])
+            messages = self.wait_for_inbox(root, "main", 1)
+            request_text = next(
+                item["message"]
+                for item in messages
+                if item["message"].startswith("AGENT_TEAM_PROTOCOL")
+            )
+            request = json.loads(request_text.split("\n", 1)[1])
+            self.assertEqual(request["type"], "plan_approval_request")
+            self.assertEqual(request["member"], "alice")
+            self.assertEqual(request["task_id"], task["id"])
+
+            manager._write_message = lambda *_: {
+                "ok": False,
+                "code": "message_write_failed",
+                "error": "Agent Team message could not be saved",
+            }
+            failed = agent.tool_registry.execute(
+                "review_teammate_plan",
+                json.dumps(
+                    {
+                        "request_id": request["request_id"],
+                        "approved": True,
+                        "feedback": "go",
+                    }
+                ),
+            )
+            self.assertEqual(failed["code"], "message_write_failed")
+            self.assertIn(request["request_id"], manager._pending_plan_approvals)
+            self.assertIsNone(manager._members["alice"].queued_plan_request_id)
+            self.assertEqual(responses.requests, [])
+            manager._write_message = original_writer
+
+            reviewed = agent.tool_registry.execute(
+                "review_teammate_plan",
+                json.dumps(
+                    {
+                        "request_id": request["request_id"],
+                        "approved": False,
+                        "feedback": "not yet",
+                    }
+                ),
+            )
+            self.assertTrue(reviewed["ok"])
+            self.assertEqual(reviewed["status"], "rejected")
+            repeated = agent.tool_registry.execute(
+                "review_teammate_plan",
+                json.dumps(
+                    {
+                        "request_id": request["request_id"],
+                        "approved": False,
+                        "feedback": "again",
+                    }
+                ),
+            )
+            self.assertEqual(repeated["code"], "pending_plan_not_found")
+            agent.tool_registry.execute(
+                "run_teammate", '{"name":"alice","task":"continue"}'
+            )
+            self.wait_for_inbox(root, "main", 2)
+            inbox_content = responses.requests[1]["input"][-1]["content"]
+            self.assertIn("plan_approval_response", inbox_content)
+            self.assertIn(request["request_id"], inbox_content)
+            persisted = agent.tool_registry.execute(
+                "get_task", json.dumps({"id": task["id"]})
+            )
+            self.assertEqual(persisted["status"], "pending")
+
+    def test_idle_shutdown_cleans_pending_plan_requests(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            agent = self.make_agent(
+                FakeResponses([]), root, approval_callback=lambda _: True
+            )
+            manager = agent.agent_team_manager
+            task = agent.tool_registry.execute(
+                "create_task",
+                json.dumps(
+                    {
+                        "name": "inspect",
+                        "summary": "inspect",
+                        "topic": "team",
+                        "dependencies": [],
+                    }
+                ),
+            )
+            agent.tool_registry.execute(
+                "create_teammate", '{"name":"alice","role":"worker"}'
+            )
+            pending = manager.request_plan_approval(
+                "alice", task["id"], "inspect"
+            )
+            self.assertIn(pending["request_id"], manager._pending_plan_approvals)
+            requested = agent.tool_registry.execute(
+                "request_teammate_shutdown",
+                '{"name":"alice","reason":"idle"}',
+            )
+            self.assertTrue(requested["ok"])
+            self.wait_for_inbox(root, "main", 2)
+            self.assertEqual(manager.member_names, ())
+            self.assertEqual(manager._pending_plan_approvals, {})
+            repeated = manager.request_teammate_shutdown("alice", "again")
+            self.assertTrue(repeated["duplicate"])
+            self.assertEqual(repeated["request_id"], requested["request_id"])
+            self.assertEqual(repeated["status"], "shutdown_completed")
+
+    def test_approved_plan_claims_executes_and_completes_through_teammate(self) -> None:
+        approval_requests = []
+        with tempfile.TemporaryDirectory() as root:
+            agent = self.make_agent(
+                FakeResponses(
+                    [
+                        response([], "task executed"),
+                        response([], "approval acknowledged"),
+                    ]
+                ),
+                root,
+                approval_callback=lambda request: approval_requests.append(request)
+                or True,
+            )
+            created = agent.tool_registry.execute(
+                "create_task",
+                json.dumps(
+                    {
+                        "name": "approved work",
+                        "summary": "execute after main approval",
+                        "topic": "team",
+                        "dependencies": [],
+                    }
+                ),
+            )
+            agent.tool_registry.execute(
+                "create_teammate", '{"name":"alice","role":"worker"}'
+            )
+            manager = agent.agent_team_manager
+            teammate_registry = manager._members["alice"].agent.tool_registry
+            requested = teammate_registry.execute(
+                "request_plan_approval",
+                json.dumps(
+                    {"task_id": created["id"], "plan": "implement and verify"}
+                ),
+            )
+            reviewed = agent.tool_registry.execute(
+                "review_teammate_plan",
+                json.dumps(
+                    {
+                        "request_id": requested["request_id"],
+                        "approved": True,
+                        "feedback": "proceed",
+                    }
+                ),
+            )
+            self.assertEqual(reviewed["status"], "execution_queued")
+            repeated = agent.tool_registry.execute(
+                "review_teammate_plan",
+                json.dumps(
+                    {
+                        "request_id": requested["request_id"],
+                        "approved": True,
+                        "feedback": "again",
+                    }
+                ),
+            )
+            self.assertEqual(repeated["code"], "pending_plan_not_found")
+
+            messages = self.wait_for_inbox(root, "main", 2)
+            completion = next(
+                item["message"]
+                for item in messages
+                if item["message"].startswith("AGENT_TEAM_TASK_RESULT")
+            )
+            result = json.loads(completion.split("\n", 1)[1])
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(result["persistent_task_id"], created["id"])
+            self.assertEqual(result["plan_request_id"], requested["request_id"])
+            self.assertTrue(result["claim"]["ok"])
+            self.assertTrue(result["task_completion"]["ok"])
+            task = agent.tool_registry.execute(
+                "get_task", json.dumps({"id": created["id"]})
+            )
+            self.assertEqual(task["owner"], "alice")
+            self.assertEqual(task["status"], "completed")
+            self.assertTrue(
+                any(
+                    isinstance(item, dict)
+                    and "AGENT_TEAM_APPROVED_TASK" in item.get("content", "")
+                    for item in manager._members["alice"].agent.history
+                )
+            )
+            for tool_name in ("claim_task", "complete_task"):
+                approval = next(
+                    request
+                    for request in approval_requests
+                    if request.tool_name == tool_name
+                )
+                self.assertIn("Agent Team member alice", approval.reason)
+
+    def test_claim_requires_main_approval_and_user_denial_prevents_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            deny_claim = False
+
+            def approve(request):
+                return not (deny_claim and request.tool_name == "claim_task")
+
+            agent = self.make_agent(
+                FakeResponses([]),
+                root,
+                approval_callback=approve,
+            )
+            created = agent.tool_registry.execute(
+                "create_task",
+                json.dumps(
+                    {
+                        "name": "next",
+                        "summary": "next",
+                        "topic": "team",
+                        "dependencies": [],
+                    }
+                ),
+            )
+            agent.tool_registry.execute(
+                "create_teammate", '{"name":"alice","role":"worker"}'
+            )
+            manager = agent.agent_team_manager
+            teammate_registry = manager._members["alice"].agent.tool_registry
+            direct = teammate_registry.execute(
+                "claim_task",
+                json.dumps({"id": created["id"], "owner": "alice"}),
+            )
+            self.assertEqual(direct["code"], "plan_approval_required")
+
+            requested = teammate_registry.execute(
+                "request_plan_approval",
+                json.dumps({"task_id": created["id"], "plan": "execute next"}),
+            )
+            deny_claim = True
+            reviewed = agent.tool_registry.execute(
+                "review_teammate_plan",
+                json.dumps(
+                    {
+                        "request_id": requested["request_id"],
+                        "approved": True,
+                        "feedback": "go",
+                    }
+                ),
+            )
+            self.assertTrue(reviewed["ok"])
+            messages = self.wait_for_inbox(root, "main", 2)
+            completion = next(
+                item["message"]
+                for item in messages
+                if item["message"].startswith("AGENT_TEAM_TASK_RESULT")
+            )
+            result = json.loads(completion.split("\n", 1)[1])
+            self.assertEqual(result["status"], "claim_failed")
+            self.assertEqual(result["claim"]["code"], "permission_denied")
+            persisted = agent.tool_registry.execute(
+                "get_task", json.dumps({"id": created["id"]})
+            )
+            self.assertEqual(persisted["status"], "pending")
+            self.assertEqual(manager._members["alice"].agent.client.responses.requests, [])
+
+    def test_plan_request_allowlist_and_approved_claim_race_are_non_fatal(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            created = TaskStore(root).create_task("next", "next", "team", [])
+            restricted = self.make_agent(
+                FakeResponses([]),
+                root,
+                approval_callback=lambda _: True,
+                allowed_tools={
+                    "create_teammate",
+                    "run_teammate",
+                    "send_team_message",
+                    "request_plan_approval",
+                },
+            )
+            restricted.tool_registry.execute(
+                "create_teammate", '{"name":"alice","role":"worker"}'
+            )
+            teammate_registry = (
+                restricted.agent_team_manager._members["alice"].agent.tool_registry
+            )
+            denied = teammate_registry.execute(
+                "request_plan_approval",
+                json.dumps({"task_id": created["id"], "plan": "work"}),
+            )
+            self.assertEqual(denied["code"], "permission_denied")
+            self.assertEqual(
+                restricted.agent_team_manager._pending_plan_approvals, {}
+            )
+
+        with tempfile.TemporaryDirectory() as root:
+            created_id = None
+
+            def race_before_claim(request):
+                if request.tool_name == "claim_task":
+                    TaskStore(root).claim_task(created_id, "racer")
+                return True
+
+            agent = self.make_agent(
+                FakeResponses([]),
+                root,
+                approval_callback=race_before_claim,
+            )
+            created = agent.tool_registry.execute(
+                "create_task",
+                json.dumps(
+                    {
+                        "name": "next",
+                        "summary": "next",
+                        "topic": "team",
+                        "dependencies": [],
+                    }
+                ),
+            )
+            created_id = created["id"]
+            agent.tool_registry.execute(
+                "create_teammate", '{"name":"alice","role":"worker"}'
+            )
+            manager = agent.agent_team_manager
+            teammate_registry = manager._members["alice"].agent.tool_registry
+            requested = teammate_registry.execute(
+                "request_plan_approval",
+                json.dumps({"task_id": created_id, "plan": "race safely"}),
+            )
+            agent.tool_registry.execute(
+                "review_teammate_plan",
+                json.dumps(
+                    {
+                        "request_id": requested["request_id"],
+                        "approved": True,
+                        "feedback": "go",
+                    }
+                ),
+            )
+            messages = self.wait_for_inbox(root, "main", 2)
+            completion = next(
+                item["message"]
+                for item in messages
+                if item["message"].startswith("AGENT_TEAM_TASK_RESULT")
+            )
+            result = json.loads(completion.split("\n", 1)[1])
+            self.assertEqual(result["status"], "claim_failed")
+            task = agent.tool_registry.execute(
+                "get_task", json.dumps({"id": created_id})
+            )
+            self.assertEqual(task["owner"], "racer")
+
+    def test_plan_request_rejects_non_executable_task(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            agent = self.make_agent(
+                FakeResponses([]),
+                root,
+                approval_callback=lambda _: True,
+            )
+            created = agent.tool_registry.execute(
+                "create_task",
+                json.dumps(
+                    {
+                        "name": "already owned",
+                        "summary": "not executable",
+                        "topic": "team",
+                        "dependencies": [],
+                    }
+                ),
+            )
+            agent.tool_registry.execute(
+                "claim_task",
+                json.dumps({"id": created["id"], "owner": "main"}),
+            )
+            agent.tool_registry.execute(
+                "create_teammate", '{"name":"alice","role":"worker"}'
+            )
+            manager = agent.agent_team_manager
+            requested = manager._members["alice"].agent.tool_registry.execute(
+                "request_plan_approval",
+                json.dumps({"task_id": created["id"], "plan": "take over"}),
+            )
+            self.assertEqual(requested["code"], "task_not_executable")
+            self.assertEqual(manager._pending_plan_approvals, {})
+
+    def test_shutdown_after_approval_before_claim_skips_execution(self) -> None:
+        claim_reached = threading.Event()
+        release_claim = threading.Event()
+        self.addCleanup(release_claim.set)
+        with tempfile.TemporaryDirectory() as root:
+            agent = self.make_agent(
+                FakeResponses([]),
+                root,
+                approval_callback=lambda _: True,
+            )
+            created = agent.tool_registry.execute(
+                "create_task",
+                json.dumps(
+                    {
+                        "name": "next",
+                        "summary": "next",
+                        "topic": "team",
+                        "dependencies": [],
+                    }
+                ),
+            )
+            agent.tool_registry.execute(
+                "create_teammate", '{"name":"alice","role":"worker"}'
+            )
+            member = agent.agent_team_manager._members["alice"]
+            requested = member.agent.tool_registry.execute(
+                "request_plan_approval",
+                json.dumps({"task_id": created["id"], "plan": "execute safely"}),
+            )
+            original_execute = member.agent.tool_registry.execute
+
+            def gated_execute(name, raw_arguments, *, call_id=None):
+                if name == "claim_task":
+                    claim_reached.set()
+                    if not release_claim.wait(2):
+                        raise RuntimeError("claim gate was not released")
+                return original_execute(name, raw_arguments, call_id=call_id)
+
+            member.agent.tool_registry.execute = gated_execute
+            agent.tool_registry.execute(
+                "review_teammate_plan",
+                json.dumps(
+                    {
+                        "request_id": requested["request_id"],
+                        "approved": True,
+                        "feedback": "go",
+                    }
+                ),
+            )
+            self.assertTrue(claim_reached.wait(1))
+            shutdown = agent.tool_registry.execute(
+                "request_teammate_shutdown",
+                '{"name":"alice","reason":"stop before claim"}',
+            )
+            self.assertTrue(shutdown["ok"])
+            self.assertEqual(shutdown["status"], "shutting_down")
+            release_claim.set()
+
+            messages = self.wait_for_inbox(root, "main", 3)
+            completion = next(
+                message["message"]
+                for message in messages
+                if message["message"].startswith("AGENT_TEAM_TASK_RESULT")
+            )
+            result = json.loads(completion.split("\n", 1)[1])
+            self.assertEqual(result["status"], "skipped")
+            self.assertEqual(result["reason"], "member_shutting_down")
+            task = agent.tool_registry.execute(
+                "get_task", json.dumps({"id": created["id"]})
+            )
+            self.assertEqual(task["status"], "pending")
+            self.assertIsNone(task["owner"])
 
 
 if __name__ == "__main__":

@@ -27,12 +27,12 @@ from .memory import (
 )
 from .agent_team import (
     AGENT_TEAM_TOOL_NAMES,
-    CREATE_TEAMMATE_TOOL,
     MAIN_AGENT_NAME,
-    RUN_TEAMMATE_TOOL,
+    MAIN_AGENT_TEAM_TOOL_NAMES,
+    TEAMMATE_AGENT_TEAM_TOOL_NAMES,
     AgentTeamManager,
     main_team_tools,
-    team_message_tool,
+    teammate_team_tools,
 )
 from .permissions import (
     ApprovalCallback,
@@ -84,8 +84,11 @@ _TEAMMATE_INSTRUCTIONS_SUFFIX = """
 
 You are the persistent Agent Team member named {name}. Your role is: {role}
 Retain useful context across assigned turns. You may message another Team member with
-send_team_message, whose sender identity is bound by the runtime. You cannot create or
-run teammates or manage isolated sub-agents.
+send_team_message. Before claiming a persistent task, select an executable task and use
+request_plan_approval with its task_id and your concrete plan. Your sender identity is
+bound by the runtime; a main-Agent approval queues the claim and execution automatically.
+Do not call claim_task directly. You cannot create, run, shut down, or review teammates
+or manage isolated sub-agents.
 """
 
 
@@ -322,7 +325,7 @@ def build_default_components(
                 memory_config=selected_memory_config,
                 tool_result_store=shared_tool_result_store,
                 task_store=shared_task_store,
-                additional_tools=[team_message_tool(team_manager, name)],
+                additional_tools=teammate_team_tools(team_manager, name),
             )
             try:
                 teammate = AgentLoop(
@@ -565,7 +568,7 @@ def _split_allowed_tools(
             DEFAULT_TOOL_ALLOWLIST.difference(
                 SUBAGENT_TOOL_NAMES
                 | SCHEDULED_TASK_TOOL_NAMES
-                | {CREATE_TEAMMATE_TOOL, RUN_TEAMMATE_TOOL}
+                | (MAIN_AGENT_TEAM_TOOL_NAMES - TEAMMATE_AGENT_TEAM_TOOL_NAMES)
             ),
         )
     if isinstance(allowed_tools, str):
@@ -576,7 +579,7 @@ def _split_allowed_tools(
     ), selected.difference(
         SUBAGENT_TOOL_NAMES
         | SCHEDULED_TASK_TOOL_NAMES
-        | {CREATE_TEAMMATE_TOOL, RUN_TEAMMATE_TOOL}
+        | (MAIN_AGENT_TEAM_TOOL_NAMES - TEAMMATE_AGENT_TEAM_TOOL_NAMES)
     )
 
 
