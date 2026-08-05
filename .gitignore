@@ -8,3 +8,4 @@ __pycache__/
 myagent.config.json
 dist/
 build/
+.agents/
