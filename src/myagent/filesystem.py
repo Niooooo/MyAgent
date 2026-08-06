@@ -6,7 +6,9 @@ import os
 import re
 import tempfile
 from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
+from threading import RLock
 from typing import Any
 
 from .tooling import FunctionTool, ToolExecutionError
@@ -24,12 +26,39 @@ _IGNORED_DIRECTORIES = {
 }
 
 
+class WorkspaceRoot:
+    """Thread-safe, per-agent binding for the current file and Bash root."""
+
+    def __init__(self, base_root: str | os.PathLike[str]) -> None:
+        self.base_root = Path(base_root).resolve()
+        self._current = self.base_root
+        self._lock = RLock()
+
+    @property
+    def current(self) -> Path:
+        with self._lock:
+            return self._current
+
+    @contextmanager
+    def use(self, root: str | os.PathLike[str]) -> Iterator[Path]:
+        selected = Path(root).resolve()
+        if not selected.is_dir():
+            raise ValueError("Workspace root is unavailable")
+        with self._lock:
+            previous = self._current
+            self._current = selected
+            try:
+                yield selected
+            finally:
+                self._current = previous
+
+
 class WorkspaceFiles:
     """Perform UTF-8 file operations without escaping a workspace root."""
 
     def __init__(
         self,
-        root: str | os.PathLike[str] | None = None,
+        root: str | os.PathLike[str] | WorkspaceRoot | None = None,
         *,
         max_read_bytes: int = 1_000_000,
         max_results: int = 500,
@@ -39,9 +68,15 @@ class WorkspaceFiles:
         if max_results <= 0:
             raise ValueError("max_results must be positive")
 
-        self.root = Path(root or Path.cwd()).resolve()
+        self._root = (
+            root if isinstance(root, WorkspaceRoot) else WorkspaceRoot(root or Path.cwd())
+        )
         self.max_read_bytes = max_read_bytes
         self.max_results = max_results
+
+    @property
+    def root(self) -> Path:
+        return self._root.current
 
     def read_file(
         self,

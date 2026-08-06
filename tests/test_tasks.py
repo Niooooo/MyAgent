@@ -68,6 +68,7 @@ class TaskStoreTests(unittest.TestCase):
         self.assertEqual(created["status"], "pending")
         self.assertIsNone(created["owner"])
         self.assertEqual(created["dependencies"], [])
+        self.assertIsNone(created["worktree"])
 
         reloaded = TaskStore(self.workspace).get_task(created["id"])
         self.assertEqual(reloaded["id"], created["id"])
@@ -233,6 +234,7 @@ class TaskStoreTests(unittest.TestCase):
                 "summary",
                 "topic",
                 "owner",
+                "worktree",
                 "executable",
                 "reason",
                 "dependency_count",
@@ -264,7 +266,7 @@ class TaskStoreTests(unittest.TestCase):
             "invalid_json": b"{not-json",
             "invalid_utf8": b"\xff",
             "wrong_schema": json.dumps(
-                {"schema_version": 2, "tasks": []}
+                {"schema_version": 999, "tasks": []}
             ).encode("utf-8"),
             "oversized": b"x" * (MAX_TASK_FILE_BYTES + 1),
         }
@@ -278,6 +280,47 @@ class TaskStoreTests(unittest.TestCase):
                     TaskStore(root).list_tasks()
                 self.assertEqual(raised.exception.code, "task_store_corrupt")
                 self.assertNotIn(str(root), raised.exception.error)
+
+    def test_v1_snapshot_migrates_and_worktree_lifecycle_is_strict(self) -> None:
+        task_id = "a" * 32
+        path = self.workspace / ".myagent" / "tasks" / "tasks.json"
+        path.parent.mkdir(parents=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "tasks": [
+                        {
+                            "id": task_id,
+                            "name": "Legacy",
+                            "status": "pending",
+                            "summary": "old",
+                            "topic": "test",
+                            "owner": None,
+                            "dependencies": [],
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        self.assertIsNone(self.store.get_task(task_id)["worktree"])
+        worktree = str((self.workspace / "linked").resolve())
+        self.assertTrue(self.store.bind_worktree(task_id, worktree)["changed"])
+        self.assertFalse(self.store.bind_worktree(task_id, worktree)["changed"])
+        with self.assertRaises(TaskStoreError) as raised:
+            self.store.bind_worktree(task_id, str((self.workspace / "other").resolve()))
+        self.assertEqual(raised.exception.code, "worktree_already_bound")
+        document = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(document["schema_version"], 2)
+        self.assertEqual(document["tasks"][0]["worktree"], worktree)
+
+        self.store.claim_task(task_id, "alice")
+        with self.assertRaises(TaskStoreError) as raised:
+            self.store.clear_worktree(task_id)
+        self.assertEqual(raised.exception.code, "task_in_progress")
+        self.assertEqual(self.store.get_task(task_id)["worktree"], worktree)
 
     def test_tool_schemas_are_strict_and_errors_are_structured(self) -> None:
         tools = task_tools(self.store)

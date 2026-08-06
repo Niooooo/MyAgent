@@ -1,4 +1,5 @@
 import json
+import subprocess
 import tempfile
 import threading
 import time
@@ -669,7 +670,7 @@ class AgentTeamTests(unittest.TestCase):
                 if item["message"].startswith("AGENT_TEAM_TASK_RESULT")
             )
             result = json.loads(completion.split("\n", 1)[1])
-            self.assertEqual(result["status"], "completed")
+            self.assertEqual(result["status"], "completed", result)
             self.assertEqual(result["persistent_task_id"], created["id"])
             self.assertEqual(result["plan_request_id"], requested["request_id"])
             self.assertTrue(result["claim"]["ok"])
@@ -693,6 +694,157 @@ class AgentTeamTests(unittest.TestCase):
                     if request.tool_name == tool_name
                 )
                 self.assertIn("Agent Team member alice", approval.reason)
+
+    def test_approved_task_uses_bound_worktree_then_restores_base_root(self) -> None:
+        with tempfile.TemporaryDirectory() as parent:
+            root = Path(parent) / "repo"
+            root.mkdir()
+            for arguments in (
+                ("init",),
+                ("config", "user.email", "test@example.com"),
+                ("config", "user.name", "Test"),
+            ):
+                subprocess.run(
+                    ["git", *arguments], cwd=root, capture_output=True, check=True
+                )
+            (root / "tracked.txt").write_text("base", encoding="utf-8")
+            subprocess.run(["git", "add", "tracked.txt"], cwd=root, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "initial"], cwd=root, capture_output=True, check=True
+            )
+            agent = self.make_agent(
+                FakeResponses(
+                    [
+                        response(
+                            [
+                                function_call(
+                                    "write-marker",
+                                    "write_file",
+                                    '{"path":"marker.txt","content":"inside"}',
+                                )
+                            ]
+                        ),
+                        response([], "done"),
+                        response([], "inbox handled"),
+                    ]
+                ),
+                str(root),
+                approval_callback=lambda _: True,
+            )
+            created = agent.tool_registry.execute(
+                "create_task",
+                json.dumps(
+                    {
+                        "name": "worktree task",
+                        "summary": "write marker",
+                        "topic": "team",
+                        "dependencies": [],
+                    }
+                ),
+            )
+            bound = agent.tool_registry.execute(
+                "create_worktree", json.dumps({"id": created["id"]})
+            )
+            self.assertTrue(bound["ok"], bound)
+            agent.tool_registry.execute(
+                "create_teammate", '{"name":"alice","role":"worker"}'
+            )
+            member = agent.agent_team_manager._members["alice"]
+            visible = {item["name"] for item in member.agent.tool_registry.definitions}
+            self.assertNotIn("create_worktree", visible)
+            self.assertNotIn("delete_worktree", visible)
+            self.assertEqual(
+                member.agent.tool_registry.execute(
+                    "create_worktree", json.dumps({"id": created["id"]})
+                )["code"],
+                "unknown_tool",
+            )
+            requested = member.agent.tool_registry.execute(
+                "request_plan_approval",
+                json.dumps({"task_id": created["id"], "plan": "write marker"}),
+            )
+            agent.tool_registry.execute(
+                "review_teammate_plan",
+                json.dumps(
+                    {
+                        "request_id": requested["request_id"],
+                        "approved": True,
+                        "feedback": "go",
+                    }
+                ),
+            )
+
+            messages = self.wait_for_inbox(str(root), "main", 2)
+            completion = next(
+                item["message"]
+                for item in messages
+                if item["message"].startswith("AGENT_TEAM_TASK_RESULT")
+            )
+            result = json.loads(completion.split("\n", 1)[1])
+            self.assertEqual(result["status"], "completed", result)
+            self.assertFalse((root / "marker.txt").exists())
+            self.assertEqual(
+                (Path(bound["worktree"]) / "marker.txt").read_text(encoding="utf-8"),
+                "inside",
+            )
+            self.assertEqual(member.workspace.current, root.resolve())
+
+    def test_missing_bound_worktree_stops_before_claim_or_model_run(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            responses = FakeResponses([])
+            agent = self.make_agent(
+                responses, root, approval_callback=lambda _: True
+            )
+            created = agent.tool_registry.execute(
+                "create_task",
+                json.dumps(
+                    {
+                        "name": "missing worktree",
+                        "summary": "must not run",
+                        "topic": "team",
+                        "dependencies": [],
+                    }
+                ),
+            )
+            TaskStore(root).bind_worktree(
+                created["id"], str((Path(root) / "missing").resolve())
+            )
+            agent.tool_registry.execute(
+                "create_teammate", '{"name":"alice","role":"worker"}'
+            )
+            member = agent.agent_team_manager._members["alice"]
+            requested = member.agent.tool_registry.execute(
+                "request_plan_approval",
+                json.dumps({"task_id": created["id"], "plan": "must not run"}),
+            )
+            agent.tool_registry.execute(
+                "review_teammate_plan",
+                json.dumps(
+                    {
+                        "request_id": requested["request_id"],
+                        "approved": True,
+                        "feedback": "go",
+                    }
+                ),
+            )
+
+            messages = self.wait_for_inbox(root, "main", 2)
+            completion = next(
+                item["message"]
+                for item in messages
+                if item["message"].startswith("AGENT_TEAM_TASK_RESULT")
+            )
+            result = json.loads(completion.split("\n", 1)[1])
+            self.assertEqual(result["status"], "worktree_unavailable")
+            self.assertEqual(result["code"], "worktree_unavailable")
+            self.assertEqual(
+                agent.tool_registry.execute(
+                    "get_task", json.dumps({"id": created["id"]})
+                )["status"],
+                "pending",
+            )
+            self.assertEqual(responses.requests, [])
+            self.assertEqual(member.workspace.current, Path(root).resolve())
 
     def test_claim_requires_main_approval_and_user_denial_prevents_execution(self) -> None:
         with tempfile.TemporaryDirectory() as root:
