@@ -16,7 +16,7 @@ from .agent import (
     InstructionsProvider,
     ResponsesClient,
 )
-from .filesystem import WorkspaceFiles, filesystem_tools
+from .filesystem import WorkspaceFiles, WorkspaceRoot, filesystem_tools
 from .hooks import HookRegistry, PreToolUse
 from .long_term_memory import LongTermMemoryStore, long_term_memory_tools
 from .memory import (
@@ -70,6 +70,7 @@ from .tools import (
     build_background_bash_function_tool,
     build_bash_function_tool,
 )
+from .worktrees import WORKTREE_TOOL_NAMES, WorktreeManager, worktree_tools
 
 
 _SUBAGENT_INSTRUCTIONS_SUFFIX = """
@@ -214,6 +215,7 @@ def build_default_components(
     )
     shared_tool_result_store = tool_result_store or ToolResultStore(workspace_root)
     shared_task_store = task_store or TaskStore(workspace_root)
+    worktree_manager = WorktreeManager(workspace_root, shared_task_store)
     hook_registry = hooks if hooks is not None else HookRegistry()
     child_hook_template = hook_registry.clone()
     reminder_interval = (
@@ -226,15 +228,19 @@ def build_default_components(
     )
 
     if bash_tool is None:
-        def make_bash_handler() -> Callable[[str], dict[str, Any]]:
+        def make_bash_handler(
+            root: WorkspaceRoot | None = None,
+        ) -> Callable[[str], dict[str, Any]]:
             return BashTool(
-                cwd=workspace_root,
+                cwd=root or workspace_root,
                 timeout_seconds=bash_timeout_seconds,
             )
     else:
         shared_bash_handler = _SerializedBashHandler(bash_tool)
 
-        def make_bash_handler() -> Callable[[str], dict[str, Any]]:
+        def make_bash_handler(
+            root: WorkspaceRoot | None = None,
+        ) -> Callable[[str], dict[str, Any]]:
             return shared_bash_handler
 
     main_bash_handler = make_bash_handler()
@@ -244,7 +250,7 @@ def build_default_components(
 
     manager: SubAgentManager | None = None
     team_manager: AgentTeamManager | None = None
-    management_tools = []
+    management_tools = [*worktree_tools(worktree_manager)]
     scheduled_task_runtime: ScheduledTaskRuntime | None = None
     if client is not None:
         def create_subagent() -> AgentLoop:
@@ -289,13 +295,13 @@ def build_default_components(
             max_workers=subagent_max_workers,
             max_tasks=subagent_max_tasks,
         )
-        management_tools = subagent_tools(manager)
+        management_tools.extend(subagent_tools(manager))
 
         def create_teammate_agent(
             name: str,
             role: str,
             inbox_reader: InboxReader,
-        ) -> AgentLoop:
+        ) -> tuple[AgentLoop, WorkspaceRoot]:
             if team_manager is None:
                 raise RuntimeError("Agent Team manager is unavailable")
 
@@ -310,9 +316,10 @@ def build_default_components(
                     )
                 )
 
+            teammate_workspace = WorkspaceRoot(workspace_root)
             teammate_components = _build_standard_components(
-                cwd=workspace_root,
-                bash_handler=make_bash_handler(),
+                cwd=teammate_workspace,
+                bash_handler=make_bash_handler(teammate_workspace),
                 allowed_tools=teammate_allowed_tools,
                 approval_callback=(
                     teammate_approval if approval_callback is not None else None
@@ -351,7 +358,7 @@ def build_default_components(
             teammate.skill_store = teammate_components.skill_store
             teammate.long_term_memory_store = teammate_components.long_term_memory_store
             teammate.task_store = teammate_components.task_store
-            return teammate
+            return teammate, teammate_workspace
 
         try:
             team_manager = AgentTeamManager(workspace_root, create_teammate_agent)
@@ -484,7 +491,7 @@ def build_default_components(
 
 def _build_standard_components(
     *,
-    cwd: str | os.PathLike[str],
+    cwd: str | os.PathLike[str] | WorkspaceRoot,
     bash_handler: Callable[[str], dict[str, Any]],
     allowed_tools: Iterable[str] | None,
     approval_callback: ApprovalCallback | None,
@@ -564,22 +571,28 @@ def _split_allowed_tools(
                 SUBAGENT_TOOL_NAMES
                 | SCHEDULED_TASK_TOOL_NAMES
                 | AGENT_TEAM_TOOL_NAMES
+                | WORKTREE_TOOL_NAMES
             ),
             DEFAULT_TOOL_ALLOWLIST.difference(
                 SUBAGENT_TOOL_NAMES
                 | SCHEDULED_TASK_TOOL_NAMES
                 | (MAIN_AGENT_TEAM_TOOL_NAMES - TEAMMATE_AGENT_TEAM_TOOL_NAMES)
+                | WORKTREE_TOOL_NAMES
             ),
         )
     if isinstance(allowed_tools, str):
         raise TypeError("allowed_tools must be an iterable of tool names, not a string")
     selected = frozenset(allowed_tools)
     return selected, selected.difference(
-        SUBAGENT_TOOL_NAMES | SCHEDULED_TASK_TOOL_NAMES | AGENT_TEAM_TOOL_NAMES
+        SUBAGENT_TOOL_NAMES
+        | SCHEDULED_TASK_TOOL_NAMES
+        | AGENT_TEAM_TOOL_NAMES
+        | WORKTREE_TOOL_NAMES
     ), selected.difference(
         SUBAGENT_TOOL_NAMES
         | SCHEDULED_TASK_TOOL_NAMES
         | (MAIN_AGENT_TEAM_TOOL_NAMES - TEAMMATE_AGENT_TEAM_TOOL_NAMES)
+        | WORKTREE_TOOL_NAMES
     )
 
 

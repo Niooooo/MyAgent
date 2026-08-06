@@ -13,6 +13,7 @@ from pathlib import Path
 from threading import RLock
 from typing import TYPE_CHECKING, Any
 
+from .filesystem import WorkspaceRoot
 from .hooks import PostToolUse, PreToolUse
 from .runtime_inbox import InboxBatch, InboxReader
 from .tasks import CLAIM_TASK_TOOL, COMPLETE_TASK_TOOL, GET_TASK_TOOL
@@ -44,13 +45,16 @@ TEAMMATE_AGENT_TEAM_TOOL_NAMES = frozenset(
 AGENT_TEAM_TOOL_NAMES = MAIN_AGENT_TEAM_TOOL_NAMES | TEAMMATE_AGENT_TEAM_TOOL_NAMES
 _MEMBER_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,31}\Z")
 
-TeammateFactory = Callable[[str, str, InboxReader], "AgentLoop"]
+TeammateFactory = Callable[
+    [str, str, InboxReader], tuple["AgentLoop", WorkspaceRoot]
+]
 
 
 @dataclass
 class _Member:
     agent: "AgentLoop"
     executor: ThreadPoolExecutor
+    workspace: WorkspaceRoot
     active_task_id: str | None = None
     queued_plan_request_id: str | None = None
     approved_claim_task_id: str | None = None
@@ -124,12 +128,14 @@ class AgentTeamManager:
         committed = False
         try:
             inbox_created = self._prepare_inbox(name)
-            agent = self._factory(name, role.strip(), self.inbox_reader(name))
+            agent, workspace = self._factory(
+                name, role.strip(), self.inbox_reader(name)
+            )
             executor = ThreadPoolExecutor(
                 max_workers=1,
                 thread_name_prefix=f"myagent-teammate-{name}",
             )
-            member = _Member(agent, executor)
+            member = _Member(agent, executor, workspace)
             self._install_claim_guard(name, member)
             with self._lock:
                 if self._closed:
@@ -535,6 +541,41 @@ class AgentTeamManager:
 
         if result is None:
             try:
+                inspected = member.agent.tool_registry.execute(
+                    GET_TASK_TOOL,
+                    json.dumps({"id": approval.task_id}, separators=(",", ":")),
+                )
+            except Exception:
+                inspected = _failure(
+                    "tool_execution_failed",
+                    "Approved persistent task could not be inspected",
+                )
+            worktree = inspected.get("worktree") if inspected.get("ok") else None
+            if not inspected.get("ok"):
+                result = {
+                    "task_id": execution_id,
+                    "status": "inspection_failed",
+                    "plan_request_id": request_id,
+                    "persistent_task_id": approval.task_id,
+                    "inspection": inspected,
+                }
+            elif worktree is not None and not _available_worktree(worktree):
+                result = {
+                    "task_id": execution_id,
+                    "status": "worktree_unavailable",
+                    "code": "worktree_unavailable",
+                    "error": "Task worktree directory is unavailable",
+                    "plan_request_id": request_id,
+                    "persistent_task_id": approval.task_id,
+                }
+
+        if result is not None:
+            with self._lock:
+                if member.approved_claim_task_id == approval.task_id:
+                    member.approved_claim_task_id = None
+
+        if result is None:
+            try:
                 claimed = member.agent.tool_registry.execute(
                     CLAIM_TASK_TOOL,
                     json.dumps(
@@ -572,9 +613,21 @@ class AgentTeamManager:
                     }
             else:
                 try:
-                    output = member.agent.run(
-                        _approved_task_prompt(request_id, approval, claimed)
-                    )
+                    selected_root = claimed.get("worktree") or member.workspace.base_root
+                    with member.workspace.use(selected_root):
+                        output = member.agent.run(
+                            _approved_task_prompt(request_id, approval, claimed)
+                        )
+                except ValueError:
+                    result = {
+                        "task_id": execution_id,
+                        "status": "worktree_unavailable",
+                        "code": "worktree_unavailable",
+                        "error": "Task worktree directory is unavailable",
+                        "plan_request_id": request_id,
+                        "persistent_task_id": approval.task_id,
+                        "claim": claimed,
+                    }
                 except Exception:
                     result = {
                         "task_id": execution_id,
@@ -932,6 +985,10 @@ def _valid_message(payload: object, recipient: str) -> bool:
             for key in ("id", "sender", "recipient", "message")
         )
     )
+
+
+def _available_worktree(worktree: object) -> bool:
+    return isinstance(worktree, str) and Path(worktree).is_absolute() and Path(worktree).is_dir()
 
 
 def _failure(code: str, error: str) -> dict[str, Any]:

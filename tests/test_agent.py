@@ -13,6 +13,7 @@ from myagent.scheduled_tasks import SCHEDULED_TASK_TOOL_NAMES
 from myagent.tasks import TASK_TOOL_NAMES
 from myagent.tooling import FunctionTool, ToolExecutionError, ToolRegistry
 from myagent.tools import BackgroundBashRunner, build_background_bash_function_tool
+from myagent.worktrees import WORKTREE_TOOL_NAMES
 from tests.fakes import FakeAPIError, FakeResponses, function_call, response
 
 
@@ -268,6 +269,7 @@ class AgentLoopTests(unittest.TestCase):
                 "collect_subagent",
                 *MAIN_AGENT_TEAM_TOOL_NAMES,
                 *SCHEDULED_TASK_TOOL_NAMES,
+                *WORKTREE_TOOL_NAMES,
             },
         )
         output = json.loads(responses.requests[1]["input"][-1]["output"])

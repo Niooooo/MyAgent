@@ -17,7 +17,7 @@ from typing import Any
 from .tooling import FunctionTool
 
 
-TASK_SCHEMA_VERSION = 1
+TASK_SCHEMA_VERSION = 2
 TASK_DIRECTORY = Path(".myagent") / "tasks"
 TASK_FILE_NAME = "tasks.json"
 
@@ -27,6 +27,7 @@ MAX_TASK_NAME_CHARS = 200
 MAX_TASK_SUMMARY_CHARS = 1_000
 MAX_TASK_TOPIC_CHARS = 200
 MAX_TASK_OWNER_CHARS = 200
+MAX_TASK_WORKTREE_CHARS = 4_096
 MAX_TASK_FILE_BYTES = 1_048_576
 
 CREATE_TASK_TOOL = "create_task"
@@ -50,9 +51,10 @@ TASK_MUTATION_TOOL_NAMES = frozenset(
 )
 
 _TASK_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
-_TASK_KEYS = frozenset(
+_TASK_V1_KEYS = frozenset(
     {"id", "name", "status", "summary", "topic", "owner", "dependencies"}
 )
+_TASK_KEYS = _TASK_V1_KEYS | {"worktree"}
 _DOCUMENT_KEYS = frozenset({"schema_version", "tasks"})
 
 
@@ -75,6 +77,7 @@ class Task:
     topic: str
     owner: str | None
     dependencies: tuple[str, ...]
+    worktree: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -85,6 +88,7 @@ class Task:
             "topic": self.topic,
             "owner": self.owner,
             "dependencies": list(self.dependencies),
+            "worktree": self.worktree,
         }
 
 
@@ -198,6 +202,7 @@ class TaskStore:
                     topic=normalized_topic,
                     owner=None,
                     dependencies=normalized_dependencies,
+                    worktree=None,
                 )
                 proposal = tuple((*current, task))
                 self._commit(current, proposal)
@@ -339,6 +344,64 @@ class TaskStore:
             except OSError as exc:
                 raise self._storage_error() from exc
 
+    def bind_worktree(self, id: object, worktree: object) -> dict[str, Any]:
+        """Persist a normalized absolute worktree path without overwriting another."""
+        with self._lock:
+            try:
+                task_id = self._validate_input_id(id)
+                normalized = self._validate_worktree(worktree)
+                current = self._read_tasks()
+                task = self._require_task(current, task_id)
+                if task.worktree == normalized:
+                    return {"changed": False, **self._task_details(task, current)}
+                if task.worktree is not None:
+                    raise TaskStoreError(
+                        "worktree_already_bound",
+                        "Task is already bound to a different worktree",
+                    )
+                if task.status is TaskStatus.COMPLETED:
+                    raise TaskStoreError(
+                        "invalid_worktree_transition",
+                        "A completed task cannot be bound to a worktree",
+                    )
+                bound = replace(task, worktree=normalized)
+                proposal = self._replace_task(current, bound)
+                self._commit(current, proposal)
+                return {"changed": True, **self._task_details(bound, proposal)}
+            except TaskStoreError:
+                raise
+            except OSError as exc:
+                raise self._storage_error() from exc
+
+    def clear_worktree(self, id: object, worktree: object | None = None) -> dict[str, Any]:
+        """Clear a task worktree unless the task is currently running."""
+        with self._lock:
+            try:
+                task_id = self._validate_input_id(id)
+                expected = None if worktree is None else self._validate_worktree(worktree)
+                current = self._read_tasks()
+                task = self._require_task(current, task_id)
+                if task.worktree is None:
+                    return {"changed": False, **self._task_details(task, current)}
+                if expected is not None and task.worktree != expected:
+                    raise TaskStoreError(
+                        "worktree_binding_mismatch",
+                        "Task worktree binding does not match the requested path",
+                    )
+                if task.status is TaskStatus.IN_PROGRESS:
+                    raise TaskStoreError(
+                        "task_in_progress",
+                        "An in-progress task cannot have its worktree removed",
+                    )
+                cleared = replace(task, worktree=None)
+                proposal = self._replace_task(current, cleared)
+                self._commit(current, proposal)
+                return {"changed": True, **self._task_details(cleared, proposal)}
+            except TaskStoreError:
+                raise
+            except OSError as exc:
+                raise self._storage_error() from exc
+
     def _read_tasks(self) -> tuple[Task, ...]:
         self._validate_read_boundary()
         if not self.path.exists():
@@ -361,7 +424,7 @@ class TaskStore:
         if not isinstance(document, dict) or set(document) != _DOCUMENT_KEYS:
             raise self._corrupt_error()
         schema_version = document.get("schema_version")
-        if schema_version != TASK_SCHEMA_VERSION or isinstance(schema_version, bool):
+        if schema_version not in {1, TASK_SCHEMA_VERSION} or isinstance(schema_version, bool):
             raise self._corrupt_error()
         raw_tasks = document.get("tasks")
         if not isinstance(raw_tasks, list) or len(raw_tasks) > MAX_TASKS:
@@ -369,7 +432,8 @@ class TaskStore:
 
         tasks: list[Task] = []
         for raw_task in raw_tasks:
-            if not isinstance(raw_task, dict) or set(raw_task) != _TASK_KEYS:
+            expected_keys = _TASK_V1_KEYS if schema_version == 1 else _TASK_KEYS
+            if not isinstance(raw_task, dict) or set(raw_task) != expected_keys:
                 raise self._corrupt_error()
             task_id = raw_task.get("id")
             name = raw_task.get("name")
@@ -377,6 +441,7 @@ class TaskStore:
             topic = raw_task.get("topic")
             owner = raw_task.get("owner")
             dependencies = raw_task.get("dependencies")
+            worktree = raw_task.get("worktree") if schema_version == 2 else None
             if not isinstance(task_id, str) or not _TASK_ID_PATTERN.fullmatch(task_id):
                 raise self._corrupt_error()
             if not self._is_stored_string(name, MAX_TASK_NAME_CHARS):
@@ -388,6 +453,8 @@ class TaskStore:
             if owner is not None and not self._is_stored_string(
                 owner, MAX_TASK_OWNER_CHARS
             ):
+                raise self._corrupt_error()
+            if worktree is not None and not self._is_valid_worktree(worktree):
                 raise self._corrupt_error()
             if (
                 not isinstance(dependencies, list)
@@ -412,6 +479,7 @@ class TaskStore:
                     topic=topic,
                     owner=owner,
                     dependencies=tuple(dependencies),
+                    worktree=worktree,
                 )
             )
 
@@ -438,6 +506,8 @@ class TaskStore:
             if task.owner is not None and not self._is_stored_string(
                 task.owner, MAX_TASK_OWNER_CHARS
             ):
+                raise self._corrupt_error()
+            if task.worktree is not None and not self._is_valid_worktree(task.worktree):
                 raise self._corrupt_error()
             if not isinstance(task.status, TaskStatus):
                 raise self._corrupt_error()
@@ -516,10 +586,21 @@ class TaskStore:
             new = proposal_by_id[task_id]
             if old.dependencies != new.dependencies:
                 raise self._corrupt_error()
-            if old.status is TaskStatus.COMPLETED and new != old:
-                raise self._corrupt_error()
             if old == new:
                 continue
+            if self._same_non_worktree_fields(old, new):
+                if (
+                    old.worktree is None
+                    and new.worktree is not None
+                    and old.status is not TaskStatus.COMPLETED
+                ):
+                    continue
+                if (
+                    old.worktree is not None
+                    and new.worktree is None
+                    and old.status is not TaskStatus.IN_PROGRESS
+                ):
+                    continue
             if (
                 old.status is TaskStatus.PENDING
                 and old.owner is None
@@ -550,7 +631,12 @@ class TaskStore:
             and old.summary == new.summary
             and old.topic == new.topic
             and old.dependencies == new.dependencies
+            and old.worktree == new.worktree
         )
+
+    @staticmethod
+    def _same_non_worktree_fields(old: Task, new: Task) -> bool:
+        return replace(old, worktree=None) == replace(new, worktree=None)
 
     @staticmethod
     def _serialize(tasks: Iterable[Task]) -> str:
@@ -692,6 +778,15 @@ class TaskStore:
             )
         return tuple(dependencies)
 
+    @classmethod
+    def _validate_worktree(cls, value: object) -> str:
+        if not cls._is_valid_worktree(value):
+            raise TaskStoreError(
+                "invalid_worktree",
+                "worktree must be a normalized absolute path",
+            )
+        return value
+
     def _new_task_id(self, current_by_id: Mapping[str, Task]) -> str:
         for _ in range(100):
             candidate = self._id_factory()
@@ -753,6 +848,7 @@ class TaskStore:
             "summary": task.summary,
             "topic": task.topic,
             "owner": task.owner,
+            "worktree": task.worktree,
             "executable": executability.executable,
             "reason": executability.reason,
             "dependency_count": len(task.dependencies),
@@ -769,6 +865,18 @@ class TaskStore:
             and value == value.strip()
             and len(value) <= maximum
         )
+
+    @staticmethod
+    def _is_valid_worktree(value: object) -> bool:
+        if (
+            not isinstance(value, str)
+            or not value
+            or value != value.strip()
+            or len(value) > MAX_TASK_WORKTREE_CHARS
+        ):
+            return False
+        path = Path(value)
+        return path.is_absolute() and str(path.resolve()) == value
 
     @staticmethod
     def _is_within(path: Path, root: Path) -> bool:

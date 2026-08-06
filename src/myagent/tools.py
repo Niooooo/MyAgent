@@ -11,6 +11,7 @@ from pathlib import Path
 from threading import Lock
 from typing import TYPE_CHECKING, Any
 
+from .filesystem import WorkspaceRoot
 from .permissions import (
     BACKGROUND_BASH_TOOL,
     PermissionLevel,
@@ -189,7 +190,7 @@ class BashTool:
     def __init__(
         self,
         *,
-        cwd: str | os.PathLike[str] | None = None,
+        cwd: str | os.PathLike[str] | WorkspaceRoot | None = None,
         timeout_seconds: int = 30,
         max_output_chars: int = 50_000,
     ) -> None:
@@ -198,9 +199,15 @@ class BashTool:
         if max_output_chars <= 0:
             raise ValueError("max_output_chars must be positive")
 
-        self.cwd = Path(cwd or Path.cwd()).resolve()
+        self._cwd = (
+            cwd if isinstance(cwd, WorkspaceRoot) else WorkspaceRoot(cwd or Path.cwd())
+        )
         self.timeout_seconds = timeout_seconds
         self.max_output_chars = max_output_chars
+
+    @property
+    def cwd(self) -> Path:
+        return self._cwd.current
 
     def __call__(self, command: str) -> dict[str, Any]:
         if is_dangerous_command(command):

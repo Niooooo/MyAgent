@@ -43,6 +43,7 @@ from .tasks import (
     CREATE_TASK_TOOL,
     TASK_TOOL_NAMES,
 )
+from .worktrees import CREATE_WORKTREE_TOOL, DELETE_WORKTREE_TOOL, WORKTREE_TOOL_NAMES
 
 
 BACKGROUND_BASH_TOOL = "run_bash_in_background"
@@ -66,6 +67,7 @@ DEFAULT_TOOL_ALLOWLIST = frozenset(
         *SUBAGENT_TOOL_NAMES,
         *AGENT_TEAM_TOOL_NAMES,
         *SCHEDULED_TASK_TOOL_NAMES,
+        *WORKTREE_TOOL_NAMES,
     }
 )
 
@@ -107,6 +109,10 @@ _SENSITIVE_AGENT_TEAM_TOOLS = {
     REQUEST_TEAMMATE_SHUTDOWN_TOOL: (
         "requesting teammate shutdown changes persistent in-process Agent state"
     ),
+}
+_SENSITIVE_WORKTREE_TOOLS = {
+    CREATE_WORKTREE_TOOL: "creating a Git worktree changes repository and task state",
+    DELETE_WORKTREE_TOOL: "deleting a Git worktree changes repository and task state",
 }
 _SENSITIVE_COMMANDS = {
     "chmod",
@@ -397,6 +403,12 @@ class DefaultPermissionPolicy:
             return PermissionDecision(
                 PermissionLevel.REQUIRE_APPROVAL,
                 _SENSITIVE_AGENT_TEAM_TOOLS[tool_name],
+            )
+
+        if tool_name in _SENSITIVE_WORKTREE_TOOLS:
+            return PermissionDecision(
+                PermissionLevel.REQUIRE_APPROVAL,
+                _SENSITIVE_WORKTREE_TOOLS[tool_name],
             )
 
         if tool_name in {"bash", BACKGROUND_BASH_TOOL}:
