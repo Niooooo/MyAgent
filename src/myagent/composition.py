@@ -25,6 +25,11 @@ from .memory import (
     ToolResultStore,
     memory_tools,
 )
+from .mcp import (
+    ClientTargetFactory,
+    MCPRuntime,
+    StdioMCPServerConfig,
+)
 from .agent_team import (
     AGENT_TEAM_TOOL_NAMES,
     MAIN_AGENT_NAME,
@@ -110,6 +115,7 @@ class AgentConfig:
     subagent_max_tasks: int = DEFAULT_SUBAGENT_MAX_TASKS
     allowed_tools: frozenset[str] | None = None
     memory: MemoryConfig = field(default_factory=MemoryConfig)
+    mcp_servers: tuple[StdioMCPServerConfig, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.model, str) or not self.model.strip():
@@ -118,6 +124,11 @@ class AgentConfig:
             raise ValueError("fallback_model must be a non-empty string")
         if not isinstance(self.memory, MemoryConfig):
             raise TypeError("memory must be a MemoryConfig")
+        if not isinstance(self.mcp_servers, tuple) or any(
+            not isinstance(server, StdioMCPServerConfig)
+            for server in self.mcp_servers
+        ):
+            raise TypeError("mcp_servers must be a tuple of StdioMCPServerConfig")
 
 
 @dataclass(frozen=True)
@@ -136,6 +147,7 @@ class DefaultAgentComponents:
     background_bash_runner: BackgroundBashRunner | None = None
     scheduled_task_runtime: ScheduledTaskRuntime | None = None
     agent_team_manager: AgentTeamManager | None = None
+    mcp_runtime: MCPRuntime | None = None
     inbox_reader: InboxReader | None = None
     _close_callback: Callable[[], None] = field(
         default=_noop,
@@ -182,10 +194,18 @@ def build_default_components(
     memory_config: MemoryConfig | None = None,
     tool_result_store: ToolResultStore | None = None,
     task_store: TaskStore | None = None,
+    mcp_servers: Iterable[StdioMCPServerConfig] = (),
+    mcp_client_target_factory: ClientTargetFactory | None = None,
 ) -> DefaultAgentComponents:
     """Create and connect the standard tools, policies, state, and hooks."""
     if max_tool_rounds < 0:
         raise ValueError("max_tool_rounds must be non-negative")
+    selected_mcp_servers = tuple(mcp_servers)
+    if any(
+        not isinstance(server, StdioMCPServerConfig)
+        for server in selected_mcp_servers
+    ):
+        raise TypeError("mcp_servers must contain StdioMCPServerConfig values")
 
     workspace_root = WorkspaceFiles(cwd).root
     if skill_store is not None and skill_store.workspace_root != workspace_root:
@@ -371,6 +391,35 @@ def build_default_components(
             raise
         management_tools.extend(main_team_tools(team_manager))
 
+    mcp_runtime: MCPRuntime | None = None
+    mcp_tools: tuple[FunctionTool, ...] = ()
+    try:
+        if selected_mcp_servers:
+            mcp_runtime = MCPRuntime(
+                selected_mcp_servers,
+                client_target_factory=mcp_client_target_factory,
+            )
+            mcp_tools = mcp_runtime.start()
+    except BaseException:
+        try:
+            if background_bash_runner is not None:
+                background_bash_runner.close()
+        finally:
+            if manager is not None:
+                manager.close()
+            if team_manager is not None:
+                team_manager.close()
+        raise
+
+    mcp_tool_names = frozenset(tool.name for tool in mcp_tools)
+    mcp_approval_reasons = {
+        tool.name: (
+            f"external MCP Server {tool.name.split('__', 2)[1]!r} "
+            f"tool {tool.name.split('__', 2)[2]!r} requires one-time approval"
+        )
+        for tool in mcp_tools
+    }
+
     try:
         components = _build_standard_components(
             cwd=workspace_root,
@@ -385,8 +434,11 @@ def build_default_components(
             memory_config=selected_memory_config,
             tool_result_store=shared_tool_result_store,
             task_store=shared_task_store,
+            dynamic_default_tools=mcp_tool_names,
+            dynamic_approval_reasons=mcp_approval_reasons,
             additional_tools=[
                 *management_tools,
+                *mcp_tools,
                 *(
                     [build_background_bash_function_tool(background_bash_runner)]
                     if background_bash_runner is not None
@@ -407,6 +459,8 @@ def build_default_components(
                     manager.close()
                 if team_manager is not None:
                     team_manager.close()
+                if mcp_runtime is not None:
+                    mcp_runtime.close()
         raise
 
     if client is not None:
@@ -414,7 +468,7 @@ def build_default_components(
             schedulable_tool_names = {
                 definition["name"]
                 for definition in components.tool_registry.definitions
-            }.difference(SCHEDULED_TASK_TOOL_NAMES)
+            }.difference(SCHEDULED_TASK_TOOL_NAMES | mcp_tool_names)
 
             def execute_scheduled_tool(tool_name: str, tool_arguments: str) -> object:
                 return components.tool_registry.execute(
@@ -443,6 +497,8 @@ def build_default_components(
                         manager.close()
                     if team_manager is not None:
                         team_manager.close()
+                    if mcp_runtime is not None:
+                        mcp_runtime.close()
             raise
 
     if (
@@ -450,6 +506,7 @@ def build_default_components(
         and background_bash_runner is None
         and scheduled_task_runtime is None
         and team_manager is None
+        and mcp_runtime is None
     ):
         return components
 
@@ -466,6 +523,8 @@ def build_default_components(
                     manager.close()
                 if team_manager is not None:
                     team_manager.close()
+                if mcp_runtime is not None:
+                    mcp_runtime.close()
 
     return DefaultAgentComponents(
         tool_registry=components.tool_registry,
@@ -480,6 +539,7 @@ def build_default_components(
         background_bash_runner=background_bash_runner,
         scheduled_task_runtime=scheduled_task_runtime,
         agent_team_manager=team_manager,
+        mcp_runtime=mcp_runtime,
         inbox_reader=(
             team_manager.inbox_reader(MAIN_AGENT_NAME)
             if team_manager is not None
@@ -503,6 +563,8 @@ def _build_standard_components(
     memory_config: MemoryConfig,
     tool_result_store: ToolResultStore,
     task_store: TaskStore,
+    dynamic_default_tools: Iterable[str] = (),
+    dynamic_approval_reasons: dict[str, str] | None = None,
     additional_tools: Iterable[FunctionTool] = (),
 ) -> DefaultAgentComponents:
     """Build one isolated ordinary capability set and its guarded registry."""
@@ -513,7 +575,11 @@ def _build_standard_components(
     ).register(hooks)
 
     permissions = PermissionManager(
-        DefaultPermissionPolicy(allowed_tools),
+        DefaultPermissionPolicy(
+            allowed_tools,
+            dynamic_default_tools=dynamic_default_tools,
+            dynamic_approval_reasons=dynamic_approval_reasons,
+        ),
         approval_callback,
     )
     permission_hook = PermissionHook(permissions)
@@ -624,6 +690,7 @@ def create_default_agent(
     config: AgentConfig | None = None,
     approval_callback: ApprovalCallback | None = None,
     hooks: HookRegistry | None = None,
+    mcp_client_target_factory: ClientTargetFactory | None = None,
 ) -> AgentLoop:
     """Create one fully connected default agent for an application boundary."""
     selected = config if config is not None else AgentConfig()
@@ -640,6 +707,8 @@ def create_default_agent(
         subagent_max_workers=selected.subagent_max_workers,
         subagent_max_tasks=selected.subagent_max_tasks,
         memory_config=selected.memory,
+        mcp_servers=selected.mcp_servers,
+        mcp_client_target_factory=mcp_client_target_factory,
     )
     try:
         agent = AgentLoop(
@@ -666,4 +735,5 @@ def create_default_agent(
     agent.task_store = components.task_store
     agent.scheduled_task_runtime = components.scheduled_task_runtime
     agent.agent_team_manager = components.agent_team_manager
+    agent.mcp_runtime = components.mcp_runtime
     return agent

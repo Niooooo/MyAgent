@@ -343,15 +343,39 @@ def classify_bash_command(command: str) -> PermissionDecision:
 class DefaultPermissionPolicy:
     """Apply an explicit tool allowlist and classify sensitive built-in calls."""
 
-    def __init__(self, allowed_tools: Iterable[str] | None = None) -> None:
+    def __init__(
+        self,
+        allowed_tools: Iterable[str] | None = None,
+        *,
+        dynamic_default_tools: Iterable[str] = (),
+        dynamic_approval_reasons: Mapping[str, str] | None = None,
+    ) -> None:
         if isinstance(allowed_tools, str):
             raise TypeError(
                 "allowed_tools must be an iterable of tool names, not a string"
             )
-        selected = DEFAULT_TOOL_ALLOWLIST if allowed_tools is None else allowed_tools
+        if isinstance(dynamic_default_tools, str):
+            raise TypeError("dynamic_default_tools must be an iterable of tool names")
+        dynamic_tools = frozenset(dynamic_default_tools)
+        selected = (
+            DEFAULT_TOOL_ALLOWLIST.union(dynamic_tools)
+            if allowed_tools is None
+            else allowed_tools
+        )
         self.allowed_tools = frozenset(selected)
         if any(not isinstance(name, str) or not name for name in self.allowed_tools):
             raise ValueError("allowed_tools must contain non-empty strings")
+        reasons = dict(dynamic_approval_reasons or {})
+        if any(
+            name not in dynamic_tools
+            or not isinstance(reason, str)
+            or not reason.strip()
+            for name, reason in reasons.items()
+        ):
+            raise ValueError("dynamic approval reasons must describe dynamic tools")
+        # Explicit allowlists are an application-level approval, while dynamically
+        # exposed defaults remain subject to one approval on every invocation.
+        self.dynamic_approval_reasons = reasons if allowed_tools is None else {}
 
     def is_tool_allowed(self, tool_name: str) -> bool:
         """Return whether a tool may be exposed and considered for execution."""
@@ -379,6 +403,13 @@ class DefaultPermissionPolicy:
             return PermissionDecision(
                 PermissionLevel.REQUIRE_APPROVAL,
                 _SENSITIVE_SKILL_TOOLS[tool_name],
+            )
+
+        dynamic_reason = self.dynamic_approval_reasons.get(tool_name)
+        if dynamic_reason is not None:
+            return PermissionDecision(
+                PermissionLevel.REQUIRE_APPROVAL,
+                dynamic_reason,
             )
 
         if tool_name in _SENSITIVE_LONG_TERM_MEMORY_TOOLS:
