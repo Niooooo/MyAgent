@@ -7,5 +7,6 @@
   "bash_timeout_seconds": 30,
   "todo_reminder_tool_calls": 4,
   "subagent_max_workers": 4,
-  "subagent_max_tasks": 16
+  "subagent_max_tasks": 16,
+  "mcp_servers": []
 }

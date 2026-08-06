@@ -324,9 +324,28 @@ CLI 会读取当前工作目录中的 `myagent.config.json`。它可以同时配
   "bash_timeout_seconds": 30,
   "todo_reminder_tool_calls": 4,
   "subagent_max_workers": 4,
-  "subagent_max_tasks": 16
+  "subagent_max_tasks": 16,
+  "mcp_servers": []
 }
 ```
+
+要桥接 stdio MCP 工具，可把空数组替换为以下配置；启动时会发现工具并以
+`mcp__local__<远端工具名>` 暴露给主 Agent：
+
+```json
+"mcp_servers": [
+  {
+    "name": "local",
+    "transport": "stdio",
+    "command": "python",
+    "args": ["path/to/server.py"],
+    "env": {}
+  }
+]
+```
+
+本轮只支持 stdio、启动时工具快照和主 Agent 调用；不支持 HTTP/SSE、动态刷新、
+resources/prompts，也不向 SubAgent、Agent Team teammate 或定时任务暴露 MCP 工具。
 
 `api_key` 和 `base_url` 为 `null` 时沿用 OpenAI SDK 的环境变量或默认连接；也可以填写任意 OpenAI API 兼容服务的密钥、地址和模型 ID。兼容服务必须实现本项目使用的 Responses API（`/responses`），并支持工具调用、`max_output_tokens` 和 `previous_response_id` 等项目实际使用的语义；只有 Chat Completions 接口的服务不能直接使用。
 

@@ -196,6 +196,7 @@ class AgentLoop:
         self.context_memory: ContextMemory | None = context_memory
         self.background_bash_runner = background_bash_runner
         self.scheduled_task_runtime = scheduled_task_runtime
+        self.mcp_runtime = None
         self.inbox_reader = inbox_reader
         if tool_registry is not None:
             if hooks is not None and tool_registry.hooks is not hooks:

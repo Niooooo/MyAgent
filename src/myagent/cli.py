@@ -11,6 +11,7 @@ from typing import Any
 
 from .agent import AgentLoop, AgentLoopLimitError
 from .composition import AgentConfig, create_default_agent
+from .mcp import parse_mcp_servers
 from .permissions import ApprovalRequest
 
 
@@ -26,6 +27,7 @@ _CONFIG_FIELDS = frozenset(
         "todo_reminder_tool_calls",
         "subagent_max_workers",
         "subagent_max_tasks",
+        "mcp_servers",
     }
 )
 _POSITIVE_INTEGER_FIELDS = frozenset(
@@ -161,6 +163,11 @@ def _load_config(
             f"Invalid config {selected_path}: max_tool_rounds must be a "
             "non-negative integer"
         )
+    if "mcp_servers" in payload:
+        try:
+            payload["mcp_servers"] = parse_mcp_servers(payload["mcp_servers"])
+        except ValueError as exc:
+            raise SystemExit(f"Invalid config {selected_path}: {exc}") from exc
     return payload
 
 
@@ -214,6 +221,7 @@ def _config_from_environment(
                 "subagent_max_tasks",
                 "SUBAGENT_MAX_TASKS",
             ),
+            mcp_servers=tuple(selected_file_config.get("mcp_servers", ())),
         )
     except ValueError as exc:
         raise SystemExit(
