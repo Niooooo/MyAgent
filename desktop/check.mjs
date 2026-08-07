@@ -8,6 +8,7 @@ const required = [
   "preload.cjs",
   "renderer/index.html",
   "renderer/app.js",
+  "renderer/markdown.js",
   "renderer/styles.css",
 ]
 for (const relative of required) {
@@ -23,6 +24,14 @@ if (!layout.includes("COMPACT_ENTER_WIDTH = 880") || !layout.includes("COMPACT_E
   throw new Error("Responsive hysteresis constants are missing")
 }
 if (!app.includes("drawWelcomeLogo()")) throw new Error("Static logo draw is missing")
+for (const dependency of [
+  "node_modules/marked/lib/marked.esm.js",
+  "node_modules/dompurify/dist/purify.es.mjs",
+]) {
+  if (!existsSync(path.join(root, dependency))) {
+    throw new Error(`Missing desktop dependency: ${dependency}`)
+  }
+}
 const electronBinary = path.join(root, "node_modules", "electron", "dist", process.platform === "win32" ? "electron.exe" : "electron")
 if (!existsSync(electronBinary)) throw new Error("Electron is not installed; run npm install in desktop")
 console.log("MyAgent Electron desktop check passed")

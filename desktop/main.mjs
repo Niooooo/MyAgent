@@ -20,8 +20,9 @@ const IPC_METHODS = new Set([
   "session.new",
   "session.activate",
   "session.close",
+  "session.rename",
   "session.select_model",
-  "session.set_kind",
+  "session.configure_agent_model",
   "session.submit",
   "model.register",
   "model.delete",
@@ -282,19 +283,75 @@ function createWindow() {
         if (!renderedText.tab.includes("对话") || JSON.stringify(renderedText).includes("�")) {
           throw new Error("Renderer received mojibake from the Python sidecar")
         }
+        const renameStarted = await mainWindow.webContents.executeJavaScript(`(() => {
+          const title = document.querySelector(".tab-title")
+          const rect = title?.getBoundingClientRect()
+          title?.dispatchEvent(new MouseEvent("contextmenu", {
+            bubbles: true,
+            cancelable: true,
+            clientX: rect?.left || 20,
+            clientY: rect?.bottom || 20,
+          }))
+          const menu = document.querySelector("#tab-context-menu")
+          const menuItem = document.querySelector("#rename-tab-menu-item")
+          if (menu?.hidden || menuItem?.textContent !== "修改名称") return false
+          menuItem.click()
+          const input = document.querySelector(".tab-title-input")
+          if (!input) return false
+          input.value = "冒烟会话"
+          input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }))
+          return true
+        })()`)
+        if (!renameStarted) throw new Error("Conversation rename context menu did not open the editor")
+        let renamedTitle = ""
+        for (let attempt = 0; attempt < 20; attempt += 1) {
+          renamedTitle = await mainWindow.webContents.executeJavaScript(
+            'document.querySelector(".tab-title")?.textContent || ""',
+          )
+          if (renamedTitle === "冒烟会话") break
+          await new Promise((resolve) => setTimeout(resolve, 25))
+        }
+        if (renamedTitle !== "冒烟会话") throw new Error("Conversation title rename did not persist")
+        await mainWindow.webContents.executeJavaScript(
+          'document.querySelector(".tab-close")?.click()',
+        )
+        await new Promise((resolve) => setTimeout(resolve, 25))
+        const toast = await mainWindow.webContents.executeJavaScript(
+          '({ hidden: document.querySelector("#error-toast")?.hidden, text: document.querySelector("#error-toast")?.textContent || "" })',
+        )
+        if (toast.hidden || !toast.text.includes("至少保留一个对话标签") || toast.text.includes("remote method")) {
+          throw new Error("Desktop request errors are not shown as a clean toast")
+        }
+        await new Promise((resolve) => setTimeout(resolve, 5100))
+        const toastDismissed = await mainWindow.webContents.executeJavaScript(
+          'document.querySelector("#error-toast")?.hidden === true && document.querySelector("#error-toast")?.textContent === ""',
+        )
+        if (!toastDismissed) throw new Error("Desktop request error toast did not dismiss after five seconds")
         const busyState = JSON.parse(JSON.stringify(result.state))
         const busySession = busyState.sessions.find(
           (session) => session.id === busyState.activeSessionId,
         )
+        busyState.models = [
+          { name: "smoke-model", baseUrl: null, createdAt: "2026-01-01T00:00:00Z" },
+          { name: "child-model", baseUrl: null, createdAt: "2026-01-01T00:00:00Z" },
+        ]
         busySession.state = "busy"
+        busySession.model = "smoke-model"
+        busySession.agentModels = { main: "smoke-model", sub: "child-model" }
         busySession.canSend = false
+        busySession.canConfigureAgents = false
         mainWindow.webContents.send("myagent:event", { event: "state", payload: busyState })
         await new Promise((resolve) => setTimeout(resolve, 25))
         const busyControls = await mainWindow.webContents.executeJavaScript(
-          '({ promptDisabled: document.querySelector("#prompt-input")?.disabled, sendDisabled: document.querySelector("#send-button")?.disabled })',
+          '({ promptDisabled: document.querySelector("#prompt-input")?.disabled, sendDisabled: document.querySelector("#send-button")?.disabled, mainModelDisabled: document.querySelector("#main-agent-model-selector")?.disabled, subModelDisabled: document.querySelector("#sub-agent-model-selector")?.disabled })',
         )
-        if (busyControls.promptDisabled || !busyControls.sendDisabled) {
-          throw new Error("Busy turn must keep the prompt editable and lock only send")
+        if (
+          busyControls.promptDisabled ||
+          !busyControls.sendDisabled ||
+          !busyControls.mainModelDisabled ||
+          !busyControls.subModelDisabled
+        ) {
+          throw new Error("Busy turn must keep the prompt editable and lock Agent configuration")
         }
         mainWindow.webContents.send("myagent:event", {
           event: "stream-start",
@@ -302,21 +359,96 @@ function createWindow() {
         })
         mainWindow.webContents.send("myagent:event", {
           event: "stream-delta",
-          payload: { sessionId: busyState.activeSessionId, delta: "流式输出" },
+          payload: { sessionId: busyState.activeSessionId, delta: "**流式输出**" },
         })
         await new Promise((resolve) => setTimeout(resolve, 25))
-        const streamingText = await mainWindow.webContents.executeJavaScript(
-          'document.querySelector(".message.streaming .message-text")?.textContent || ""',
+        const streamingMarkdown = await mainWindow.webContents.executeJavaScript(
+          'document.querySelector(".message.streaming strong")?.textContent || ""',
         )
-        if (streamingText !== "流式输出") {
-          throw new Error("Renderer did not incrementally render sidecar output")
+        if (streamingMarkdown !== "流式输出") {
+          throw new Error("Renderer did not incrementally render Markdown output")
         }
-        mainWindow.webContents.send("myagent:event", { event: "state", payload: result.state })
-        await new Promise((resolve) => setTimeout(resolve, 25))
-        const streamWasCleared = await mainWindow.webContents.executeJavaScript(
-          '!document.querySelector(".message.streaming")',
+        const completedState = JSON.parse(JSON.stringify(busyState))
+        const completedSession = completedState.sessions.find(
+          (session) => session.id === completedState.activeSessionId,
         )
-        if (!streamWasCleared) throw new Error("Final state did not replace the streaming message")
+        completedSession.state = "idle"
+        completedSession.canSend = true
+        completedSession.canConfigureAgents = true
+        completedSession.messages = [
+          { speaker: "你", text: "**用户原文**" },
+          {
+            speaker: "MyAgent",
+            text: "**模型粗体**\n\n```python\nprint('ok')\n```\n\n<img src=x onerror=alert(1)>",
+          },
+        ]
+        mainWindow.webContents.send("myagent:event", { event: "state", payload: completedState })
+        await new Promise((resolve) => setTimeout(resolve, 25))
+        const messageLayout = await mainWindow.webContents.executeJavaScript(
+          `(() => {
+            const cards = [...document.querySelectorAll(".message")]
+            const unsafeImage = document.querySelector(".message.assistant img")
+            return {
+              cardClasses: cards.map((card) => card.className),
+              assistantBold: document.querySelector(".message.assistant strong")?.textContent || "",
+              code: document.querySelector(".message.assistant pre code")?.textContent || "",
+              userRenderedAsMarkdown: Boolean(document.querySelector(".message.user strong")),
+              unsafeHandler: unsafeImage?.getAttribute("onerror") || "",
+              streamPresent: Boolean(document.querySelector(".message.streaming")),
+              mainModel: document.querySelector("#main-agent-model-selector")?.value || "",
+              subModel: document.querySelector("#sub-agent-model-selector")?.value || "",
+              agentModelsDisabled: Boolean(
+                document.querySelector("#main-agent-model-selector")?.disabled ||
+                document.querySelector("#sub-agent-model-selector")?.disabled
+              ),
+              legacyAgentControls: Boolean(
+                document.querySelector("#model-selector") || document.querySelector("#kind-selector")
+              ),
+              userLeft: document.querySelector(".message.user")?.getBoundingClientRect().left || 0,
+              assistantLeft: document.querySelector(".message.assistant")?.getBoundingClientRect().left || 0,
+            }
+          })()`,
+        )
+        if (
+          messageLayout.cardClasses.length !== 2 ||
+          !messageLayout.cardClasses[0].includes("user") ||
+          !messageLayout.cardClasses[1].includes("assistant") ||
+          messageLayout.assistantBold !== "模型粗体" ||
+          !messageLayout.code.includes("print('ok')") ||
+          messageLayout.userRenderedAsMarkdown ||
+          messageLayout.unsafeHandler ||
+          messageLayout.streamPresent ||
+          messageLayout.mainModel !== "smoke-model" ||
+          messageLayout.subModel !== "child-model" ||
+          messageLayout.agentModelsDisabled ||
+          messageLayout.legacyAgentControls ||
+          messageLayout.userLeft <= messageLayout.assistantLeft
+        ) {
+          throw new Error("Message cards, Markdown safety, or Agent configuration failed")
+        }
+        const optimisticUserMessage = await mainWindow.webContents.executeJavaScript(`(() => {
+          const input = document.querySelector("#prompt-input")
+          input.value = "立即显示的用户消息"
+          input.dispatchEvent(new Event("input", { bubbles: true }))
+          document.querySelector("#send-button")?.click()
+          return [...document.querySelectorAll(".message.user")].at(-1)?.querySelector(".message-text")?.textContent || ""
+        })()`)
+        if (optimisticUserMessage !== "立即显示的用户消息") {
+          throw new Error("User message was not rendered before the sidecar response")
+        }
+        let optimisticRollback
+        for (let attempt = 0; attempt < 20; attempt += 1) {
+          optimisticRollback = await mainWindow.webContents.executeJavaScript(`(() => ({
+            prompt: document.querySelector("#prompt-input")?.value || "",
+            messageStillPresent: [...document.querySelectorAll(".message.user .message-text")]
+              .some((node) => node.textContent === "立即显示的用户消息"),
+          }))()`)
+          if (optimisticRollback.prompt === "立即显示的用户消息" && !optimisticRollback.messageStillPresent) break
+          await new Promise((resolve) => setTimeout(resolve, 25))
+        }
+        if (optimisticRollback.prompt !== "立即显示的用户消息" || optimisticRollback.messageStillPresent) {
+          throw new Error("Rejected optimistic message did not restore the prompt")
+        }
         const modelDialog = await mainWindow.webContents.executeJavaScript(`(() => {
           document.querySelector("#add-model-button")?.click()
           const dialog = document.querySelector("#model-dialog")

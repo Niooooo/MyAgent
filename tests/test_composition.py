@@ -78,6 +78,30 @@ class DefaultCompositionTests(unittest.TestCase):
         self.assertIs(agent.context_memory.config, memory)
         agent.close()
 
+    def test_subagent_runtime_can_use_an_independent_client_and_model(self) -> None:
+        main_client = SimpleNamespace(responses=SimpleNamespace())
+        child_client = SimpleNamespace(responses=SimpleNamespace())
+        child = MagicMock()
+        child.run.return_value = "child result"
+        with patch("myagent.composition.AgentLoop", return_value=child) as agent_loop:
+            components = build_default_components(
+                client=main_client,
+                subagent_client=child_client,
+                model="main-model",
+                subagent_model="child-model",
+                subagent_fallback_model="child-fallback",
+            )
+            self.addCleanup(components.close)
+            result = components.tool_registry.execute(
+                "run_subagent",
+                '{"task":"inspect"}',
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertIs(agent_loop.call_args.args[0], child_client)
+        self.assertEqual(agent_loop.call_args.kwargs["model"], "child-model")
+        self.assertEqual(agent_loop.call_args.kwargs["fallback_model"], "child-fallback")
+
     def test_agent_factory_passes_cwd_to_every_workspace_store(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             agent = create_default_agent(

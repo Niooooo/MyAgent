@@ -81,8 +81,9 @@ class DesktopSidecar:
                 "session.new": self._new_session,
                 "session.activate": self._activate_session,
                 "session.close": self._close_session,
+                "session.rename": self._rename_session,
                 "session.select_model": self._select_model,
-                "session.set_kind": self._set_kind,
+                "session.configure_agent_model": self._configure_agent_model,
                 "session.submit": self._submit,
                 "model.register": self._register_model,
                 "model.delete": self._delete_model,
@@ -212,6 +213,13 @@ class DesktopSidecar:
             raise ProtocolError(self.manager.last_error or "conversation could not be closed")
         return {"state": self.snapshot()}
 
+    def _rename_session(self, params: dict[str, Any]) -> ProtocolPayload:
+        session_id = self._session_id(params)
+        title = self._required_text(params, "title")
+        if not self.manager.rename_session(session_id, title):
+            raise ProtocolError(self.manager.last_error or "conversation could not be renamed")
+        return {"state": self.snapshot()}
+
     def _select_model(self, params: dict[str, Any]) -> ProtocolPayload:
         session_id = self._session_id(params)
         name = self._required_text(params, "name")
@@ -219,6 +227,23 @@ class DesktopSidecar:
             raise ProtocolError(self.manager.last_error or "model could not be selected")
         session = self._find_session(session_id)
         session.status = f"模型：{name}"
+        return {"state": self.snapshot()}
+
+    def _configure_agent_model(self, params: dict[str, Any]) -> ProtocolPayload:
+        session_id = self._session_id(params)
+        role = self._required_text(params, "role")
+        if role not in {"main", "sub"}:
+            raise ProtocolError("role must be 'main' or 'sub'")
+        name = self._optional_text(params, "name")
+        if role == "main" and name is None:
+            raise ProtocolError("main Agent must select a model")
+        if not self.manager.configure_agent_model(session_id, role, name):
+            raise ProtocolError(self.manager.last_error or "Agent model could not be configured")
+        session = self._find_session(session_id)
+        if role == "main":
+            session.status = f"主 Agent：{name}"
+        else:
+            session.status = f"子 Agent：{name or '跟随主 Agent'}"
         return {"state": self.snapshot()}
 
     def _set_kind(self, params: dict[str, Any]) -> ProtocolPayload:
@@ -297,6 +322,10 @@ class DesktopSidecar:
             "workspaceName": session.workspace.name or session.workspace.drive,
             "model": controller.model,
             "kind": controller.kind,
+            "agentModels": {
+                "main": controller.model,
+                "sub": controller.subagent_model,
+            },
             "state": controller.state,
             "hasStarted": controller.has_started,
             "messages": [
@@ -305,6 +334,8 @@ class DesktopSidecar:
             ],
             "status": session.status,
             "canSend": controller.state == "idle" and bool(controller.model),
+            "canChangeModel": controller.state == "idle",
+            "canConfigureAgents": controller.state == "idle",
             "canChangeKind": controller.state == "idle" and not controller.has_started,
         }
 

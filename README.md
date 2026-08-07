@@ -295,6 +295,10 @@ Task system 与 TODO 是两种不同的状态：TODO 属于单个 Agent 实例�
 - 可从命令行调用的 `bash`（Linux/macOS 自带；Windows 可使用 Git Bash 或 WSL 中的 Bash）
 - 一个实现 OpenAI Responses API 的服务，以及通过 `OPENAI_API_KEY` 或 `myagent.config.json` 提供的 API Key
 
+Windows 下会优先选择当前 Git 安装目录中的 Git Bash，避免 PATH 中旧版
+`C:\Windows\System32\bash.exe` 抢先命中。需要使用其他 Bash 时可通过
+`MYAGENT_BASH` 指定完整可执行文件路径。
+
 ## 安装
 
 ```bash

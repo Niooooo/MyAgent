@@ -3,10 +3,12 @@ import {
   COMPACT_EXIT_WIDTH,
   nextCompactLayout,
 } from "./layout.js"
+import { renderMarkdown } from "./markdown.js"
 
 const api = window.myagent
 const elements = {
   addModel: document.querySelector("#add-model-button"),
+  agentConfig: document.querySelector("#agent-config"),
   approvalAllow: document.querySelector("#approval-allow-button"),
   approvalArguments: document.querySelector("#approval-arguments"),
   approvalDeny: document.querySelector("#approval-deny-button"),
@@ -14,8 +16,9 @@ const elements = {
   approvalReason: document.querySelector("#approval-reason"),
   approvalTool: document.querySelector("#approval-tool"),
   conversationPage: document.querySelector("#conversation-page"),
+  errorToast: document.querySelector("#error-toast"),
   headerWorkspace: document.querySelector("#header-workspace"),
-  kindSelector: document.querySelector("#kind-selector"),
+  mainAgentModelSelector: document.querySelector("#main-agent-model-selector"),
   maximize: document.querySelector("#maximize-button"),
   modelBack: document.querySelector("#model-back-button"),
   modelCancel: document.querySelector("#model-cancel-button"),
@@ -27,14 +30,16 @@ const elements = {
   modelList: document.querySelector("#model-list"),
   modelName: document.querySelector("#model-name-input"),
   modelPageStatus: document.querySelector("#model-page-status"),
-  modelSelector: document.querySelector("#model-selector"),
   modelsButton: document.querySelector("#models-button"),
   modelsPage: document.querySelector("#models-page"),
   newSession: document.querySelector("#new-session-button"),
   openFolder: document.querySelector("#open-folder-button"),
   prompt: document.querySelector("#prompt-input"),
+  renameTabMenuItem: document.querySelector("#rename-tab-menu-item"),
   send: document.querySelector("#send-button"),
   status: document.querySelector("#session-status"),
+  subAgentModelSelector: document.querySelector("#sub-agent-model-selector"),
+  tabContextMenu: document.querySelector("#tab-context-menu"),
   tabs: document.querySelector("#tab-bar"),
   transcript: document.querySelector("#transcript"),
   welcome: document.querySelector("#welcome-panel"),
@@ -58,6 +63,9 @@ let activeApproval = null
 const approvalQueue = []
 const drafts = new Map()
 const streamingMessages = new Map()
+const ERROR_TOAST_DURATION_MS = 5000
+let errorToastTimer = null
+let tabContextSessionId = null
 
 function activeSession() {
   return state.sessions.find((session) => session.id === state.activeSessionId)
@@ -74,15 +82,33 @@ function applyState(next) {
   render()
 }
 
-async function request(method, params = {}) {
+async function request(method, params = {}, { notifyError = true } = {}) {
   try {
     const result = await api.request(method, params)
     if (result?.state) applyState(result.state)
     return result
   } catch (error) {
-    setStatus(error?.message || String(error), true)
+    if (notifyError) showErrorToast(error)
     throw error
   }
+}
+
+function errorMessage(error) {
+  let message = error?.message || String(error)
+  message = message.replace(/^Error invoking remote method ['"]myagent:request['"]:\s*/i, "")
+  while (/^Error:\s*/i.test(message)) message = message.replace(/^Error:\s*/i, "")
+  return message || "请求失败"
+}
+
+function showErrorToast(error) {
+  window.clearTimeout(errorToastTimer)
+  elements.errorToast.textContent = errorMessage(error)
+  elements.errorToast.hidden = false
+  errorToastTimer = window.setTimeout(() => {
+    elements.errorToast.hidden = true
+    elements.errorToast.textContent = ""
+    errorToastTimer = null
+  }, ERROR_TOAST_DURATION_MS)
 }
 
 function setStatus(message, error = false) {
@@ -103,18 +129,33 @@ function render() {
 }
 
 function renderTabs() {
+  closeTabContextMenu()
   elements.tabs.replaceChildren()
   for (const session of state.sessions) {
     const tab = document.createElement("div")
     tab.className = `tab${session.id === state.activeSessionId ? " active" : ""}`
+    tab.dataset.sessionId = String(session.id)
+    tab.addEventListener("contextmenu", (event) => openTabContextMenu(event, session.id))
     const title = document.createElement("span")
     title.className = "tab-title"
     title.textContent = session.title
-    title.title = session.title
+    title.title = `${session.title}（右键可修改名称）`
+    title.tabIndex = 0
+    title.setAttribute("aria-label", `${session.title}，右键、双击或按 F2 修改名称`)
     title.addEventListener("click", async () => {
       if (session.id === state.activeSessionId) return
       storeDraft()
       await request("session.activate", { sessionId: session.id }).catch(() => undefined)
+    })
+    title.addEventListener("dblclick", (event) => {
+      event.preventDefault()
+      event.stopPropagation()
+      beginTabRename(session, title)
+    })
+    title.addEventListener("keydown", (event) => {
+      if (event.key !== "F2") return
+      event.preventDefault()
+      beginTabRename(session, title)
     })
     const close = document.createElement("button")
     close.className = "tab-close"
@@ -127,6 +168,74 @@ function renderTabs() {
     tab.append(title, close)
     elements.tabs.append(tab)
   }
+}
+
+function openTabContextMenu(event, sessionId) {
+  event.preventDefault()
+  event.stopPropagation()
+  tabContextSessionId = sessionId
+  elements.tabContextMenu.hidden = false
+  const bounds = elements.tabContextMenu.getBoundingClientRect()
+  const margin = 8
+  const left = Math.max(margin, Math.min(event.clientX, window.innerWidth - bounds.width - margin))
+  const top = Math.max(margin, Math.min(event.clientY, window.innerHeight - bounds.height - margin))
+  elements.tabContextMenu.style.left = `${left}px`
+  elements.tabContextMenu.style.top = `${top}px`
+  elements.renameTabMenuItem.focus({ preventScroll: true })
+}
+
+function closeTabContextMenu() {
+  elements.tabContextMenu.hidden = true
+  tabContextSessionId = null
+}
+
+function renameTabFromContextMenu() {
+  const sessionId = tabContextSessionId
+  const session = state.sessions.find((item) => item.id === sessionId)
+  const title = elements.tabs.querySelector(
+    `.tab[data-session-id="${sessionId}"] .tab-title`,
+  )
+  closeTabContextMenu()
+  if (session && title) beginTabRename(session, title)
+}
+
+function beginTabRename(session, titleElement) {
+  const input = document.createElement("input")
+  input.className = "tab-title-input"
+  input.type = "text"
+  input.value = session.title
+  input.maxLength = 80
+  input.setAttribute("aria-label", "会话名称")
+  titleElement.replaceWith(input)
+  input.focus()
+  input.select()
+  let finished = false
+
+  const finish = async (save) => {
+    if (finished) return
+    finished = true
+    const nextTitle = input.value.trim()
+    if (save && !nextTitle) {
+      showErrorToast("会话名称不能为空")
+    } else if (save && nextTitle !== session.title) {
+      await request("session.rename", {
+        sessionId: session.id,
+        title: nextTitle,
+      }).catch(() => undefined)
+    }
+    renderTabs()
+  }
+
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault()
+      finish(true)
+    } else if (event.key === "Escape") {
+      event.preventDefault()
+      finish(false)
+    }
+  })
+  input.addEventListener("blur", () => finish(true))
 }
 
 function renderConversation() {
@@ -145,9 +254,7 @@ function renderConversation() {
   elements.status.classList.toggle("busy", session.state === "busy")
   elements.status.classList.toggle("error", session.status?.includes("失败") || false)
 
-  renderModelSelector(session)
-  elements.kindSelector.value = session.kind
-  elements.kindSelector.disabled = !session.canChangeKind || state.closing
+  renderAgentConfiguration(session)
   elements.prompt.disabled = state.closing
   elements.send.disabled = !session.canSend || state.closing
 
@@ -159,22 +266,32 @@ function renderConversation() {
   renderTranscript(session)
 }
 
-function renderModelSelector(session) {
+function renderAgentConfiguration(session) {
   const names = state.models.map((model) => model.name)
-  const desired = session.model || ""
-  elements.modelSelector.replaceChildren()
-  const placeholder = document.createElement("option")
-  placeholder.value = ""
-  placeholder.textContent = names.length ? "选择模型" : "尚无模型"
-  elements.modelSelector.append(placeholder)
+  const mainModel = session.agentModels?.main || session.model || ""
+  const subModel = session.agentModels?.sub || ""
+  const mainPlaceholder = document.createElement("option")
+  mainPlaceholder.value = ""
+  mainPlaceholder.textContent = names.length ? "选择模型" : "尚无模型"
+  elements.mainAgentModelSelector.replaceChildren(mainPlaceholder)
+  const followMain = document.createElement("option")
+  followMain.value = ""
+  followMain.textContent = mainModel ? `跟随主 Agent（${mainModel}）` : "跟随主 Agent"
+  elements.subAgentModelSelector.replaceChildren(followMain)
   for (const name of names) {
-    const option = document.createElement("option")
-    option.value = name
-    option.textContent = name
-    elements.modelSelector.append(option)
+    const mainOption = document.createElement("option")
+    mainOption.value = name
+    mainOption.textContent = name
+    elements.mainAgentModelSelector.append(mainOption)
+    const subOption = mainOption.cloneNode(true)
+    elements.subAgentModelSelector.append(subOption)
   }
-  elements.modelSelector.value = names.includes(desired) ? desired : ""
-  elements.modelSelector.disabled = session.state !== "idle" || names.length === 0 || state.closing
+  elements.mainAgentModelSelector.value = names.includes(mainModel) ? mainModel : ""
+  elements.subAgentModelSelector.value = names.includes(subModel) ? subModel : ""
+  const disabled = !session.canConfigureAgents || names.length === 0 || state.closing
+  elements.mainAgentModelSelector.disabled = disabled
+  elements.subAgentModelSelector.disabled = disabled
+  elements.agentConfig.classList.toggle("disabled", disabled)
 }
 
 function renderTranscript(session) {
@@ -194,32 +311,32 @@ function renderTranscript(session) {
   elements.transcript.hidden = false
   const fragment = document.createDocumentFragment()
   for (const message of session.messages) {
-    const article = document.createElement("article")
-    article.className = `message${message.speaker === "错误" ? " error" : ""}`
-    const speaker = document.createElement("div")
-    speaker.className = "message-speaker"
-    speaker.textContent = message.speaker
-    const text = document.createElement("p")
-    text.className = "message-text"
-    text.textContent = message.text
-    article.append(speaker, text)
-    fragment.append(article)
+    fragment.append(createMessageCard(message.speaker, message.text))
   }
   if (hasStream) {
-    const article = document.createElement("article")
-    article.className = "message streaming"
-    article.dataset.streamSession = String(session.id)
-    const speaker = document.createElement("div")
-    speaker.className = "message-speaker"
-    speaker.textContent = "MyAgent"
-    const text = document.createElement("p")
-    text.className = "message-text"
-    text.textContent = streamText
-    article.append(speaker, text)
-    fragment.append(article)
+    fragment.append(createMessageCard("MyAgent", streamText, session.id))
   }
   elements.transcript.replaceChildren(fragment)
   elements.transcript.scrollTop = elements.transcript.scrollHeight
+}
+
+function createMessageCard(speakerName, content, streamSessionId = null) {
+  const role = speakerName === "你" ? "user" : speakerName === "错误" ? "error" : "assistant"
+  const article = document.createElement("article")
+  article.className = `message ${role}${streamSessionId === null ? "" : " streaming"}`
+  if (streamSessionId !== null) article.dataset.streamSession = String(streamSessionId)
+  const speaker = document.createElement("div")
+  speaker.className = "message-speaker"
+  speaker.textContent = speakerName
+  const text = document.createElement("div")
+  text.className = `message-text${role === "assistant" ? " markdown-body" : ""}`
+  if (role === "assistant") {
+    renderMarkdown(text, content)
+  } else {
+    text.textContent = content
+  }
+  article.append(speaker, text)
+  return article
 }
 
 function startStream(payload) {
@@ -248,7 +365,7 @@ function appendStreamDelta(payload) {
     if (session) renderTranscript(session)
     return
   }
-  text.append(document.createTextNode(delta))
+  renderMarkdown(text, streamingMessages.get(sessionId))
   elements.transcript.scrollTop = elements.transcript.scrollHeight
 }
 
@@ -321,9 +438,37 @@ async function send() {
   const session = activeSession()
   const prompt = elements.prompt.value.trim()
   if (!session || !prompt || elements.send.disabled) return
-  await request("session.submit", { sessionId: session.id, prompt }).catch(() => undefined)
+  const previous = {
+    state: session.state,
+    canSend: session.canSend,
+    canConfigureAgents: session.canConfigureAgents,
+    status: session.status,
+  }
+  const optimisticMessage = { speaker: "你", text: prompt }
+  session.messages.push(optimisticMessage)
+  session.state = "busy"
+  session.canSend = false
+  session.canConfigureAgents = false
+  session.status = `正在发送 · ${session.agentModels?.main || session.model || "MyAgent"}`
   drafts.set(session.id, "")
   elements.prompt.value = ""
+  renderedMessagesToken = ""
+  renderConversation()
+
+  try {
+    await request("session.submit", { sessionId: session.id, prompt })
+  } catch {
+    const current = state.sessions.find((item) => item.id === session.id)
+    if (current === session) {
+      const optimisticIndex = current.messages.indexOf(optimisticMessage)
+      if (optimisticIndex >= 0) current.messages.splice(optimisticIndex, 1)
+      Object.assign(current, previous)
+    }
+    drafts.set(session.id, prompt)
+    if (state.activeSessionId === session.id) elements.prompt.value = prompt
+    renderedMessagesToken = ""
+    render()
+  }
 }
 
 function openModelDialog() {
@@ -399,6 +544,7 @@ elements.modelsButton.addEventListener("click", showModels)
 elements.modelBack.addEventListener("click", showConversation)
 elements.addModel.addEventListener("click", openModelDialog)
 elements.modelCancel.addEventListener("click", () => elements.modelDialog.close())
+elements.renameTabMenuItem.addEventListener("click", renameTabFromContextMenu)
 elements.send.addEventListener("click", send)
 elements.prompt.addEventListener("input", () => {
   const session = activeSession()
@@ -410,31 +556,37 @@ elements.prompt.addEventListener("keydown", (event) => {
     send()
   }
 })
-elements.modelSelector.addEventListener("change", async () => {
+elements.mainAgentModelSelector.addEventListener("change", async () => {
   const session = activeSession()
-  if (!session || !elements.modelSelector.value) return
-  await request("session.select_model", {
+  if (!session || !elements.mainAgentModelSelector.value) return
+  await request("session.configure_agent_model", {
     sessionId: session.id,
-    name: elements.modelSelector.value,
+    role: "main",
+    name: elements.mainAgentModelSelector.value,
   }).catch(() => undefined)
 })
-elements.kindSelector.addEventListener("change", async () => {
+elements.subAgentModelSelector.addEventListener("change", async () => {
   const session = activeSession()
   if (!session) return
-  await request("session.set_kind", {
+  await request("session.configure_agent_model", {
     sessionId: session.id,
-    kind: elements.kindSelector.value,
+    role: "sub",
+    name: elements.subAgentModelSelector.value,
   }).catch(() => undefined)
 })
 elements.modelForm.addEventListener("submit", async (event) => {
   event.preventDefault()
   elements.modelDialogError.textContent = ""
   try {
-    await request("model.register", {
-      name: elements.modelName.value,
-      baseUrl: elements.modelBaseUrl.value,
-      apiKey: elements.modelKey.value,
-    })
+    await request(
+      "model.register",
+      {
+        name: elements.modelName.value,
+        baseUrl: elements.modelBaseUrl.value,
+        apiKey: elements.modelKey.value,
+      },
+      { notifyError: false },
+    )
   } catch (error) {
     elements.modelDialogError.textContent = error?.message || String(error)
     return
@@ -452,7 +604,10 @@ document.querySelectorAll("[data-window-action]").forEach((button) => {
   button.addEventListener("click", () => api.windowAction(button.dataset.windowAction))
 })
 document.addEventListener("keydown", (event) => {
-  if (event.ctrlKey && event.key.toLowerCase() === "n") {
+  if (event.key === "Escape" && !elements.tabContextMenu.hidden) {
+    event.preventDefault()
+    closeTabContextMenu()
+  } else if (event.ctrlKey && event.key.toLowerCase() === "n") {
     event.preventDefault()
     newSession()
   } else if (event.ctrlKey && event.key.toLowerCase() === "o") {
@@ -463,14 +618,21 @@ document.addEventListener("keydown", (event) => {
     showConversation()
   }
 })
+document.addEventListener("pointerdown", (event) => {
+  if (!elements.tabContextMenu.hidden && !elements.tabContextMenu.contains(event.target)) {
+    closeTabContextMenu()
+  }
+})
 window.addEventListener("resize", updateResponsiveLayout, { passive: true })
+window.addEventListener("resize", closeTabContextMenu, { passive: true })
+window.addEventListener("blur", closeTabContextMenu)
 
 api.onEvent((message) => {
   if (message.event === "state") applyState(message.payload)
   if (message.event === "approval") enqueueApproval(message.payload)
   if (message.event === "stream-start") startStream(message.payload)
   if (message.event === "stream-delta") appendStreamDelta(message.payload)
-  if (message.event === "sidecar-error") setStatus(message.payload?.message || "Python sidecar 异常", true)
+  if (message.event === "sidecar-error") showErrorToast(message.payload?.message || "Python sidecar 异常")
 })
 api.onWindowState((windowState) => {
   elements.maximize.dataset.maximized = String(windowState.maximized)
