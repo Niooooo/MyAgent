@@ -20,6 +20,16 @@ const layout = readFileSync(path.join(root, "renderer/layout.js"), "utf8")
 if (!/<section id="welcome-panel"[^>]*>\s*<canvas[^>]*><\/canvas>\s*<\/section>/s.test(html)) {
   throw new Error("Welcome panel must contain only the logo canvas")
 }
+if (
+  !html.includes('id="history-sidebar"') ||
+  !html.includes('id="history-sidebar-toggle"') ||
+  !app.includes("openHistorySession(session.id)")
+) {
+  throw new Error("Workspace conversation history sidebar is missing")
+}
+if (!html.includes('viewBox="0 0 120 120"') || !app.includes("context.lineTo(204, 107)")) {
+  throw new Error("Original M+A logo mark is missing")
+}
 if (!layout.includes("COMPACT_ENTER_WIDTH = 880") || !layout.includes("COMPACT_EXIT_WIDTH = 920")) {
   throw new Error("Responsive hysteresis constants are missing")
 }

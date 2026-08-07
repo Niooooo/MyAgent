@@ -2,6 +2,8 @@ import {
   COMPACT_ENTER_WIDTH,
   COMPACT_EXIT_WIDTH,
   nextCompactLayout,
+  reconcileOpenSessionIds,
+  sessionsInWorkspace,
 } from "./layout.js"
 import { renderMarkdown } from "./markdown.js"
 
@@ -19,6 +21,10 @@ const elements = {
   deleteTabMenuItem: document.querySelector("#delete-tab-menu-item"),
   errorToast: document.querySelector("#error-toast"),
   headerWorkspace: document.querySelector("#header-workspace"),
+  historyEmpty: document.querySelector("#history-empty"),
+  historyList: document.querySelector("#history-list"),
+  historySidebarToggle: document.querySelector("#history-sidebar-toggle"),
+  historyWorkspaceName: document.querySelector("#history-workspace-name"),
   mainAgentModelSelector: document.querySelector("#main-agent-model-selector"),
   maximize: document.querySelector("#maximize-button"),
   modelBack: document.querySelector("#model-back-button"),
@@ -77,9 +83,12 @@ let activeApproval = null
 const approvalQueue = []
 const drafts = new Map()
 const streamingMessages = new Map()
+const openedSessionIds = new Set()
 const ERROR_TOAST_DURATION_MS = 5000
+const SIDEBAR_STORAGE_KEY = "myagent.historySidebarCollapsed"
 let errorToastTimer = null
 let tabContextSessionId = null
+let sidebarCollapsed = loadSidebarCollapsed()
 
 function activeSession() {
   return state.sessions.find((session) => session.id === state.activeSessionId)
@@ -92,6 +101,9 @@ function applyState(next) {
     if (session.state !== "busy" && streamingMessages.delete(session.id)) clearedStream = true
   }
   if (clearedStream) renderedMessagesToken = ""
+  const reconciled = reconcileOpenSessionIds(openedSessionIds, next.sessions, next.activeSessionId)
+  openedSessionIds.clear()
+  for (const sessionId of reconciled) openedSessionIds.add(sessionId)
   state = next
   render()
 }
@@ -129,6 +141,32 @@ function closeAgentConfig() {
   elements.agentConfig.open = false
 }
 
+function loadSidebarCollapsed() {
+  try {
+    return window.localStorage.getItem(SIDEBAR_STORAGE_KEY) === "true"
+  } catch {
+    return false
+  }
+}
+
+function updateHistorySidebar() {
+  document.body.classList.toggle("sidebar-collapsed", sidebarCollapsed)
+  elements.historySidebarToggle.ariaExpanded = String(!sidebarCollapsed)
+  const label = sidebarCollapsed ? "展开历史对话侧栏" : "收起历史对话侧栏"
+  elements.historySidebarToggle.ariaLabel = label
+  elements.historySidebarToggle.title = label
+}
+
+function toggleHistorySidebar() {
+  sidebarCollapsed = !sidebarCollapsed
+  try {
+    window.localStorage.setItem(SIDEBAR_STORAGE_KEY, String(sidebarCollapsed))
+  } catch {
+    // The current window still updates when persistent renderer storage is unavailable.
+  }
+  updateHistorySidebar()
+}
+
 function openSettings() {
   const values = state.settings || {}
   for (const [name, input] of [
@@ -154,6 +192,7 @@ function storeDraft() {
 
 function render() {
   renderTabs()
+  renderHistory()
   renderConversation()
   renderModels()
   renderPage()
@@ -162,7 +201,10 @@ function render() {
 function renderTabs() {
   closeTabContextMenu()
   elements.tabs.replaceChildren()
-  for (const session of state.sessions) {
+  const openSessions = [...openedSessionIds]
+    .map((sessionId) => state.sessions.find((session) => session.id === sessionId))
+    .filter(Boolean)
+  for (const session of openSessions) {
     const tab = document.createElement("div")
     tab.className = `tab${session.id === state.activeSessionId ? " active" : ""}`
     tab.dataset.sessionId = String(session.id)
@@ -196,11 +238,95 @@ function renderTabs() {
     close.type = "button"
     close.textContent = "×"
     close.ariaLabel = `关闭 ${session.title}`
-    close.addEventListener("click", async () => {
-      await request("session.close", { sessionId: session.id }).catch(() => undefined)
+    close.title = "关闭标签（不会删除历史）"
+    close.addEventListener("click", (event) => {
+      event.stopPropagation()
+      closeSessionTab(session.id)
     })
     tab.append(title, close)
     elements.tabs.append(tab)
+  }
+}
+
+function renderHistory() {
+  const active = activeSession()
+  elements.historyList.replaceChildren()
+  elements.historyWorkspaceName.textContent = active?.workspaceName || ""
+  const sessions = active
+    ? sessionsInWorkspace(state.sessions, active.workspace).slice().reverse()
+    : []
+  elements.historyEmpty.hidden = sessions.length !== 0
+  for (const session of sessions) {
+    const item = document.createElement("button")
+    item.type = "button"
+    item.className = `history-item${session.id === state.activeSessionId ? " active" : ""}${openedSessionIds.has(session.id) ? " open" : ""}`
+    item.dataset.sessionId = String(session.id)
+    item.setAttribute("role", "listitem")
+    item.title = `${session.title}\n${session.workspace}`
+    const copy = document.createElement("span")
+    copy.className = "history-item-copy"
+    const title = document.createElement("span")
+    title.className = "history-item-title"
+    title.textContent = session.title
+    const meta = document.createElement("span")
+    meta.className = "history-item-meta"
+    meta.textContent = session.messages.length
+      ? `${session.messages.length} 条消息`
+      : "尚未开始"
+    const indicator = document.createElement("span")
+    indicator.className = "history-open-indicator"
+    indicator.ariaHidden = "true"
+    copy.append(title, meta)
+    item.append(copy, indicator)
+    item.addEventListener("click", () => openHistorySession(session.id))
+    elements.historyList.append(item)
+  }
+}
+
+async function openHistorySession(sessionId) {
+  const wasOpen = openedSessionIds.has(sessionId)
+  openedSessionIds.add(sessionId)
+  if (sessionId === state.activeSessionId) {
+    renderTabs()
+    renderHistory()
+    showConversation()
+    return
+  }
+  storeDraft()
+  try {
+    await request("session.activate", { sessionId })
+    showConversation()
+  } catch {
+    if (!wasOpen) openedSessionIds.delete(sessionId)
+    renderTabs()
+    renderHistory()
+  }
+}
+
+async function closeSessionTab(sessionId) {
+  const openSessions = [...openedSessionIds]
+    .map((id) => state.sessions.find((session) => session.id === id))
+    .filter(Boolean)
+  if (openSessions.length <= 1) {
+    showErrorToast("至少保留一个打开的对话标签")
+    return
+  }
+  const closingIndex = openSessions.findIndex((session) => session.id === sessionId)
+  if (closingIndex < 0) return
+  openedSessionIds.delete(sessionId)
+  if (sessionId !== state.activeSessionId) {
+    renderTabs()
+    renderHistory()
+    return
+  }
+  storeDraft()
+  const next = openSessions[closingIndex + 1] || openSessions[closingIndex - 1]
+  try {
+    await request("session.activate", { sessionId: next.id })
+  } catch {
+    openedSessionIds.add(sessionId)
+    renderTabs()
+    renderHistory()
   }
 }
 
@@ -378,7 +504,12 @@ function createMessageCard(speakerName, content, streamSessionId = null) {
   const text = document.createElement("div")
   text.className = `message-text${role === "assistant" ? " markdown-body" : ""}`
   if (role === "assistant") {
-    renderMarkdown(text, content)
+    if (streamSessionId !== null && !content) {
+      text.classList.add("thinking")
+      text.textContent = "正在思考"
+    } else {
+      renderMarkdown(text, content)
+    }
   } else {
     text.textContent = content
   }
@@ -412,6 +543,7 @@ function appendStreamDelta(payload) {
     if (session) renderTranscript(session)
     return
   }
+  text.classList.remove("thinking")
   renderMarkdown(text, streamingMessages.get(sessionId))
   elements.transcript.scrollTop = elements.transcript.scrollHeight
 }
@@ -497,6 +629,7 @@ async function send() {
   session.canSend = false
   session.canConfigureAgents = false
   session.status = `正在发送 · ${session.agentModels?.main || session.model || "MyAgent"}`
+  streamingMessages.set(session.id, "")
   drafts.set(session.id, "")
   elements.prompt.value = ""
   renderedMessagesToken = ""
@@ -505,6 +638,7 @@ async function send() {
   try {
     await request("session.submit", { sessionId: session.id, prompt })
   } catch {
+    streamingMessages.delete(session.id)
     const current = state.sessions.find((item) => item.id === session.id)
     if (current === session) {
       const optimisticIndex = current.messages.indexOf(optimisticMessage)
@@ -578,6 +712,10 @@ function drawWelcomeLogo() {
   context.lineTo(204, 64)
   context.lineTo(204, 116)
   context.stroke()
+  context.beginPath()
+  context.moveTo(178, 92)
+  context.lineTo(204, 107)
+  context.stroke()
   context.fillStyle = "#f1f5f3"
   context.font = '700 24px "Microsoft YaHei UI", "Segoe UI", sans-serif'
   context.textAlign = "center"
@@ -586,6 +724,7 @@ function drawWelcomeLogo() {
 }
 
 elements.newSession.addEventListener("click", () => newSession())
+elements.historySidebarToggle.addEventListener("click", toggleHistorySidebar)
 elements.openFolder.addEventListener("click", openFolder)
 elements.modelsButton.addEventListener("click", showModels)
 elements.modelBack.addEventListener("click", showConversation)
@@ -718,6 +857,7 @@ api.onWindowState((windowState) => {
   elements.maximize.ariaLabel = windowState.maximized ? "还原" : "最大化"
 })
 
+updateHistorySidebar()
 drawWelcomeLogo()
 updateResponsiveLayout()
 request("app.snapshot").catch(() => undefined)

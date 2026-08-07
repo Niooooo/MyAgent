@@ -51,6 +51,7 @@ class DesktopAssetTests(unittest.TestCase):
         cls.sidecar = (ROOT / "src" / "myagent" / "desktop_sidecar.py").read_text(
             encoding="utf-8"
         )
+        cls.gui = (ROOT / "src" / "myagent" / "gui.py").read_text(encoding="utf-8")
 
     def test_welcome_panel_contains_only_one_logo_canvas(self) -> None:
         parser = WelcomePanelParser()
@@ -74,6 +75,19 @@ class DesktopAssetTests(unittest.TestCase):
         )
         self.assertIsNotNone(resize_binding)
         self.assertNotIn("drawWelcomeLogo", resize_binding.group(0))
+
+    def test_original_ma_mark_is_used_in_brand_welcome_and_window_icon(self) -> None:
+        self.assertIn('viewBox="0 0 120 120"', self.html)
+        self.assertIn("M24 88V35L60 75L96 35V88", self.html)
+        self.assertIn("M68 66L96 80", self.html)
+        self.assertIn("context.lineTo(204, 107)", self.app)
+        self.assertIn("[35, 33, 46, 40]", self.main)
+        self.assertNotIn('<span class="brand-mark" aria-hidden="true">M</span>', self.html)
+        self.assertIn('const BACKGROUND = "#0b0e10"', self.main)
+        self.assertIn("--app: #0b0e10", self.css)
+        self.assertIn('_APP_BACKGROUND = "#0b0e10"', self.gui)
+        self.assertIn("(18, 16, 23, 20)", self.gui)
+        self.assertIn("self.header_logo.create_line", self.gui)
 
     def test_hysteresis_and_action_positions_are_structurally_stable(self) -> None:
         self.assertIn("COMPACT_ENTER_WIDTH = 880", self.layout)
@@ -129,6 +143,26 @@ class DesktopAssetTests(unittest.TestCase):
         self.assertNotIn("对话与 AgentTeammate", self.html)
         self.assertNotIn("run_subagent 与 fork_subagent", self.html)
         self.assertNotIn(".agent-config-menu small", self.css)
+        self.assertRegex(
+            self.css,
+            r"\.agent-config-menu\s*\{[^}]*width:\s*240px",
+        )
+
+    def test_workspace_history_opens_saved_conversations_as_tabs(self) -> None:
+        self.assertIn('id="history-sidebar"', self.html)
+        self.assertIn('id="history-list"', self.html)
+        self.assertIn('id="history-sidebar-toggle"', self.html)
+        self.assertIn("sessionsInWorkspace(state.sessions, active.workspace)", self.app)
+        self.assertIn("openedSessionIds.add(sessionId)", self.app)
+        self.assertIn("openHistorySession(session.id)", self.app)
+        self.assertIn("closeSessionTab(session.id)", self.app)
+        self.assertNotIn('request("session.close", { sessionId: session.id })', self.app)
+        self.assertIn("关闭标签（不会删除历史）", self.app)
+        self.assertIn("Workspace history did not reopen the conversation in a tab", self.main)
+        self.assertIn("myagent.historySidebarCollapsed", self.app)
+        self.assertIn('classList.toggle("sidebar-collapsed", sidebarCollapsed)', self.app)
+        self.assertIn("body.sidebar-collapsed #history-list", self.css)
+        self.assertIn("History sidebar collapse and restore behavior failed", self.main)
 
     def test_settings_and_agent_config_dismissal_are_wired(self) -> None:
         self.assertIn('id="settings-button"', self.html)
@@ -139,14 +173,25 @@ class DesktopAssetTests(unittest.TestCase):
         self.assertIn("!elements.agentConfig.contains(event.target)", self.app)
         self.assertIn('window.addEventListener("blur", closeAgentConfig)', self.app)
         self.assertIn('window.addEventListener("resize", closeAgentConfig', self.app)
+        self.assertRegex(self.css, r"#settings-dialog\s*\{[^}]*overflow:\s*hidden")
+        self.assertRegex(self.css, r"#settings-dialog form\s*\{[^}]*width:\s*100%")
+        self.assertIn("settingsDialog.scrollWidth <= settingsDialog.clientWidth", self.main)
+        self.assertIn("settingsFormBounds.right <= settingsBounds.right + 1", self.main)
 
-    def test_user_message_is_rendered_before_submit_request_resolves(self) -> None:
+    def test_user_and_agent_cards_render_before_submit_request_resolves(self) -> None:
         send_start = self.app.index("async function send()")
         optimistic = self.app.index("session.messages.push(optimisticMessage)", send_start)
+        agent_placeholder = self.app.index('streamingMessages.set(session.id, "")', send_start)
         clear_input = self.app.index('elements.prompt.value = ""', send_start)
         request = self.app.index('await request("session.submit"', send_start)
         self.assertLess(optimistic, request)
+        self.assertLess(agent_placeholder, request)
         self.assertLess(clear_input, request)
+        self.assertIn("streamingMessages.delete(session.id)", self.app)
+        self.assertIn('text.textContent = "正在思考"', self.app)
+        self.assertIn('text.classList.remove("thinking")', self.app)
+        self.assertIn(".message-text.thinking::after", self.css)
+        self.assertIn("@keyframes thinking-pulse", self.css)
         self.assertIn("current.messages.indexOf(optimisticMessage)", self.app)
         self.assertIn("Object.assign(current, previous)", self.app)
 
@@ -155,7 +200,7 @@ class DesktopAssetTests(unittest.TestCase):
         self.assertIn('message.event === "stream-delta"', self.app)
         self.assertIn('createMessageCard("MyAgent", streamText, session.id)', self.app)
         self.assertIn('renderMarkdown(text, streamingMessages.get(sessionId))', self.app)
-        self.assertIn(".message.streaming .message-text::after", self.css)
+        self.assertIn(".message.streaming .message-text:not(.thinking)::after", self.css)
 
     def test_messages_are_separate_role_aligned_cards_with_safe_markdown(self) -> None:
         markdown = (DESKTOP / "renderer" / "markdown.js").read_text(encoding="utf-8")
@@ -216,8 +261,8 @@ class DesktopAssetTests(unittest.TestCase):
         )
         self.assertIn("Renderer did not incrementally render Markdown output", self.main)
         self.assertIn("Message cards, Markdown safety, or Agent configuration failed", self.main)
-        self.assertIn("User message was not rendered before the sidecar response", self.main)
-        self.assertIn("Rejected optimistic message did not restore the prompt", self.main)
+        self.assertIn("User and Agent message cards were not rendered before the sidecar response", self.main)
+        self.assertIn("Rejected optimistic messages did not restore the prompt", self.main)
         self.assertIn("Conversation rename context menu did not open the editor", self.main)
         self.assertIn("Conversation title rename did not persist", self.main)
         self.assertIn("Cancelled conversation deletion changed persisted state", self.main)
