@@ -5,6 +5,7 @@ from .composition import (
     AgentConfig,
     DefaultAgentComponents,
     create_default_agent,
+    create_default_subagent,
 )
 from .hooks import (
     HookExecutionError,
@@ -108,6 +109,7 @@ __all__ = [
     "TodoStatus",
     "UserPromptSubmit",
     "create_default_agent",
+    "create_default_subagent",
     "memory_tools",
     "parse_mcp_servers",
     "long_term_memory_tools",

@@ -8,4 +8,7 @@ __pycache__/
 myagent.config.json
 dist/
 build/
+desktop/node_modules/
+.npm-cache/
+.electron-cache/
 .agents/

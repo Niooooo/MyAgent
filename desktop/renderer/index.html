@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'none'"
+    />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>MyAgent 工作台</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div id="app-shell">
+      <header id="titlebar">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true">M</span>
+          <span class="brand-copy">
+            <strong>MyAgent</strong>
+            <small>本地 Agent 工作台</small>
+          </span>
+        </div>
+        <nav class="header-actions no-drag" aria-label="工作台操作">
+          <button id="new-session-button" class="quiet-button" type="button">新建对话</button>
+          <button id="open-folder-button" class="quiet-button" type="button">打开文件夹</button>
+          <button id="models-button" class="quiet-button" type="button">模型</button>
+          <button class="quiet-button" type="button" disabled>设置</button>
+        </nav>
+        <div id="header-workspace" class="header-workspace">LOCAL</div>
+        <div class="window-controls no-drag" aria-label="窗口控制">
+          <button type="button" data-window-action="minimize" aria-label="最小化">
+            <span class="window-glyph window-minimize" aria-hidden="true"></span>
+          </button>
+          <button
+            id="maximize-button"
+            type="button"
+            data-window-action="maximize"
+            data-maximized="false"
+            aria-label="最大化"
+          >
+            <span class="window-glyph window-maximize" aria-hidden="true"></span>
+          </button>
+          <button class="window-close" type="button" data-window-action="close" aria-label="关闭">
+            <span class="window-glyph window-close-glyph" aria-hidden="true"></span>
+          </button>
+        </div>
+      </header>
+
+      <div id="tab-bar" class="no-drag" aria-label="对话标签"></div>
+
+      <main id="page-host">
+        <section id="conversation-page" class="page">
+          <div class="context-bar">
+            <span class="context-label">工作区</span>
+            <span id="workspace-value" class="workspace-value"></span>
+            <span id="session-status" class="status-pill">正在连接桌面后端…</span>
+          </div>
+
+          <div id="transcript-host">
+            <div id="transcript" role="log" aria-live="polite" hidden></div>
+            <section id="welcome-panel"><canvas id="welcome-logo" width="680" height="460"></canvas></section>
+          </div>
+
+          <section id="composer">
+            <textarea
+              id="prompt-input"
+              rows="4"
+              placeholder="向 MyAgent 发送消息"
+              aria-label="消息"
+              spellcheck="false"
+            ></textarea>
+            <div id="action-bar">
+              <label class="select-control">
+                <span>模型</span>
+                <select id="model-selector" aria-label="模型"></select>
+              </label>
+              <label class="select-control agent-control">
+                <span>Agent</span>
+                <select id="kind-selector" aria-label="Agent 类型">
+                  <option value="main">主 Agent（含 AgentTeammate）</option>
+                  <option value="sub">子 Agent</option>
+                </select>
+              </label>
+              <span id="send-hint">Ctrl + Enter 发送</span>
+              <button id="send-button" class="primary-button" type="button" disabled>发送&nbsp;&nbsp;↑</button>
+            </div>
+          </section>
+        </section>
+
+        <section id="models-page" class="page" hidden>
+          <button id="model-back-button" class="back-button" type="button">←&nbsp;&nbsp;返回对话</button>
+          <div class="models-header">
+            <div>
+              <h1>模型与凭据</h1>
+              <p>凭据保存在仓库外；每个会话可独立选择模型。</p>
+            </div>
+            <button id="add-model-button" class="primary-button" type="button">＋&nbsp;&nbsp;添加模型</button>
+          </div>
+          <div id="model-list"></div>
+          <p id="model-page-status" class="page-status"></p>
+        </section>
+      </main>
+    </div>
+
+    <dialog id="model-dialog">
+      <form id="model-form" method="dialog">
+        <header>
+          <h2>添加模型</h2>
+          <p>API key 只发送给本机 Python sidecar，不进入渲染状态。</p>
+        </header>
+        <label>
+          <span>模型名称</span>
+          <input id="model-name-input" name="name" autocomplete="off" maxlength="120" required />
+        </label>
+        <label>
+          <span>Base URL（可选）</span>
+          <input id="model-base-url-input" name="baseUrl" type="url" autocomplete="off" maxlength="2048" placeholder="例如 https://api.example.com/v1" />
+        </label>
+        <label>
+          <span>API key</span>
+          <input id="model-key-input" name="apiKey" type="password" autocomplete="off" maxlength="4096" required />
+        </label>
+        <p id="model-dialog-error" class="dialog-error" aria-live="polite"></p>
+        <footer>
+          <button id="model-cancel-button" class="secondary-button" type="button">取消</button>
+          <button class="primary-button" type="submit">保存模型</button>
+        </footer>
+      </form>
+    </dialog>
+
+    <dialog id="approval-dialog">
+      <form method="dialog">
+        <header>
+          <h2>需要确认敏感操作</h2>
+          <p id="approval-tool"></p>
+        </header>
+        <section class="approval-detail">
+          <strong>原因</strong>
+          <p id="approval-reason"></p>
+          <strong>参数</strong>
+          <pre id="approval-arguments"></pre>
+        </section>
+        <footer>
+          <button id="approval-deny-button" class="secondary-button" type="button">拒绝</button>
+          <button id="approval-allow-button" class="primary-button" type="button">允许一次</button>
+        </footer>
+      </form>
+    </dialog>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

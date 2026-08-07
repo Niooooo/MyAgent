@@ -1,14 +1,23 @@
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+from myagent.agent_team import AGENT_TEAM_TOOL_NAMES
 
 from myagent.composition import (
     AgentConfig,
     build_default_components,
     create_default_agent,
+    create_default_subagent,
 )
 from myagent.hooks import HookRegistry, PreToolUse
 from myagent.memory import MemoryConfig
-from myagent.permissions import PermissionHook, PermissionManager
+from myagent.permissions import DEFAULT_TOOL_ALLOWLIST, PermissionHook, PermissionManager
+from myagent.scheduled_tasks import SCHEDULED_TASK_TOOL_NAMES
+from myagent.subagents import SUBAGENT_TOOL_NAMES
+from myagent.worktrees import WORKTREE_TOOL_NAMES
 
 
 class DefaultCompositionTests(unittest.TestCase):
@@ -68,6 +77,68 @@ class DefaultCompositionTests(unittest.TestCase):
         self.assertIsNotNone(agent.context_memory)
         self.assertIs(agent.context_memory.config, memory)
         agent.close()
+
+    def test_agent_factory_passes_cwd_to_every_workspace_store(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            agent = create_default_agent(
+                SimpleNamespace(responses=SimpleNamespace()),
+                cwd=folder,
+            )
+            self.addCleanup(agent.close)
+
+            expected = Path(folder).resolve()
+            self.assertEqual(agent.task_store.workspace_root, expected)
+            self.assertEqual(agent.skill_store.workspace_root, expected)
+            self.assertEqual(agent.long_term_memory_store.workspace_root, expected)
+
+    def test_agent_factory_default_cwd_remains_compatible(self) -> None:
+        agent = create_default_agent(SimpleNamespace(responses=SimpleNamespace()))
+        self.addCleanup(agent.close)
+        self.assertEqual(agent.task_store.workspace_root, Path.cwd().resolve())
+
+    def test_standalone_subagent_isolated_tools_instructions_and_lifecycle(self) -> None:
+        blocked = (
+            SUBAGENT_TOOL_NAMES
+            | SCHEDULED_TASK_TOOL_NAMES
+            | AGENT_TEAM_TOOL_NAMES
+            | WORKTREE_TOOL_NAMES
+        )
+        with tempfile.TemporaryDirectory() as folder:
+            components = build_default_components(
+                cwd=folder,
+                allowed_tools=DEFAULT_TOOL_ALLOWLIST.difference(blocked),
+            )
+            close_callback = MagicMock()
+            object.__setattr__(components, "_close_callback", close_callback)
+            with patch(
+                "myagent.composition.build_default_components",
+                return_value=components,
+            ) as build:
+                agent = create_default_subagent(
+                    SimpleNamespace(responses=SimpleNamespace()),
+                    cwd=folder,
+                )
+
+            visible = {
+                definition["name"] for definition in agent.tool_registry.definitions
+            }
+            selected = frozenset(build.call_args.kwargs["allowed_tools"])
+            self.assertFalse(visible & blocked)
+            self.assertFalse(selected & blocked)
+            forged = agent.tool_registry.execute(
+                "fork_subagent",
+                '{"task":"not allowed"}',
+            )
+            self.assertEqual(forged["code"], "unknown_tool")
+            self.assertIn("isolated sub-agent", agent.instructions)
+            self.assertIsNone(agent.agent_team_manager)
+            self.assertIsInstance(
+                agent.hooks.handlers_for(PreToolUse)[0],
+                PermissionHook,
+            )
+            agent.close()
+            agent.close()
+            close_callback.assert_called_once_with()
 
     def test_agent_config_allowlist_can_disable_subagent_tools(self) -> None:
         agent = create_default_agent(
