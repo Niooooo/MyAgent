@@ -1412,15 +1412,26 @@ class MyAgentWindow:
             (29, 7, 25),
         ):
             icon.put(_ACCENT_COLOR, to=(left, y, right, y + 1))
-        for x, y, width, height in (
-            (8, 8, 3, 16),
-            (21, 8, 3, 16),
-            (11, 10, 3, 5),
-            (13, 13, 3, 5),
-            (16, 13, 3, 5),
-            (18, 10, 3, 5),
-        ):
-            icon.put(_APP_BACKGROUND, to=(x, y, x + width, y + height))
+        segments = (
+            (9, 24, 9, 9),
+            (9, 9, 16, 18),
+            (16, 18, 23, 9),
+            (23, 9, 23, 24),
+            (18, 16, 23, 20),
+        )
+        for y in range(32):
+            for x in range(32):
+                for x1, y1, x2, y2 in segments:
+                    dx = x2 - x1
+                    dy = y2 - y1
+                    length_squared = dx * dx + dy * dy
+                    offset = ((x - x1) * dx + (y - y1) * dy) / length_squared
+                    position = max(0.0, min(1.0, offset))
+                    nearest_x = x1 + position * dx
+                    nearest_y = y1 + position * dy
+                    if (x - nearest_x) ** 2 + (y - nearest_y) ** 2 <= 2.25:
+                        icon.put(_ACCENT_TEXT_COLOR, to=(x, y, x + 1, y + 1))
+                        break
         self._app_icon = icon
         if isinstance(self.root, ctk.CTk):
             # Calling iconbitmap marks the icon as user-owned so CTk does not
@@ -1447,17 +1458,32 @@ class MyAgentWindow:
 
         brand = ctk.CTkFrame(header, fg_color="transparent")
         brand.grid(row=0, column=0, padx=(18, 22), pady=12, sticky="w")
-        logo = ctk.CTkLabel(
+        self.header_logo = tk.Canvas(
             brand,
-            text="M",
             width=34,
             height=34,
-            corner_radius=10,
-            fg_color=_ACCENT_COLOR,
-            text_color=_ACCENT_TEXT_COLOR,
-            font=(_FONT_FAMILY, _FONT_SIZE_BRAND, "bold"),
+            background=_HEADER_BACKGROUND,
+            borderwidth=0,
+            highlightthickness=0,
         )
-        logo.grid(row=0, column=0, rowspan=2, padx=(0, 10))
+        self.header_logo.grid(row=0, column=0, rowspan=2, padx=(0, 10))
+        self.header_logo.create_rectangle(8, 1, 26, 33, fill=_ACCENT_COLOR, outline="")
+        self.header_logo.create_rectangle(1, 8, 33, 26, fill=_ACCENT_COLOR, outline="")
+        for bounds in ((1, 1, 15, 15), (19, 1, 33, 15), (1, 19, 15, 33), (19, 19, 33, 33)):
+            self.header_logo.create_oval(*bounds, fill=_ACCENT_COLOR, outline="")
+        self.header_logo.create_line(
+            9, 25, 9, 10, 17, 19, 25, 10, 25, 25,
+            fill=_ACCENT_TEXT_COLOR,
+            width=4,
+            capstyle=tk.ROUND,
+            joinstyle=tk.ROUND,
+        )
+        self.header_logo.create_line(
+            19, 17, 25, 21,
+            fill=_ACCENT_TEXT_COLOR,
+            width=4,
+            capstyle=tk.ROUND,
+        )
         ctk.CTkLabel(
             brand,
             text="MyAgent",
@@ -1950,6 +1976,15 @@ class MyAgentWindow:
             width=13,
             capstyle=tk.ROUND,
             joinstyle=tk.ROUND,
+        )
+        canvas.create_line(
+            178,
+            92,
+            204,
+            107,
+            fill=_ACCENT_TEXT_COLOR,
+            width=13,
+            capstyle=tk.ROUND,
         )
         canvas.create_text(
             170,

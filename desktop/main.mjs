@@ -1,6 +1,6 @@
 import { EventEmitter, once } from "node:events"
 import { spawn } from "node:child_process"
-import { existsSync } from "node:fs"
+import { existsSync, writeFileSync } from "node:fs"
 import path from "node:path"
 import process from "node:process"
 import { deflateSync } from "node:zlib"
@@ -14,6 +14,9 @@ const rendererRoot = path.join(desktopRoot, "renderer")
 const APP_ID = "Niooooo.MyAgent.Desktop"
 const BACKGROUND = "#0b0e10"
 const smokeTest = process.argv.includes("--smoke-test")
+const smokeScreenshotPath = process.env.MYAGENT_SMOKE_SCREENSHOT || ""
+const smokeSettingsScreenshotPath = process.env.MYAGENT_SMOKE_SETTINGS_SCREENSHOT || ""
+const smokeIconPath = process.env.MYAGENT_SMOKE_ICON || ""
 const IPC_METHODS = new Set([
   "app.snapshot",
   "app.shutdown",
@@ -34,6 +37,7 @@ const IPC_METHODS = new Set([
 
 app.setName("MyAgent")
 app.setAppUserModelId(APP_ID)
+if (smokeTest) app.disableHardwareAcceleration()
 
 class SidecarBridge extends EventEmitter {
   constructor() {
@@ -188,6 +192,7 @@ function createMyAgentIcon(size = 64) {
     [18, 20, 32, 36],
     [32, 36, 46, 20],
     [46, 20, 46, 45],
+    [35, 33, 46, 40],
   ]
   for (let y = 0; y < size; y += 1) {
     for (let x = 0; x < size; x += 1) {
@@ -228,6 +233,7 @@ function createMyAgentIcon(size = 64) {
 
 function createWindow() {
   const icon = createMyAgentIcon()
+  if (smokeTest && smokeIconPath) writeFileSync(smokeIconPath, icon.toPNG())
   mainWindow = new BrowserWindow({
     width: 960,
     height: 640,
@@ -283,13 +289,33 @@ function createWindow() {
         const renderedText = await mainWindow.webContents.executeJavaScript(
           '({ tab: document.querySelector(".tab-title")?.textContent || "", status: document.querySelector("#session-status")?.textContent || "" })',
         )
-        if (!renderedText.tab.includes("对话") || JSON.stringify(renderedText).includes("�")) {
+        if (!renderedText.tab || JSON.stringify(renderedText).includes("�")) {
           throw new Error("Renderer received mojibake from the Python sidecar")
+        }
+        if (smokeSettingsScreenshotPath) {
+          await mainWindow.webContents.executeJavaScript(
+            'document.querySelector("#settings-button").click()',
+          )
+          await new Promise((resolve) => setTimeout(resolve, 50))
+          writeFileSync(
+            smokeSettingsScreenshotPath,
+            (await mainWindow.webContents.capturePage()).toPNG(),
+          )
+          await mainWindow.webContents.executeJavaScript(
+            'document.querySelector("#settings-dialog").close()',
+          )
         }
         const settingsAndAgentConfig = await mainWindow.webContents.executeJavaScript(`(() => {
           document.querySelector("#settings-button")?.click()
           const settingsDialog = document.querySelector("#settings-dialog")
           const settingsOpened = settingsDialog.open
+          const settingsBounds = settingsDialog.getBoundingClientRect()
+          const settingsFormBounds = settingsDialog.querySelector("form").getBoundingClientRect()
+          const settingsFits =
+            settingsDialog.scrollWidth <= settingsDialog.clientWidth &&
+            settingsDialog.scrollHeight <= settingsDialog.clientHeight &&
+            settingsFormBounds.right <= settingsBounds.right + 1 &&
+            settingsFormBounds.bottom <= settingsBounds.bottom + 1
           const settingValues = [...settingsDialog.querySelectorAll('input[type="number"]')]
             .map((input) => input.value)
           settingsDialog.close()
@@ -315,6 +341,7 @@ function createWindow() {
           const resizeClosed = !details.open
           return {
             settingsOpened,
+            settingsFits,
             settingValues,
             internalStayedOpen,
             selectStayedOpen,
@@ -327,6 +354,7 @@ function createWindow() {
         })()`)
         if (
           !settingsAndAgentConfig.settingsOpened ||
+          !settingsAndAgentConfig.settingsFits ||
           settingsAndAgentConfig.settingValues.length !== 5 ||
           settingsAndAgentConfig.settingValues.some((value) => value === "") ||
           !settingsAndAgentConfig.internalStayedOpen ||
@@ -374,6 +402,84 @@ function createWindow() {
           payload: secondConversation.state,
         })
         await new Promise((resolve) => setTimeout(resolve, 25))
+        const historyOpenedTab = await mainWindow.webContents.executeJavaScript(`(() => {
+          const inactiveClose = document.querySelector(".tab:not(.active) .tab-close")
+          const historyItemsBefore = document.querySelectorAll(".history-item").length
+          inactiveClose?.click()
+          const tabsAfterClose = document.querySelectorAll(".tab").length
+          const historyItem = [...document.querySelectorAll(".history-item")]
+            .find((item) => item.querySelector(".history-item-title")?.textContent === "冒烟会话")
+          historyItem?.click()
+          return { historyItemsBefore, tabsAfterClose, foundHistory: Boolean(historyItem) }
+        })()`)
+        let reopenedTitle = ""
+        let reopenedTabs = 0
+        for (let attempt = 0; attempt < 20; attempt += 1) {
+          const reopened = await mainWindow.webContents.executeJavaScript(`({
+            title: document.querySelector(".tab.active .tab-title")?.textContent || "",
+            tabs: document.querySelectorAll(".tab").length,
+          })`)
+          reopenedTitle = reopened.title
+          reopenedTabs = reopened.tabs
+          if (reopenedTitle === "冒烟会话" && reopenedTabs === 2) break
+          await new Promise((resolve) => setTimeout(resolve, 25))
+        }
+        if (
+          historyOpenedTab.historyItemsBefore !== 2 ||
+          historyOpenedTab.tabsAfterClose !== 1 ||
+          !historyOpenedTab.foundHistory ||
+          reopenedTitle !== "冒烟会话" ||
+          reopenedTabs !== 2
+        ) {
+          throw new Error("Workspace history did not reopen the conversation in a tab")
+        }
+        await mainWindow.webContents.executeJavaScript(`(() => {
+          const second = [...document.querySelectorAll(".tab-title")]
+            .find((title) => title.textContent !== "冒烟会话")
+          second?.click()
+        })()`)
+        for (let attempt = 0; attempt < 20; attempt += 1) {
+          const activeTitle = await mainWindow.webContents.executeJavaScript(
+            'document.querySelector(".tab.active .tab-title")?.textContent || ""',
+          )
+          if (activeTitle && activeTitle !== "冒烟会话") break
+          await new Promise((resolve) => setTimeout(resolve, 25))
+        }
+        const sidebarCollapse = await mainWindow.webContents.executeJavaScript(`(() => {
+          const sidebar = document.querySelector("#history-sidebar")
+          const toggle = document.querySelector("#history-sidebar-toggle")
+          const expandedWidth = sidebar.getBoundingClientRect().width
+          toggle.click()
+          const collapsed = document.body.classList.contains("sidebar-collapsed")
+          const collapsedWidth = sidebar.getBoundingClientRect().width
+          const collapsedAria = toggle.getAttribute("aria-expanded")
+          toggle.click()
+          return {
+            collapsed,
+            collapsedAria,
+            collapsedWidth,
+            expandedWidth,
+            restored: !document.body.classList.contains("sidebar-collapsed"),
+          }
+        })()`)
+        if (
+          !sidebarCollapse.collapsed ||
+          sidebarCollapse.collapsedAria !== "false" ||
+          sidebarCollapse.collapsedWidth >= sidebarCollapse.expandedWidth ||
+          !sidebarCollapse.restored
+        ) {
+          throw new Error("History sidebar collapse and restore behavior failed")
+        }
+        if (smokeScreenshotPath) {
+          await mainWindow.webContents.executeJavaScript(
+            'document.querySelector("#agent-config").open = true',
+          )
+          await new Promise((resolve) => setTimeout(resolve, 50))
+          writeFileSync(smokeScreenshotPath, (await mainWindow.webContents.capturePage()).toPNG())
+          await mainWindow.webContents.executeJavaScript(
+            'document.querySelector("#agent-config").open = false',
+          )
+        }
         const menuBehavior = await mainWindow.webContents.executeJavaScript(`(() => {
           const open = () => {
             const title = document.querySelector(".tab.active .tab-title")
@@ -443,7 +549,7 @@ function createWindow() {
         const toast = await mainWindow.webContents.executeJavaScript(
           '({ hidden: document.querySelector("#error-toast")?.hidden, text: document.querySelector("#error-toast")?.textContent || "" })',
         )
-        if (toast.hidden || !toast.text.includes("至少保留一个对话标签") || toast.text.includes("remote method")) {
+        if (toast.hidden || !toast.text.includes("至少保留一个打开的对话标签") || toast.text.includes("remote method")) {
           throw new Error("Desktop request errors are not shown as a clean toast")
         }
         await new Promise((resolve) => setTimeout(resolve, 5200))
@@ -550,15 +656,23 @@ function createWindow() {
         ) {
           throw new Error("Message cards, Markdown safety, or Agent configuration failed")
         }
-        const optimisticUserMessage = await mainWindow.webContents.executeJavaScript(`(() => {
+        const optimisticMessages = await mainWindow.webContents.executeJavaScript(`(() => {
           const input = document.querySelector("#prompt-input")
           input.value = "立即显示的用户消息"
           input.dispatchEvent(new Event("input", { bubbles: true }))
           document.querySelector("#send-button")?.click()
-          return [...document.querySelectorAll(".message.user")].at(-1)?.querySelector(".message-text")?.textContent || ""
+          return {
+            user: [...document.querySelectorAll(".message.user")].at(-1)?.querySelector(".message-text")?.textContent || "",
+            agent: Boolean(document.querySelector(".message.assistant.streaming")),
+            agentStatus: document.querySelector(".message.assistant.streaming .message-text")?.textContent || "",
+          }
         })()`)
-        if (optimisticUserMessage !== "立即显示的用户消息") {
-          throw new Error("User message was not rendered before the sidecar response")
+        if (
+          optimisticMessages.user !== "立即显示的用户消息" ||
+          !optimisticMessages.agent ||
+          optimisticMessages.agentStatus !== "正在思考"
+        ) {
+          throw new Error("User and Agent message cards were not rendered before the sidecar response")
         }
         let optimisticRollback
         for (let attempt = 0; attempt < 20; attempt += 1) {
@@ -566,12 +680,21 @@ function createWindow() {
             prompt: document.querySelector("#prompt-input")?.value || "",
             messageStillPresent: [...document.querySelectorAll(".message.user .message-text")]
               .some((node) => node.textContent === "立即显示的用户消息"),
+            agentPlaceholderPresent: Boolean(document.querySelector(".message.assistant.streaming")),
           }))()`)
-          if (optimisticRollback.prompt === "立即显示的用户消息" && !optimisticRollback.messageStillPresent) break
+          if (
+            optimisticRollback.prompt === "立即显示的用户消息" &&
+            !optimisticRollback.messageStillPresent &&
+            !optimisticRollback.agentPlaceholderPresent
+          ) break
           await new Promise((resolve) => setTimeout(resolve, 25))
         }
-        if (optimisticRollback.prompt !== "立即显示的用户消息" || optimisticRollback.messageStillPresent) {
-          throw new Error("Rejected optimistic message did not restore the prompt")
+        if (
+          optimisticRollback.prompt !== "立即显示的用户消息" ||
+          optimisticRollback.messageStillPresent ||
+          optimisticRollback.agentPlaceholderPresent
+        ) {
+          throw new Error("Rejected optimistic messages did not restore the prompt")
         }
         const modelDialog = await mainWindow.webContents.executeJavaScript(`(() => {
           document.querySelector("#add-model-button")?.click()

@@ -14,7 +14,13 @@
     <div id="app-shell">
       <header id="titlebar">
         <div class="brand">
-          <span class="brand-mark" aria-hidden="true">M</span>
+          <span class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 120 120" role="presentation">
+              <rect x="2" y="2" width="116" height="116" rx="28"></rect>
+              <path d="M24 88V35L60 75L96 35V88"></path>
+              <path d="M68 66L96 80"></path>
+            </svg>
+          </span>
           <span class="brand-copy">
             <strong>MyAgent</strong>
             <small>本地 Agent 工作台</small>
@@ -45,6 +51,26 @@
           </button>
         </div>
       </header>
+
+      <aside id="history-sidebar" class="no-drag" aria-label="当前目录的历史对话">
+        <div class="history-heading">
+          <span class="history-heading-copy">
+            <strong>历史对话</strong>
+            <small id="history-workspace-name"></small>
+          </span>
+          <button
+            id="history-sidebar-toggle"
+            type="button"
+            aria-label="收起历史对话侧栏"
+            aria-expanded="true"
+            title="收起历史对话侧栏"
+          >
+            <span class="history-toggle-glyph" aria-hidden="true"></span>
+          </button>
+        </div>
+        <div id="history-list" role="list"></div>
+        <p id="history-empty" hidden>当前目录还没有历史对话</p>
+      </aside>
 
       <div id="tab-bar" class="no-drag" aria-label="对话标签"></div>
 
