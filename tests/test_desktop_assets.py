@@ -48,6 +48,9 @@ class DesktopAssetTests(unittest.TestCase):
         cls.layout = (DESKTOP / "renderer" / "layout.js").read_text(encoding="utf-8")
         cls.main = (DESKTOP / "main.mjs").read_text(encoding="utf-8")
         cls.preload = (DESKTOP / "preload.cjs").read_text(encoding="utf-8")
+        cls.sidecar = (ROOT / "src" / "myagent" / "desktop_sidecar.py").read_text(
+            encoding="utf-8"
+        )
 
     def test_welcome_panel_contains_only_one_logo_canvas(self) -> None:
         parser = WelcomePanelParser()
@@ -71,13 +74,12 @@ class DesktopAssetTests(unittest.TestCase):
         )
         self.assertIsNotNone(resize_binding)
         self.assertNotIn("drawWelcomeLogo", resize_binding.group(0))
-        self.assertNotIn("Configure", self.app)
 
     def test_hysteresis_and_action_positions_are_structurally_stable(self) -> None:
         self.assertIn("COMPACT_ENTER_WIDTH = 880", self.layout)
         self.assertIn("COMPACT_EXIT_WIDTH = 920", self.layout)
         self.assertIn(
-            "grid-template-columns: max-content max-content minmax(0, 1fr) 92px",
+            "grid-template-columns: max-content minmax(0, 1fr) 92px",
             self.css,
         )
         compact_rule = re.search(
@@ -112,11 +114,71 @@ class DesktopAssetTests(unittest.TestCase):
         )
         self.assertIn("elements.send.disabled = !session.canSend || state.closing", self.app)
 
+    def test_agent_configuration_replaces_runtime_kind_selection(self) -> None:
+        self.assertIn('id="agent-config"', self.html)
+        self.assertIn('id="main-agent-model-selector"', self.html)
+        self.assertIn('id="sub-agent-model-selector"', self.html)
+        self.assertNotIn('id="model-selector"', self.html)
+        self.assertNotIn('id="kind-selector"', self.html)
+        self.assertIn('"canConfigureAgents": controller.state == "idle"', self.sidecar)
+        self.assertIn('request("session.configure_agent_model"', self.app)
+        self.assertIn('role: "main"', self.app)
+        self.assertIn('role: "sub"', self.app)
+        self.assertIn("!session.canConfigureAgents", self.app)
+        self.assertNotIn('request("session.set_kind"', self.app)
+        self.assertNotIn("对话与 AgentTeammate", self.html)
+        self.assertNotIn("run_subagent 与 fork_subagent", self.html)
+        self.assertNotIn(".agent-config-menu small", self.css)
+
+    def test_user_message_is_rendered_before_submit_request_resolves(self) -> None:
+        send_start = self.app.index("async function send()")
+        optimistic = self.app.index("session.messages.push(optimisticMessage)", send_start)
+        clear_input = self.app.index('elements.prompt.value = ""', send_start)
+        request = self.app.index('await request("session.submit"', send_start)
+        self.assertLess(optimistic, request)
+        self.assertLess(clear_input, request)
+        self.assertIn("current.messages.indexOf(optimisticMessage)", self.app)
+        self.assertIn("Object.assign(current, previous)", self.app)
+
     def test_renderer_handles_incremental_sidecar_output(self) -> None:
         self.assertIn('message.event === "stream-start"', self.app)
         self.assertIn('message.event === "stream-delta"', self.app)
-        self.assertIn('article.className = "message streaming"', self.app)
+        self.assertIn('createMessageCard("MyAgent", streamText, session.id)', self.app)
+        self.assertIn('renderMarkdown(text, streamingMessages.get(sessionId))', self.app)
         self.assertIn(".message.streaming .message-text::after", self.css)
+
+    def test_messages_are_separate_role_aligned_cards_with_safe_markdown(self) -> None:
+        markdown = (DESKTOP / "renderer" / "markdown.js").read_text(encoding="utf-8")
+        self.assertIn('article.className = `message ${role}', self.app)
+        self.assertIn('role === "assistant"', self.app)
+        self.assertIn("renderMarkdown(text, content)", self.app)
+        self.assertIn('from "../node_modules/marked/lib/marked.esm.js"', markdown)
+        self.assertIn('from "../node_modules/dompurify/dist/purify.es.mjs"', markdown)
+        self.assertIn("DOMPurify.sanitize", markdown)
+        self.assertIn("align-items: flex-start", self.css)
+        self.assertIn(".message.user", self.css)
+        self.assertIn("align-self: flex-end", self.css)
+        self.assertIn("margin-left: auto", self.css)
+        self.assertIn(".message.assistant", self.css)
+        self.assertIn(".markdown-body pre", self.css)
+
+    def test_errors_use_a_five_second_toast_and_tabs_can_be_renamed(self) -> None:
+        self.assertIn('id="error-toast"', self.html)
+        self.assertIn("const ERROR_TOAST_DURATION_MS = 5000", self.app)
+        self.assertIn("showErrorToast(error)", self.app)
+        self.assertIn("elements.errorToast.hidden = true", self.app)
+        self.assertNotIn("setStatus(error?.message || String(error), true)", self.app)
+        self.assertIn('title.addEventListener("dblclick"', self.app)
+        self.assertIn('tab.addEventListener("contextmenu"', self.app)
+        self.assertIn('id="tab-context-menu"', self.html)
+        self.assertIn('id="rename-tab-menu-item"', self.html)
+        self.assertIn(">修改名称</button>", self.html)
+        self.assertIn("renameTabFromContextMenu", self.app)
+        self.assertIn('request("session.rename"', self.app)
+        self.assertIn('"session.rename",', self.main)
+        self.assertIn('"session.rename": self._rename_session', self.sidecar)
+        self.assertIn(".tab-title-input", self.css)
+        self.assertIn(".tab-context-menu", self.css)
 
     def test_renderer_is_isolated_and_launcher_defaults_to_myagent_electron(self) -> None:
         self.assertIn("contextIsolation: true", self.main)
@@ -131,11 +193,17 @@ class DesktopAssetTests(unittest.TestCase):
         self.assertIn('document.querySelector("#model-base-url-input")', self.main)
         self.assertIn("Model dialog does not expose the Base URL setting", self.main)
         self.assertIn(
-            "Busy turn must keep the prompt editable and lock only send",
+            "Busy turn must keep the prompt editable and lock Agent configuration",
             self.main,
         )
-        self.assertIn("Renderer did not incrementally render sidecar output", self.main)
-        self.assertIn("Final state did not replace the streaming message", self.main)
+        self.assertIn("Renderer did not incrementally render Markdown output", self.main)
+        self.assertIn("Message cards, Markdown safety, or Agent configuration failed", self.main)
+        self.assertIn("User message was not rendered before the sidecar response", self.main)
+        self.assertIn("Rejected optimistic message did not restore the prompt", self.main)
+        self.assertIn("Conversation rename context menu did not open the editor", self.main)
+        self.assertIn("Conversation title rename did not persist", self.main)
+        self.assertIn("Desktop request errors are not shown as a clean toast", self.main)
+        self.assertIn("Desktop request error toast did not dismiss after five seconds", self.main)
         self.assertIn('if (action === "minimize") mainWindow.minimize()', self.main)
         self.assertIn('if (action === "close") mainWindow.close()', self.main)
         self.assertIn('document.querySelector("[data-window-action=maximize]").click()', self.main)

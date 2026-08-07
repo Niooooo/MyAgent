@@ -70,17 +70,19 @@
               spellcheck="false"
             ></textarea>
             <div id="action-bar">
-              <label class="select-control">
-                <span>模型</span>
-                <select id="model-selector" aria-label="模型"></select>
-              </label>
-              <label class="select-control agent-control">
-                <span>Agent</span>
-                <select id="kind-selector" aria-label="Agent 类型">
-                  <option value="main">主 Agent（含 AgentTeammate）</option>
-                  <option value="sub">子 Agent</option>
-                </select>
-              </label>
+              <details id="agent-config" class="agent-config">
+                <summary>Agent 配置</summary>
+                <div class="agent-config-menu">
+                  <label>
+                    <span>主 Agent</span>
+                    <select id="main-agent-model-selector" aria-label="主 Agent 模型"></select>
+                  </label>
+                  <label>
+                    <span>子 Agent</span>
+                    <select id="sub-agent-model-selector" aria-label="子 Agent 模型"></select>
+                  </label>
+                </div>
+              </details>
               <span id="send-hint">Ctrl + Enter 发送</span>
               <button id="send-button" class="primary-button" type="button" disabled>发送&nbsp;&nbsp;↑</button>
             </div>
@@ -100,6 +102,11 @@
           <p id="model-page-status" class="page-status"></p>
         </section>
       </main>
+    </div>
+
+    <div id="error-toast" class="error-toast" role="alert" aria-live="assertive" hidden></div>
+    <div id="tab-context-menu" class="tab-context-menu" role="menu" aria-label="对话标签操作" hidden>
+      <button id="rename-tab-menu-item" type="button" role="menuitem">修改名称</button>
     </div>
 
     <dialog id="model-dialog">

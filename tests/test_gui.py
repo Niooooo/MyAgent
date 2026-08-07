@@ -120,6 +120,9 @@ class DeferredAgentTests(unittest.TestCase):
                 model="model-a",
                 api_key="sk-secret-value",
                 base_url="https://gateway.example/v1",
+                subagent_model="model-child",
+                subagent_api_key="sk-child-secret",
+                subagent_base_url="https://child.example/v1",
                 cwd=folder,
                 kind="sub",
                 runtime_factory=factory,
@@ -132,6 +135,9 @@ class DeferredAgentTests(unittest.TestCase):
             self.assertEqual(kwargs["model"], "model-a")
             self.assertEqual(kwargs["api_key"], "sk-secret-value")
             self.assertEqual(kwargs["base_url"], "https://gateway.example/v1")
+            self.assertEqual(kwargs["subagent_model"], "model-child")
+            self.assertEqual(kwargs["subagent_api_key"], "sk-child-secret")
+            self.assertEqual(kwargs["subagent_base_url"], "https://child.example/v1")
             self.assertEqual(kwargs["cwd"], Path(folder).resolve())
             self.assertEqual(kwargs["kind"], "sub")
             agent.close()
@@ -225,6 +231,53 @@ class ConversationControllerTests(unittest.TestCase):
         self.assertFalse(controller.submit("too early"))
         self.assertFalse(controller.consume_result())
         self.assertEqual(controller.state, "idle")
+
+    def test_model_can_switch_after_a_completed_turn_and_preserve_history(self) -> None:
+        controller, factory = self.make_controller()
+        self.addCleanup(self.tearDownController, controller, factory)
+        first = ModelRecord("one", "key-one", "2026-01-01T00:00:00Z")
+        second = ModelRecord("two", "key-two", "2026-01-02T00:00:00Z")
+        self.assertTrue(controller.set_model(first))
+        self.assertTrue(controller.submit("first"))
+        consume(controller)
+        first_history = list(factory.runtimes[0].history)
+
+        self.assertTrue(controller.has_started)
+        self.assertTrue(controller.set_model(second))
+        self.assertEqual(controller.model, "two")
+        self.assertEqual(factory.runtimes[0].close_calls, 1)
+        self.assertTrue(controller.submit("second"))
+        consume(controller)
+
+        self.assertEqual(factory.calls[1][1]["model"], "two")
+        self.assertEqual(factory.runtimes[1].history[: len(first_history)], first_history)
+
+    def test_subagent_model_can_change_after_a_completed_turn(self) -> None:
+        controller, factory = self.make_controller()
+        self.addCleanup(self.tearDownController, controller, factory)
+        main = ModelRecord("main", "main-key", "2026-01-01T00:00:00Z")
+        child = ModelRecord(
+            "child",
+            "child-key",
+            "2026-01-02T00:00:00Z",
+            "https://child.example/v1",
+        )
+        self.assertTrue(controller.set_agent_model("main", main))
+        self.assertTrue(controller.submit("first"))
+        consume(controller)
+        first_history = list(factory.runtimes[0].history)
+
+        self.assertTrue(controller.set_agent_model("sub", child))
+        self.assertEqual(controller.subagent_model, "child")
+        self.assertEqual(factory.runtimes[0].close_calls, 1)
+        self.assertTrue(controller.submit("second"))
+        consume(controller)
+
+        options = factory.calls[1][1]
+        self.assertEqual(options["model"], "main")
+        self.assertEqual(options["subagent_model"], "child")
+        self.assertEqual(options["subagent_api_key"], "child-key")
+        self.assertEqual(factory.runtimes[1].history[: len(first_history)], first_history)
 
     def test_stream_deltas_arrive_before_final_result_and_redact_split_secret(self) -> None:
         factory = RuntimeFactory()
@@ -407,6 +460,16 @@ class SessionManagerTests(unittest.TestCase):
         self.assertEqual(self.manager.sessions, [first])
         self.assertFalse(self.manager.close_session(first.session_id))
         self.assertEqual(len(self.manager.sessions), 1)
+
+    def test_session_title_can_be_renamed_with_bounded_normalization(self) -> None:
+        session = self.manager.active
+        self.assertTrue(self.manager.rename_session(session.session_id, "  项目   排查  "))
+        self.assertEqual(session.title, "项目 排查")
+        self.assertFalse(self.manager.rename_session(session.session_id, "   "))
+        self.assertEqual(session.title, "项目 排查")
+        self.assertIn("不能为空", self.manager.last_error)
+        self.assertFalse(self.manager.rename_session(session.session_id, "x" * 81))
+        self.assertIn("80", self.manager.last_error)
 
     def test_delete_busy_rejected_then_clears_idle_selected_runtimes(self) -> None:
         self.manager.register_model("one", "key-one")

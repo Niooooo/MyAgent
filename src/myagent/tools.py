@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import os
 import secrets
+import shutil
+import signal
 import subprocess
+import sys
 from collections.abc import Callable, Iterable
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from pathlib import Path
@@ -50,6 +53,8 @@ BASH_TOOL: dict[str, Any] = {
 }
 
 _BACKGROUND_ERROR_CHARS = 1_000
+_BASH_OVERRIDE_ENV = "MYAGENT_BASH"
+_PROCESS_TREE_CLEANUP_SECONDS = 5
 
 
 class BackgroundBashRunner:
@@ -193,6 +198,7 @@ class BashTool:
         cwd: str | os.PathLike[str] | WorkspaceRoot | None = None,
         timeout_seconds: int = 30,
         max_output_chars: int = 50_000,
+        bash_executable: str | os.PathLike[str] | None = None,
     ) -> None:
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
@@ -204,6 +210,13 @@ class BashTool:
         )
         self.timeout_seconds = timeout_seconds
         self.max_output_chars = max_output_chars
+        if bash_executable is None:
+            self.executable = _resolve_bash_executable()
+        else:
+            selected = os.fspath(bash_executable)
+            if not isinstance(selected, str) or not selected.strip():
+                raise ValueError("bash_executable must be a non-empty path")
+            self.executable = selected
 
     @property
     def cwd(self) -> Path:
@@ -219,47 +232,220 @@ class BashTool:
                 "error": "Command refused: recursive forced deletion via rm is blocked.",
             }
 
+        process: subprocess.Popen[str] | None = None
+        windows_job: _WindowsProcessJob | None = None
         try:
-            completed = subprocess.run(
-                ["bash", "-lc", command],
+            popen_options: dict[str, Any] = {}
+            if sys.platform == "win32":
+                popen_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            else:
+                popen_options["start_new_session"] = True
+
+            arguments = [self.executable, "-lc", command]
+            if sys.platform == "win32":
+                arguments = [
+                    self.executable,
+                    "--noprofile",
+                    "--norc",
+                    "-c",
+                    command,
+                ]
+
+            process = subprocess.Popen(
+                arguments,
                 cwd=self.cwd,
-                capture_output=True,
-                text=True,
-                timeout=self.timeout_seconds,
-                check=False,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                encoding="utf-8",
+                errors="replace",
+                **popen_options,
             )
+            if sys.platform == "win32":
+                windows_job = _WindowsProcessJob.try_create(process)
+            try:
+                stdout, stderr = process.communicate(timeout=self.timeout_seconds)
+            except subprocess.TimeoutExpired as exc:
+                cleanup_error = _terminate_process_tree(process, windows_job)
+                try:
+                    stdout, stderr = process.communicate(
+                        timeout=_PROCESS_TREE_CLEANUP_SECONDS
+                    )
+                except subprocess.TimeoutExpired:
+                    stdout = exc.stdout or ""
+                    stderr = exc.stderr or ""
+                error = f"Command timed out after {self.timeout_seconds} seconds."
+                if cleanup_error:
+                    error = f"{error} Process cleanup failed: {cleanup_error}"
+                return {
+                    "ok": False,
+                    "exit_code": None,
+                    "stdout": self._truncate(stdout),
+                    "stderr": self._truncate(stderr),
+                    "error": error,
+                }
         except FileNotFoundError:
             return {
                 "ok": False,
                 "exit_code": None,
                 "stdout": "",
                 "stderr": "",
-                "error": "bash executable was not found on PATH.",
+                "error": f"Bash executable was not found: {self.executable}",
             }
-        except subprocess.TimeoutExpired as exc:
-            return {
-                "ok": False,
-                "exit_code": None,
-                "stdout": self._truncate(exc.stdout or ""),
-                "stderr": self._truncate(exc.stderr or ""),
-                "error": f"Command timed out after {self.timeout_seconds} seconds.",
-            }
+        finally:
+            if windows_job is not None:
+                windows_job.close()
 
+        assert process is not None
+        ok = process.returncode == 0
         return {
-            "ok": completed.returncode == 0,
-            "exit_code": completed.returncode,
-            "stdout": self._truncate(completed.stdout),
-            "stderr": self._truncate(completed.stderr),
-            "error": None,
+            "ok": ok,
+            "exit_code": process.returncode,
+            "stdout": self._truncate(stdout or ""),
+            "stderr": self._truncate(stderr or ""),
+            "error": (
+                None if ok else f"Command exited with code {process.returncode}."
+            ),
         }
 
-    def _truncate(self, value: str | bytes) -> str:
+    def _truncate(self, value: str | bytes | None) -> str:
+        if value is None:
+            return ""
         if isinstance(value, bytes):
             value = value.decode(errors="replace")
         if len(value) <= self.max_output_chars:
             return value
         omitted = len(value) - self.max_output_chars
         return f"{value[:self.max_output_chars]}\n...[truncated {omitted} characters]"
+
+
+class _WindowsProcessJob:
+    """Own a Windows process tree so timeout cleanup includes descendants."""
+
+    def __init__(self, handle: int, kernel32: Any) -> None:
+        self._handle = handle
+        self._kernel32 = kernel32
+
+    @classmethod
+    def try_create(
+        cls,
+        process: subprocess.Popen[str],
+    ) -> _WindowsProcessJob | None:
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
+            kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+            kernel32.AssignProcessToJobObject.argtypes = [
+                wintypes.HANDLE,
+                wintypes.HANDLE,
+            ]
+            kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+            kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+            kernel32.TerminateJobObject.restype = wintypes.BOOL
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+
+            handle = kernel32.CreateJobObjectW(None, None)
+            if not handle:
+                raise ctypes.WinError(ctypes.get_last_error())
+            if not kernel32.AssignProcessToJobObject(handle, int(process._handle)):
+                error = ctypes.get_last_error()
+                kernel32.CloseHandle(handle)
+                raise ctypes.WinError(error)
+            return cls(handle, kernel32)
+        except (AttributeError, OSError):
+            return None
+
+    def terminate(self) -> str | None:
+        import ctypes
+
+        if self._kernel32.TerminateJobObject(self._handle, 1):
+            return None
+        return str(ctypes.WinError(ctypes.get_last_error()))
+
+    def close(self) -> None:
+        if self._handle:
+            self._kernel32.CloseHandle(self._handle)
+            self._handle = 0
+
+
+def _terminate_process_tree(
+    process: subprocess.Popen[str],
+    windows_job: _WindowsProcessJob | None,
+) -> str | None:
+    if sys.platform == "win32":
+        if windows_job is not None:
+            return windows_job.terminate()
+        try:
+            completed = subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=_PROCESS_TREE_CLEANUP_SECONDS,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            if process.poll() is None:
+                process.kill()
+            return str(exc)
+        if completed.returncode != 0 and process.poll() is None:
+            process.kill()
+        return None
+
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return None
+    except OSError as exc:
+        if process.poll() is None:
+            process.kill()
+        return str(exc)
+    return None
+
+
+def _resolve_bash_executable() -> str:
+    override = os.getenv(_BASH_OVERRIDE_ENV, "").strip()
+    if override:
+        return override
+    if sys.platform == "win32":
+        for candidate in _windows_git_bash_candidates():
+            if candidate.is_file():
+                return str(candidate)
+    return shutil.which("bash") or "bash"
+
+
+def _windows_git_bash_candidates() -> tuple[Path, ...]:
+    candidates: list[Path] = []
+    git_executable = shutil.which("git")
+    if git_executable:
+        for root in tuple(Path(git_executable).parents)[:3]:
+            candidates.extend(
+                (
+                    root / "usr" / "bin" / "bash.exe",
+                    root / "bin" / "bash.exe",
+                )
+            )
+
+    for variable in ("ProgramFiles", "ProgramFiles(x86)"):
+        base = os.getenv(variable)
+        if base:
+            candidates.extend(
+                (
+                    Path(base) / "Git" / "usr" / "bin" / "bash.exe",
+                    Path(base) / "Git" / "bin" / "bash.exe",
+                )
+            )
+    local_app_data = os.getenv("LOCALAPPDATA")
+    if local_app_data:
+        root = Path(local_app_data) / "Programs" / "Git"
+        candidates.extend(
+            (root / "usr" / "bin" / "bash.exe", root / "bin" / "bash.exe")
+        )
+
+    return tuple(dict.fromkeys(candidates))
 
 
 def build_bash_function_tool(

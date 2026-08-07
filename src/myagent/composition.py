@@ -176,6 +176,7 @@ class _SerializedBashHandler:
 def build_default_components(
     *,
     client: ResponsesClient | None = None,
+    subagent_client: ResponsesClient | None = None,
     cwd: str | os.PathLike[str] | None = None,
     bash_tool: Callable[[str], dict[str, Any]] | None = None,
     bash_timeout_seconds: int = 30,
@@ -186,6 +187,8 @@ def build_default_components(
     todo_reminder_tool_calls: int | None = None,
     model: str = DEFAULT_MODEL,
     fallback_model: str = FALLBACK_MODEL,
+    subagent_model: str | None = None,
+    subagent_fallback_model: str | None = None,
     instructions: str = DEFAULT_INSTRUCTIONS,
     max_tool_rounds: int = 10,
     subagent_max_workers: int = DEFAULT_SUBAGENT_MAX_WORKERS,
@@ -201,6 +204,9 @@ def build_default_components(
     """Create and connect the standard tools, policies, state, and hooks."""
     if max_tool_rounds < 0:
         raise ValueError("max_tool_rounds must be non-negative")
+    selected_subagent_client = subagent_client or client
+    selected_subagent_model = (subagent_model or model).strip()
+    selected_subagent_fallback = (subagent_fallback_model or fallback_model).strip()
     selected_mcp_servers = tuple(mcp_servers)
     if any(
         not isinstance(server, StdioMCPServerConfig)
@@ -291,9 +297,9 @@ def build_default_components(
             )
             try:
                 child = AgentLoop(
-                    client,
-                    model=model,
-                    fallback_model=fallback_model,
+                    selected_subagent_client,
+                    model=selected_subagent_model,
+                    fallback_model=selected_subagent_fallback,
                     instructions=instructions + _SUBAGENT_INSTRUCTIONS_SUFFIX,
                     max_tool_rounds=max_tool_rounds,
                     tool_registry=child_components.tool_registry,
@@ -689,6 +695,9 @@ def create_default_agent(
     client: ResponsesClient,
     *,
     config: AgentConfig | None = None,
+    subagent_client: ResponsesClient | None = None,
+    subagent_model: str | None = None,
+    subagent_fallback_model: str | None = None,
     cwd: str | os.PathLike[str] | None = None,
     approval_callback: ApprovalCallback | None = None,
     hooks: HookRegistry | None = None,
@@ -699,6 +708,7 @@ def create_default_agent(
     selected = config if config is not None else AgentConfig()
     components = build_default_components(
         client=client,
+        subagent_client=subagent_client,
         cwd=cwd,
         bash_timeout_seconds=selected.bash_timeout_seconds,
         allowed_tools=selected.allowed_tools,
@@ -707,6 +717,8 @@ def create_default_agent(
         todo_reminder_tool_calls=selected.todo_reminder_tool_calls,
         model=selected.model,
         fallback_model=selected.fallback_model,
+        subagent_model=subagent_model,
+        subagent_fallback_model=subagent_fallback_model,
         max_tool_rounds=selected.max_tool_rounds,
         subagent_max_workers=selected.subagent_max_workers,
         subagent_max_tasks=selected.subagent_max_tasks,

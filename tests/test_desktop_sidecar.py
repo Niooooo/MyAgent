@@ -57,9 +57,11 @@ class RuntimeFactory:
     def __init__(self) -> None:
         self.next_request_approval = False
         self.next_stream_chunks = None
+        self.calls: list[tuple[object, dict]] = []
         self.runtimes: list[FakeRuntime] = []
 
     def __call__(self, approval, **_kwargs):
+        self.calls.append((approval, dict(_kwargs)))
         runtime = FakeRuntime(
             approval,
             request_approval=self.next_request_approval,
@@ -123,6 +125,12 @@ class DesktopSidecarTests(unittest.TestCase):
         self.assertNotIn("apiKey", serialized)
         self.assertEqual(snapshot["activeSessionId"], session_id)
         self.assertEqual(snapshot["models"][0]["name"], "model-one")
+        self.assertTrue(snapshot["sessions"][0]["canChangeModel"])
+        self.assertTrue(snapshot["sessions"][0]["canConfigureAgents"])
+        self.assertEqual(
+            snapshot["sessions"][0]["agentModels"],
+            {"main": "model-one", "sub": ""},
+        )
         self.assertEqual(
             snapshot["models"][0]["baseUrl"],
             "https://gateway.example/v1",
@@ -135,13 +143,76 @@ class DesktopSidecarTests(unittest.TestCase):
             {"sessionId": session_id, "prompt": "你好"},
         )
         self.assertEqual(result["state"]["sessions"][0]["messages"][0]["speaker"], "你")
+        self.assertFalse(result["state"]["sessions"][0]["canChangeModel"])
+        self.assertFalse(result["state"]["sessions"][0]["canConfigureAgents"])
         self.pump_until(
             lambda: len(self.sidecar.snapshot()["sessions"][0]["messages"]) == 2
         )
         session = self.sidecar.snapshot()["sessions"][0]
         self.assertEqual(session["messages"][-1], {"speaker": "MyAgent", "text": "回答：你好"})
         self.assertEqual(session["state"], "idle")
+        self.assertTrue(session["canChangeModel"])
+        self.assertTrue(session["canConfigureAgents"])
         self.assertTrue(any(name == "state" for name, _payload in self.events))
+
+    def test_main_and_subagent_models_are_configured_independently(self) -> None:
+        session_id = self.register_and_select()
+        self.sidecar.dispatch(
+            "model.register",
+            {
+                "name": "model-child",
+                "baseUrl": "https://child.example/v1",
+                "apiKey": "child-secret",
+            },
+        )
+        result = self.sidecar.dispatch(
+            "session.configure_agent_model",
+            {"sessionId": session_id, "role": "sub", "name": "model-child"},
+        )
+        self.assertEqual(
+            result["state"]["sessions"][0]["agentModels"],
+            {"main": "model-one", "sub": "model-child"},
+        )
+
+        self.sidecar.dispatch(
+            "session.submit",
+            {"sessionId": session_id, "prompt": "使用子 Agent"},
+        )
+        self.pump_until(
+            lambda: self.sidecar.snapshot()["sessions"][0]["state"] == "idle"
+        )
+        runtime_options = self.factory.calls[0][1]
+        self.assertEqual(runtime_options["model"], "model-one")
+        self.assertEqual(runtime_options["subagent_model"], "model-child")
+        self.assertEqual(runtime_options["subagent_api_key"], "child-secret")
+        self.assertEqual(
+            runtime_options["subagent_base_url"],
+            "https://child.example/v1",
+        )
+
+        cleared = self.sidecar.dispatch(
+            "session.configure_agent_model",
+            {"sessionId": session_id, "role": "sub", "name": ""},
+        )
+        self.assertEqual(cleared["state"]["sessions"][0]["agentModels"]["sub"], "")
+
+    def test_session_title_can_be_renamed_through_protocol(self) -> None:
+        session_id = self.sidecar.snapshot()["activeSessionId"]
+        result = self.sidecar.dispatch(
+            "session.rename",
+            {"sessionId": session_id, "title": "  发布   排查  "},
+        )
+        self.assertEqual(result["state"]["sessions"][0]["title"], "发布 排查")
+        with self.assertRaisesRegex(ProtocolError, "must not be empty"):
+            self.sidecar.dispatch(
+                "session.rename",
+                {"sessionId": session_id, "title": "   "},
+            )
+        with self.assertRaisesRegex(ProtocolError, "80"):
+            self.sidecar.dispatch(
+                "session.rename",
+                {"sessionId": session_id, "title": "x" * 81},
+            )
 
     def test_stream_events_precede_final_state_and_never_expose_split_key(self) -> None:
         session_id = self.register_and_select()

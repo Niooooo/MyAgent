@@ -157,6 +157,7 @@ class ApprovalBridge:
 
 class GUIAgent(Protocol):
     model: str
+    subagent_model: str
     kind: AgentKind
 
     @property
@@ -170,6 +171,15 @@ class GUIAgent(Protocol):
     ) -> None: ...
 
     def clear_model(self) -> None: ...
+
+    def configure_subagent_model(
+        self,
+        model: str,
+        api_key: str,
+        base_url: str | None = None,
+    ) -> None: ...
+
+    def clear_subagent_model(self) -> None: ...
 
     def set_kind(self, kind: AgentKind) -> None: ...
 
@@ -192,6 +202,9 @@ class DeferredAgent:
         model: str = "",
         api_key: str = "",
         base_url: str | None = None,
+        subagent_model: str = "",
+        subagent_api_key: str = "",
+        subagent_base_url: str | None = None,
         cwd: str | os.PathLike[str] | None = None,
         kind: AgentKind = "main",
         runtime_factory: RuntimeFactory | None = None,
@@ -202,8 +215,13 @@ class DeferredAgent:
         self._model = model.strip()
         self._api_key = api_key.strip()
         self._base_url = base_url.strip() if base_url else None
+        self._subagent_model = subagent_model.strip()
+        self._subagent_api_key = subagent_api_key.strip()
+        self._subagent_base_url = subagent_base_url.strip() if subagent_base_url else None
         if bool(self._model) != bool(self._api_key):
             raise ValueError("model and api_key must be configured together")
+        if bool(self._subagent_model) != bool(self._subagent_api_key):
+            raise ValueError("subagent_model and subagent_api_key must be configured together")
         self.cwd = Path(cwd or Path.cwd()).resolve()
         self._kind = kind
         self._runtime_factory = runtime_factory or create_runtime
@@ -216,7 +234,8 @@ class DeferredAgent:
     def __repr__(self) -> str:
         return (
             f"DeferredAgent(model={self.model!r}, cwd={str(self.cwd)!r}, "
-            f"kind={self.kind!r}, loaded={self.loaded})"
+            f"subagent_model={self.subagent_model!r}, kind={self.kind!r}, "
+            f"loaded={self.loaded})"
         )
 
     @property
@@ -230,6 +249,11 @@ class DeferredAgent:
             return self._kind
 
     @property
+    def subagent_model(self) -> str:
+        with self._lock:
+            return self._subagent_model
+
+    @property
     def loaded(self) -> bool:
         with self._lock:
             return self._agent is not None
@@ -237,7 +261,13 @@ class DeferredAgent:
     @property
     def sensitive_values(self) -> tuple[str, ...]:
         with self._lock:
-            return (self._api_key,) if self._api_key else ()
+            return tuple(
+                dict.fromkeys(
+                    value
+                    for value in (self._api_key, self._subagent_api_key)
+                    if value
+                )
+            )
 
     def configure_model(
         self,
@@ -267,6 +297,35 @@ class DeferredAgent:
             self._base_url = None
         if old_agent is not None:
             old_agent.reset()
+            old_agent.close()
+
+    def configure_subagent_model(
+        self,
+        model: str,
+        api_key: str,
+        base_url: str | None = None,
+    ) -> None:
+        selected_model = model.strip()
+        selected_key = api_key.strip()
+        selected_base_url = base_url.strip() if base_url else None
+        if not selected_model or not selected_key:
+            raise ValueError("model and api_key must be non-empty")
+        old_agent = self._detach_runtime(preserve_history=True)
+        with self._lock:
+            self._assert_open()
+            self._subagent_model = selected_model
+            self._subagent_api_key = selected_key
+            self._subagent_base_url = selected_base_url
+        if old_agent is not None:
+            old_agent.close()
+
+    def clear_subagent_model(self) -> None:
+        old_agent = self._detach_runtime(preserve_history=True)
+        with self._lock:
+            self._subagent_model = ""
+            self._subagent_api_key = ""
+            self._subagent_base_url = None
+        if old_agent is not None:
             old_agent.close()
 
     def set_kind(self, kind: AgentKind) -> None:
@@ -310,6 +369,8 @@ class DeferredAgent:
             self._history.clear()
             self._api_key = ""
             self._base_url = None
+            self._subagent_api_key = ""
+            self._subagent_base_url = None
         if agent is not None:
             agent.close()
 
@@ -333,6 +394,9 @@ class DeferredAgent:
                     model=self._model,
                     api_key=self._api_key,
                     base_url=self._base_url,
+                    subagent_model=self._subagent_model,
+                    subagent_api_key=self._subagent_api_key,
+                    subagent_base_url=self._subagent_base_url,
                     cwd=self.cwd,
                     kind=self._kind,
                     stream_callback=self._stream_callback,
@@ -422,24 +486,58 @@ class ConversationController:
         return self.agent.kind
 
     @property
+    def subagent_model(self) -> str:
+        return self.agent.subagent_model
+
+    @property
     def has_started(self) -> bool:
         with self._lock:
             return self._has_started
 
     def set_model(self, record: ModelRecord) -> bool:
+        return self.set_agent_model("main", record)
+
+    def set_agent_model(
+        self,
+        role: AgentKind,
+        record: ModelRecord | None,
+    ) -> bool:
         with self._lock:
             if self._state != "idle":
-                self.last_error = "请求进行中，暂不能切换模型"
+                self.last_error = "请求进行中，暂不能修改 Agent 配置"
                 return False
-            self.agent.configure_model(record.name, record.api_key, record.base_url)
+            if role == "main":
+                if record is None:
+                    self.last_error = "主 Agent 必须选择模型"
+                    return False
+                self.agent.configure_model(record.name, record.api_key, record.base_url)
+            elif role == "sub":
+                if record is None:
+                    self.agent.clear_subagent_model()
+                else:
+                    self.agent.configure_subagent_model(
+                        record.name,
+                        record.api_key,
+                        record.base_url,
+                    )
+            else:
+                self.last_error = "Agent 配置类型无效"
+                return False
             self.last_error = ""
         return True
 
     def clear_deleted_model(self, name: str) -> bool:
         with self._lock:
-            if self._state != "idle" or self.agent.model != name:
+            if self._state != "idle":
                 return False
-            self.agent.clear_model()
+            clears_main = self.agent.model == name
+            clears_subagent = self.agent.subagent_model == name
+            if not clears_main and not clears_subagent:
+                return False
+            if clears_main:
+                self.agent.clear_model()
+            if clears_subagent:
+                self.agent.clear_subagent_model()
             self.last_error = "所选模型已删除，请重新选择模型"
         return True
 
@@ -658,6 +756,25 @@ class SessionManager:
             return True
         return False
 
+    def rename_session(self, session_id: int, title: str) -> bool:
+        session = next(
+            (item for item in self.sessions if item.session_id == session_id),
+            None,
+        )
+        if session is None:
+            self.last_error = "对话不存在"
+            return False
+        normalized = " ".join(title.split())
+        if not normalized:
+            self.last_error = "会话名称不能为空"
+            return False
+        if len(normalized) > 80:
+            self.last_error = "会话名称不能超过 80 个字符"
+            return False
+        session.title = normalized
+        self.last_error = ""
+        return True
+
     def close_session(self, session_id: int) -> bool:
         session = next(
             (item for item in self.sessions if item.session_id == session_id),
@@ -681,15 +798,33 @@ class SessionManager:
         return True
 
     def select_model(self, session_id: int, name: str) -> bool:
+        return self.configure_agent_model(session_id, "main", name)
+
+    def configure_agent_model(
+        self,
+        session_id: int,
+        role: AgentKind,
+        name: str | None,
+    ) -> bool:
         record = next((item for item in self._models if item.name == name), None)
         session = next(
             (item for item in self.sessions if item.session_id == session_id),
             None,
         )
-        if record is None or session is None:
+        if session is None:
+            self.last_error = "对话不存在"
+            return False
+        if role == "sub" and name is None:
+            selected = session.controller.set_agent_model(role, None)
+            self.last_error = session.controller.last_error
+            return selected
+        if role not in {"main", "sub"}:
+            self.last_error = "Agent 配置类型无效"
+            return False
+        if record is None:
             self.last_error = "模型不存在，请刷新后重试"
             return False
-        selected = session.controller.set_model(record)
+        selected = session.controller.set_agent_model(role, record)
         self.last_error = session.controller.last_error
         return selected
 
@@ -706,7 +841,10 @@ class SessionManager:
 
     def delete_model(self, name: str) -> bool:
         if any(
-            session.controller.model == name
+            (
+                session.controller.model == name
+                or session.controller.subagent_model == name
+            )
             and session.controller.state in {"busy", "closing"}
             for session in self.sessions
         ):
@@ -743,6 +881,9 @@ def create_runtime(
     model: str,
     api_key: str,
     base_url: str | None = None,
+    subagent_model: str = "",
+    subagent_api_key: str = "",
+    subagent_base_url: str | None = None,
     cwd: str | os.PathLike[str],
     kind: AgentKind,
     stream_callback: StreamCallback | None = None,
@@ -761,9 +902,31 @@ def create_runtime(
         options["base_url"] = base_url
     client = OpenAI(**options)
     factory = create_default_agent if kind == "main" else create_default_subagent
+    if kind == "sub" or not subagent_model:
+        return factory(
+            client,
+            config=config,
+            cwd=Path(cwd),
+            approval_callback=approval_callback,
+            stream_callback=stream_callback,
+        )
+
+    subagent_config = _config_from_environment(
+        subagent_model,
+        fallback_model,
+        file_config,
+    )
+    subagent_options = _client_options(file_config)
+    subagent_options["api_key"] = subagent_api_key
+    if subagent_base_url:
+        subagent_options["base_url"] = subagent_base_url
+    subagent_client = OpenAI(**subagent_options)
     return factory(
         client,
         config=config,
+        subagent_client=subagent_client,
+        subagent_model=subagent_config.model,
+        subagent_fallback_model=subagent_config.fallback_model,
         cwd=Path(cwd),
         approval_callback=approval_callback,
         stream_callback=stream_callback,

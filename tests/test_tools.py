@@ -1,11 +1,15 @@
+import os
+import subprocess
 import tempfile
 import threading
 import unittest
-from unittest.mock import patch
+from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 from myagent.tools import (
     BackgroundBashRunner,
     BashTool,
+    _resolve_bash_executable,
     build_default_tool_registry,
     is_dangerous_command,
 )
@@ -41,13 +45,135 @@ class DangerousCommandTests(unittest.TestCase):
 
 
 class BashToolTests(unittest.TestCase):
-    @patch("myagent.tools.subprocess.run")
-    def test_refusal_happens_before_subprocess(self, run) -> None:
+    @patch("myagent.tools.subprocess.Popen")
+    def test_refusal_happens_before_subprocess(self, popen) -> None:
         result = BashTool()("rm -rf /tmp/example")
 
         self.assertFalse(result["ok"])
         self.assertIn("refused", result["error"])
-        run.assert_not_called()
+        popen.assert_not_called()
+
+    def test_windows_prefers_git_bash_over_the_system_wsl_launcher(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            git_root = Path(temporary_directory) / "Git"
+            git_executable = git_root / "cmd" / "git.exe"
+            bash_executable = git_root / "bin" / "bash.exe"
+            direct_bash_executable = git_root / "usr" / "bin" / "bash.exe"
+            git_executable.parent.mkdir(parents=True)
+            bash_executable.parent.mkdir(parents=True)
+            direct_bash_executable.parent.mkdir(parents=True)
+            git_executable.touch()
+            bash_executable.touch()
+            direct_bash_executable.touch()
+
+            def which(name: str) -> str | None:
+                if name == "git":
+                    return str(git_executable)
+                if name == "bash":
+                    return r"C:\Windows\System32\bash.exe"
+                return None
+
+            with patch.dict(os.environ, {}, clear=True), patch(
+                "myagent.tools.sys.platform",
+                "win32",
+            ), patch("myagent.tools.shutil.which", side_effect=which):
+                selected = _resolve_bash_executable()
+
+        self.assertEqual(selected, str(direct_bash_executable))
+
+    def test_explicit_bash_override_wins(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"MYAGENT_BASH": r"D:\PortableGit\bin\bash.exe"},
+            clear=True,
+        ):
+            self.assertEqual(
+                _resolve_bash_executable(),
+                r"D:\PortableGit\bin\bash.exe",
+            )
+
+    @patch("myagent.tools._WindowsProcessJob.try_create", return_value=None)
+    @patch("myagent.tools.subprocess.Popen")
+    def test_none_process_output_is_normalized_to_empty_text(
+        self,
+        popen,
+        _try_create_job,
+    ) -> None:
+        process = popen.return_value
+        process.communicate.return_value = (None, None)
+        process.returncode = 0
+        executable = r"C:\Program Files\Git\bin\bash.exe"
+
+        result = BashTool(bash_executable=executable)("printf hello")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["stdout"], "")
+        self.assertEqual(result["stderr"], "")
+        self.assertIsNone(result["error"])
+        self.assertEqual(
+            popen.call_args.args[0],
+            [
+                executable,
+                "--noprofile",
+                "--norc",
+                "-c",
+                "printf hello",
+            ],
+        )
+        self.assertIs(popen.call_args.kwargs["stdin"], subprocess.DEVNULL)
+        self.assertEqual(popen.call_args.kwargs["encoding"], "utf-8")
+        process.communicate.assert_called_once_with(timeout=30)
+
+    @patch("myagent.tools._WindowsProcessJob.try_create", return_value=None)
+    @patch("myagent.tools.subprocess.Popen")
+    def test_nonzero_exit_has_a_clear_error(
+        self,
+        popen,
+        _try_create_job,
+    ) -> None:
+        process = popen.return_value
+        process.communicate.return_value = ("", "failed")
+        process.returncode = 7
+
+        result = BashTool(bash_executable="bash")("exit 7")
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["exit_code"], 7)
+        self.assertEqual(result["stderr"], "failed")
+        self.assertEqual(result["error"], "Command exited with code 7.")
+
+    @patch("myagent.tools._WindowsProcessJob.try_create")
+    @patch("myagent.tools.subprocess.Popen")
+    def test_timeout_terminates_the_owned_process_tree(
+        self,
+        popen,
+        try_create_job,
+    ) -> None:
+        process = popen.return_value
+        process.communicate.side_effect = [
+            subprocess.TimeoutExpired(
+                cmd=["bash", "-lc", "slow command"],
+                timeout=1,
+                output="partial output",
+            ),
+            ("partial output", ""),
+        ]
+        job = MagicMock()
+        job.terminate.return_value = None
+        try_create_job.return_value = job
+
+        result = BashTool(
+            bash_executable="bash",
+            timeout_seconds=1,
+        )("slow command")
+
+        self.assertFalse(result["ok"])
+        self.assertIsNone(result["exit_code"])
+        self.assertEqual(result["stdout"], "partial output")
+        self.assertEqual(result["error"], "Command timed out after 1 seconds.")
+        job.terminate.assert_called_once_with()
+        job.close.assert_called_once_with()
+        self.assertEqual(process.communicate.call_count, 2)
 
     def test_registry_rejects_empty_command_before_injected_handler(self) -> None:
         seen_commands = []
