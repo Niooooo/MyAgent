@@ -81,6 +81,7 @@ class DesktopSidecar:
                 "session.new": self._new_session,
                 "session.activate": self._activate_session,
                 "session.close": self._close_session,
+                "session.delete": self._delete_session,
                 "session.rename": self._rename_session,
                 "session.select_model": self._select_model,
                 "session.configure_agent_model": self._configure_agent_model,
@@ -88,6 +89,7 @@ class DesktopSidecar:
                 "model.register": self._register_model,
                 "model.delete": self._delete_model,
                 "model.refresh": self._refresh_models,
+                "settings.update": self._update_settings,
                 "approval.decide": self._decide_approval,
             }
             handler = handlers.get(method)
@@ -110,6 +112,9 @@ class DesktopSidecar:
                     for model in self.manager.models
                 ],
                 "modelError": self.manager.model_error,
+                "settings": self.manager.settings.public_dict(),
+                "settingsError": self.manager.settings_error,
+                "conversationError": self.manager.conversation_error,
                 "lastError": self.manager.last_error,
                 "closing": self._closing,
             }
@@ -153,6 +158,7 @@ class DesktopSidecar:
                     else:
                         session.messages.append(("错误", str(event.payload)))
                         session.status = "请求失败，可继续发送"
+                    self.manager.persist_completed_turn(session.session_id)
                     if close_ready:
                         session.controller.close_agent_once()
                     changed = True
@@ -282,6 +288,19 @@ class DesktopSidecar:
     def _refresh_models(self, _params: dict[str, Any]) -> ProtocolPayload:
         if not self.manager.refresh_models():
             raise ProtocolError(self.manager.model_error or "models could not be refreshed")
+        return {"state": self.snapshot()}
+
+    def _delete_session(self, params: dict[str, Any]) -> ProtocolPayload:
+        session_id = self._session_id(params)
+        if not self.manager.delete_session(session_id):
+            raise ProtocolError(self.manager.last_error or "conversation could not be deleted")
+        return {"state": self.snapshot()}
+
+    def _update_settings(self, params: dict[str, Any]) -> ProtocolPayload:
+        if not self.manager.update_settings(params):
+            raise ProtocolError(
+                self.manager.settings_error or "desktop settings could not be saved"
+            )
         return {"state": self.snapshot()}
 
     def _decide_approval(self, params: dict[str, Any]) -> ProtocolPayload:

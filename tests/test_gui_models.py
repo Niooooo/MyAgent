@@ -7,6 +7,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from myagent.gui_models import (
+    DesktopSettingsError,
+    DesktopSettingsStore,
     MAX_API_KEY_LENGTH,
     MAX_BASE_URL_LENGTH,
     MAX_MODEL_NAME_LENGTH,
@@ -15,6 +17,36 @@ from myagent.gui_models import (
     ModelValidationError,
     default_model_store_path,
 )
+
+
+class DesktopSettingsStoreTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "settings.json"
+        self.store = DesktopSettingsStore(self.path)
+
+    def test_defaults_round_trip_and_strict_integer_validation(self) -> None:
+        defaults = self.store.load()
+        self.store.save(defaults)
+        self.assertEqual(self.store.load(), defaults)
+        invalid = defaults.public_dict()
+        invalid["maxToolRounds"] = True
+        with self.assertRaisesRegex(DesktopSettingsError, "必须是整数"):
+            self.store.validate(invalid)
+
+    def test_corrupt_and_atomic_replace_failure_preserve_last_valid_file(self) -> None:
+        self.path.write_text("{broken", encoding="utf-8")
+        with self.assertRaisesRegex(DesktopSettingsError, "JSON 已损坏"):
+            self.store.load()
+        self.path.unlink()
+        defaults = self.store.load()
+        self.store.save(defaults)
+        old_bytes = self.path.read_bytes()
+        with patch("myagent.gui_models.os.replace", side_effect=OSError("locked")):
+            with self.assertRaisesRegex(DesktopSettingsError, "无法保存桌面设置"):
+                self.store.save(defaults)
+        self.assertEqual(self.path.read_bytes(), old_bytes)
 
 
 class ModelStoreTests(unittest.TestCase):

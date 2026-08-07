@@ -8,7 +8,7 @@ import os
 import queue
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Literal, Protocol
 
@@ -20,7 +20,15 @@ import customtkinter as ctk
 from .agent import AgentLoop, AgentLoopLimitError, StreamCallback
 from .cli import _client_options, _config_from_environment, _load_config
 from .composition import AgentConfig, create_default_agent, create_default_subagent
-from .gui_models import ModelRecord, ModelStore, ModelStoreError
+from .gui_conversations import ConversationStore, ConversationStoreError, SCHEMA_VERSION
+from .gui_models import (
+    DesktopSettings,
+    DesktopSettingsError,
+    DesktopSettingsStore,
+    ModelRecord,
+    ModelStore,
+    ModelStoreError,
+)
 from .permissions import ApprovalCallback, ApprovalRequest
 
 
@@ -185,6 +193,10 @@ class GUIAgent(Protocol):
 
     def set_stream_callback(self, callback: StreamCallback | None) -> None: ...
 
+    def snapshot_history(self) -> list[object]: ...
+
+    def restore_history(self, history: list[object]) -> None: ...
+
     def run(self, prompt: str) -> str: ...
 
     def reset(self) -> None: ...
@@ -207,6 +219,7 @@ class DeferredAgent:
         subagent_base_url: str | None = None,
         cwd: str | os.PathLike[str] | None = None,
         kind: AgentKind = "main",
+        settings: DesktopSettings | None = None,
         runtime_factory: RuntimeFactory | None = None,
     ) -> None:
         if kind not in AGENT_KIND_LABELS:
@@ -224,6 +237,7 @@ class DeferredAgent:
             raise ValueError("subagent_model and subagent_api_key must be configured together")
         self.cwd = Path(cwd or Path.cwd()).resolve()
         self._kind = kind
+        self._settings = settings or DesktopSettings.defaults()
         self._runtime_factory = runtime_factory or create_runtime
         self._stream_callback: StreamCallback | None = None
         self._agent: AgentLoop | None = None
@@ -264,10 +278,29 @@ class DeferredAgent:
             return tuple(
                 dict.fromkeys(
                     value
-                    for value in (self._api_key, self._subagent_api_key)
+                    for value in (
+                        self._api_key, self._base_url,
+                        self._subagent_api_key, self._subagent_base_url,
+                    )
                     if value
                 )
             )
+
+    def snapshot_history(self) -> list[object]:
+        """Return a thread-safe copy of the currently authoritative protocol history."""
+        with self._lock:
+            source = getattr(self._agent, "history", ()) if self._agent is not None else self._history
+            return list(source)
+
+    def restore_history(self, history: list[object]) -> None:
+        """Restore plain response input items before the lazy runtime is created."""
+        if not isinstance(history, list):
+            raise TypeError("history must be a list")
+        with self._lock:
+            self._assert_open()
+            if self._agent is not None:
+                raise RuntimeError("cannot restore history after runtime creation")
+            self._history = list(history)
 
     def configure_model(
         self,
@@ -290,7 +323,7 @@ class DeferredAgent:
             old_agent.close()
 
     def clear_model(self) -> None:
-        old_agent = self._detach_runtime(preserve_history=False)
+        old_agent = self._detach_runtime(preserve_history=True)
         with self._lock:
             self._model = ""
             self._api_key = ""
@@ -337,6 +370,23 @@ class DeferredAgent:
             self._kind = kind
         if old_agent is not None:
             old_agent.close()
+
+    def configure_settings(self, settings: DesktopSettings) -> None:
+        old_agent = self.swap_settings(settings)
+        if old_agent is not None:
+            old_agent.close()
+
+    def swap_settings(self, settings: DesktopSettings) -> AgentLoop | None:
+        """Commit settings without invoking fallible runtime cleanup."""
+        if not isinstance(settings, DesktopSettings):
+            raise TypeError("settings must be DesktopSettings")
+        with self._lock:
+            self._assert_open()
+            old_agent, self._agent = self._agent, None
+            if old_agent is not None:
+                self._history = list(getattr(old_agent, "history", ()))
+            self._settings = settings
+            return old_agent
 
     def set_stream_callback(self, callback: StreamCallback | None) -> None:
         if callback is not None and not callable(callback):
@@ -399,6 +449,7 @@ class DeferredAgent:
                     subagent_base_url=self._subagent_base_url,
                     cwd=self.cwd,
                     kind=self._kind,
+                    settings=self._settings,
                     stream_callback=self._stream_callback,
                 )
                 if self._history and hasattr(agent, "history"):
@@ -494,6 +545,13 @@ class ConversationController:
         with self._lock:
             return self._has_started
 
+    def restore_started(self, started: bool) -> None:
+        """Restore the kind-lock bit without creating a worker or runtime."""
+        with self._lock:
+            if self._state != "idle":
+                raise RuntimeError("can only restore an idle conversation")
+            self._has_started = bool(started)
+
     def set_model(self, record: ModelRecord) -> bool:
         return self.set_agent_model("main", record)
 
@@ -552,6 +610,21 @@ class ConversationController:
             self.agent.set_kind(kind)
             self.last_error = ""
         return True
+
+    def configure_settings(self, settings: DesktopSettings) -> bool:
+        with self._lock:
+            if self._state != "idle":
+                self.last_error = "请求进行中，暂不能修改运行设置"
+                return False
+            self.agent.configure_settings(settings)
+            self.last_error = ""
+        return True
+
+    def swap_settings(self, settings: DesktopSettings) -> AgentLoop | None:
+        with self._lock:
+            if self._state != "idle":
+                raise RuntimeError("请求进行中，暂不能修改运行设置")
+            return self.agent.swap_settings(settings)
 
     def submit(self, user_input: str) -> bool:
         prompt = user_input.strip()
@@ -666,6 +739,8 @@ class ConversationSession:
     status: str = "就绪"
     streaming: bool = False
     streaming_text: str = ""
+    _stable_messages: list[tuple[str, str]] = field(default_factory=list, repr=False)
+    _stable_history: list[object] = field(default_factory=list, repr=False)
 
 
 class SessionManager:
@@ -675,20 +750,46 @@ class SessionManager:
         self,
         *,
         store: ModelStore | None = None,
+        settings_store: DesktopSettingsStore | None = None,
+        conversation_store: ConversationStore | None = None,
         default_cwd: str | os.PathLike[str] | None = None,
         runtime_factory: RuntimeFactory | None = None,
     ) -> None:
         self.store = store or ModelStore()
+        self.settings_store = settings_store or DesktopSettingsStore(
+            self.store.path.with_name("settings.json")
+        )
+        self.conversation_store = conversation_store or ConversationStore(
+            self.store.path.with_name("conversations.json")
+        )
         self.default_cwd = Path(default_cwd or Path.cwd()).resolve()
         self.runtime_factory = runtime_factory
         self.sessions: list[ConversationSession] = []
         self.active_session_id = 0
         self.last_error = ""
         self.model_error = ""
+        self.settings_error = ""
+        self.conversation_error = ""
         self._next_id = 1
         self._models: list[ModelRecord] = []
+        try:
+            self.settings = self.settings_store.load()
+        except DesktopSettingsError as exc:
+            self.settings = DesktopSettings.defaults()
+            self.settings_error = str(exc)
         self.refresh_models()
-        self.new_session()
+        try:
+            saved = self.conversation_store.load()
+        except ConversationStoreError as exc:
+            self.conversation_error = str(exc)
+            self.last_error = self.conversation_error
+            self._create_session(self.default_cwd)
+        else:
+            if saved is None:
+                self._create_session(self.default_cwd)
+                self._persist()
+            else:
+                self._restore_conversations(saved)
 
     @property
     def active(self) -> ConversationSession:
@@ -722,28 +823,147 @@ class SessionManager:
         cwd: str | os.PathLike[str] | None = None,
     ) -> ConversationSession:
         workspace = Path(cwd or self.default_cwd).resolve()
+        previous_active = self.active_session_id
+        session = self._create_session(workspace)
+        if not self._persist():
+            self.sessions.remove(session)
+            self.active_session_id = previous_active
+            try:
+                session.controller.request_close()
+                session.controller.close_agent_once()
+            except Exception:
+                pass
+            raise ConversationStoreError(self.conversation_error)
+        self.last_error = ""
+        return session
+
+    def _create_session(
+        self,
+        workspace: Path,
+        *,
+        session_id: int | None = None,
+        title: str | None = None,
+        main_model: str = "",
+        sub_model: str = "",
+        kind: AgentKind = "main",
+        messages: list[tuple[str, str]] | None = None,
+        history: list[object] | None = None,
+    ) -> ConversationSession:
+        workspace = workspace.resolve()
         if not workspace.is_dir():
             raise ValueError(f"工作目录无效：{workspace}")
         events: queue.Queue[UIEvent] = queue.Queue()
         approvals = ApprovalBridge(events)
+        main_record = next((item for item in self._models if item.name == main_model), None)
+        sub_record = next((item for item in self._models if item.name == sub_model), None)
         agent = DeferredAgent(
             approvals.request,
+            model=main_record.name if main_record else "",
+            api_key=main_record.api_key if main_record else "",
+            base_url=main_record.base_url if main_record else None,
+            subagent_model=sub_record.name if sub_record else "",
+            subagent_api_key=sub_record.api_key if sub_record else "",
+            subagent_base_url=sub_record.base_url if sub_record else None,
             cwd=workspace,
+            kind=kind,
+            settings=self.settings,
             runtime_factory=self.runtime_factory,
         )
+        restored_history = list(history or [])
+        agent.restore_history(restored_history)
         controller = ConversationController(
             agent,
             events=events,
             approvals=approvals,
         )
-        session_id = self._next_id
-        self._next_id += 1
-        title = f"对话 {session_id} · {workspace.name or workspace.drive}"
-        session = ConversationSession(session_id, title, workspace, controller)
+        restored_messages = list(messages or [])
+        controller.restore_started(bool(restored_history or restored_messages))
+        selected_id = self._next_id if session_id is None else session_id
+        self._next_id = max(self._next_id, selected_id + 1)
+        selected_title = title or f"对话 {selected_id} · {workspace.name or workspace.drive}"
+        session = ConversationSession(
+            selected_id, selected_title, workspace, controller, restored_messages
+        )
+        session._stable_messages = list(restored_messages)
+        session._stable_history = list(restored_history)
+        missing = [name for name in (main_model, sub_model) if name and name not in self.model_names]
+        if missing:
+            session.status = "模型已缺失，请重新选择；历史已保留"
         self.sessions.append(session)
-        self.active_session_id = session_id
-        self.last_error = ""
+        self.active_session_id = selected_id
         return session
+
+    def _restore_conversations(self, saved: dict[str, Any]) -> None:
+        issues: list[str] = []
+        for item in saved["sessions"]:
+            workspace = Path(item["workspace"])
+            if not workspace.is_dir():
+                issues.append(f"已跳过不存在的工作目录：{workspace}")
+                continue
+            messages = [(entry["speaker"], entry["text"]) for entry in item["messages"]]
+            self._create_session(
+                workspace,
+                session_id=item["id"],
+                title=item["title"],
+                main_model=item["mainModel"],
+                sub_model=item["subModel"],
+                kind=item["kind"],
+                messages=messages,
+                history=list(item["history"]),
+            )
+            missing = [
+                name for name in (item["mainModel"], item["subModel"])
+                if name and name not in self.model_names
+            ]
+            if missing:
+                issues.append(f"对话 {item['id']} 的模型已缺失：{', '.join(missing)}")
+        self._next_id = max(saved["nextSessionId"], self._next_id)
+        if not self.sessions:
+            self._create_session(self.default_cwd)
+            issues.append("没有可恢复的工作目录，已创建安全空白对话")
+        restored_ids = {session.session_id for session in self.sessions}
+        self.active_session_id = (
+            saved["activeSessionId"]
+            if saved["activeSessionId"] in restored_ids
+            else self.sessions[0].session_id
+        )
+        if issues:
+            self.conversation_error = "；".join(issues)
+            self.last_error = self.conversation_error
+
+    def update_settings(self, values: object) -> bool:
+        try:
+            proposed = self.settings_store.validate(values)
+        except DesktopSettingsError as exc:
+            self.settings_error = str(exc)
+            self.last_error = self.settings_error
+            return False
+        if any(session.controller.state != "idle" for session in self.sessions):
+            self.settings_error = "有对话正在运行或关闭，暂不能保存运行设置"
+            self.last_error = self.settings_error
+            return False
+        try:
+            self.settings_store.save(proposed)
+        except DesktopSettingsError as exc:
+            self.settings_error = str(exc)
+            self.last_error = self.settings_error
+            return False
+        retired: list[AgentLoop] = []
+        for session in self.sessions:
+            old_agent = session.controller.swap_settings(proposed)
+            if old_agent is not None:
+                retired.append(old_agent)
+        self.settings = proposed
+        self.settings_error = ""
+        self.last_error = ""
+        # Cleanup is deliberately outside the committed state transition. A
+        # close failure cannot split persisted, manager, or per-session values.
+        for old_agent in retired:
+            try:
+                old_agent.close()
+            except Exception:
+                pass
+        return True
 
     def open_folder(self, selected: str | os.PathLike[str] | None) -> ConversationSession | None:
         if selected is None or not str(selected).strip():
@@ -752,7 +972,12 @@ class SessionManager:
 
     def activate(self, session_id: int) -> bool:
         if any(session.session_id == session_id for session in self.sessions):
+            previous = self.active_session_id
             self.active_session_id = session_id
+            if not self._persist():
+                self.active_session_id = previous
+                return False
+            self.last_error = ""
             return True
         return False
 
@@ -771,11 +996,16 @@ class SessionManager:
         if len(normalized) > 80:
             self.last_error = "会话名称不能超过 80 个字符"
             return False
+        previous = session.title
         session.title = normalized
+        if not self._persist():
+            session.title = previous
+            return False
         self.last_error = ""
         return True
 
     def close_session(self, session_id: int) -> bool:
+        """Permanently delete an idle conversation after the disk proposal commits."""
         session = next(
             (item for item in self.sessions if item.session_id == session_id),
             None,
@@ -788,14 +1018,26 @@ class SessionManager:
         if session.controller.state != "idle":
             self.last_error = "该对话正在运行，完成后才能关闭"
             return False
-        session.controller.request_close()
-        session.controller.close_agent_once()
         index = self.sessions.index(session)
+        remaining = [item for item in self.sessions if item is not session]
+        next_active = self.active_session_id
+        if next_active == session_id:
+            next_active = remaining[min(index, len(remaining) - 1)].session_id
+        if not self._persist(exclude_session_id=session_id, active_id=next_active):
+            return False
         self.sessions.remove(session)
-        if self.active_session_id == session_id:
-            self.active_session_id = self.sessions[min(index, len(self.sessions) - 1)].session_id
+        self.active_session_id = next_active
+        try:
+            session.controller.request_close()
+            session.controller.close_agent_once()
+        except Exception:
+            # The disk and owner transition already committed. Cleanup is
+            # intentionally best-effort and must never resurrect the record.
+            pass
         self.last_error = ""
         return True
+
+    delete_session = close_session
 
     def select_model(self, session_id: int, name: str) -> bool:
         return self.configure_agent_model(session_id, "main", name)
@@ -814,19 +1056,42 @@ class SessionManager:
         if session is None:
             self.last_error = "对话不存在"
             return False
-        if role == "sub" and name is None:
-            selected = session.controller.set_agent_model(role, None)
-            self.last_error = session.controller.last_error
-            return selected
         if role not in {"main", "sub"}:
             self.last_error = "Agent 配置类型无效"
             return False
-        if record is None:
+        if role == "main" and record is None:
             self.last_error = "模型不存在，请刷新后重试"
+            return False
+        if role == "sub" and name is not None and record is None:
+            self.last_error = "模型不存在，请刷新后重试"
+            return False
+        if session.controller.state != "idle":
+            self.last_error = "请求进行中，暂不能修改 Agent 配置"
+            return False
+        proposed_name = record.name if record is not None else ""
+        if not self._persist(model_overrides={(session_id, role): proposed_name}):
             return False
         selected = session.controller.set_agent_model(role, record)
         self.last_error = session.controller.last_error
         return selected
+
+    def set_kind(self, session_id: int, kind: AgentKind) -> bool:
+        session = next(
+            (item for item in self.sessions if item.session_id == session_id), None
+        )
+        if session is None:
+            self.last_error = "对话不存在"
+            return False
+        previous = session.controller.kind
+        if not session.controller.set_kind(kind):
+            self.last_error = session.controller.last_error
+            return False
+        if not self._persist():
+            # This rollback is safe because kind changes are allowed only before a turn.
+            session.controller.set_kind(previous)
+            return False
+        self.last_error = ""
+        return True
 
     def register_model(
         self,
@@ -850,14 +1115,132 @@ class SessionManager:
         ):
             self.last_error = "模型正在被运行中的对话使用，暂不能删除"
             return False
-        if not self.store.delete(name):
+        original_models = list(self._models)
+        if not any(record.name == name for record in original_models):
             self.last_error = "模型不存在"
+            return False
+        overrides: dict[tuple[int, AgentKind], str] = {}
+        for session in self.sessions:
+            if session.controller.model == name:
+                overrides[(session.session_id, "main")] = ""
+            if session.controller.subagent_model == name:
+                overrides[(session.session_id, "sub")] = ""
+        try:
+            deleted = self.store.delete(name)
+        except ModelStoreError as exc:
+            self.last_error = str(exc)
+            return False
+        if not deleted:
+            self.last_error = "模型不存在"
+            return False
+        if not self._persist(model_overrides=overrides):
+            try:
+                self.store._write(original_models)
+            except ModelStoreError as exc:
+                self.last_error = f"{self.conversation_error}；模型配置回滚失败：{exc}"
             return False
         for session in self.sessions:
             if session.controller.clear_deleted_model(name):
                 session.status = "所选模型已删除，请重新选择"
         self._models = self.store.load()
         self.last_error = ""
+        return True
+
+    def persist_completed_turn(self, session_id: int) -> bool:
+        session = next(
+            (item for item in self.sessions if item.session_id == session_id), None
+        )
+        if session is None:
+            self.last_error = "对话不存在"
+            return False
+        if session.controller.state not in {"idle", "closing"}:
+            self.last_error = "对话尚未完成，未保存临时历史"
+            return False
+        return self._persist(force_completed_session_id=session_id)
+
+    def _payload(
+        self,
+        *,
+        exclude_session_id: int | None = None,
+        active_id: int | None = None,
+        model_overrides: dict[tuple[int, AgentKind], str] | None = None,
+        force_completed_session_id: int | None = None,
+    ) -> dict[str, Any]:
+        sessions: list[dict[str, Any]] = []
+        for session in self.sessions:
+            if session.session_id == exclude_session_id:
+                continue
+            controller = session.controller
+            stable_only = controller.state != "idle" and session.session_id != force_completed_session_id
+            messages = session._stable_messages if stable_only else session.messages
+            history = (
+                session._stable_history
+                if stable_only
+                else controller.agent.snapshot_history()
+            )
+            sessions.append({
+                "id": session.session_id,
+                "title": session.title,
+                "workspace": str(session.workspace),
+                "mainModel": (model_overrides or {}).get((session.session_id, "main"), controller.model),
+                "subModel": (model_overrides or {}).get((session.session_id, "sub"), controller.subagent_model),
+                "kind": controller.kind,
+                "messages": [
+                    {"speaker": speaker, "text": text}
+                    for speaker, text in messages
+                ],
+                "history": history,
+            })
+        selected_active = active_id if active_id is not None else self.active_session_id
+        return {
+            "version": SCHEMA_VERSION,
+            "activeSessionId": selected_active,
+            "nextSessionId": self._next_id,
+            "sessions": sessions,
+        }
+
+    def _persist(
+        self,
+        *,
+        exclude_session_id: int | None = None,
+        active_id: int | None = None,
+        model_overrides: dict[tuple[int, AgentKind], str] | None = None,
+        force_completed_session_id: int | None = None,
+    ) -> bool:
+        payload = self._payload(
+            exclude_session_id=exclude_session_id,
+            active_id=active_id,
+            model_overrides=model_overrides,
+            force_completed_session_id=force_completed_session_id,
+        )
+        secrets = tuple(
+            secret
+            for values in (
+                *(session.controller.agent.sensitive_values for session in self.sessions),
+                *((record.api_key, record.base_url or "") for record in self._models),
+            )
+            for secret in values
+        )
+        previous_error = self.conversation_error
+        try:
+            self.conversation_store.save(payload, sensitive_values=secrets)
+        except ConversationStoreError as exc:
+            self.conversation_error = str(exc)
+            self.last_error = self.conversation_error
+            return False
+        self.conversation_error = ""
+        if previous_error and self.last_error == previous_error:
+            self.last_error = ""
+        for session in self.sessions:
+            if (
+                session.session_id != exclude_session_id
+                and (
+                    session.controller.state == "idle"
+                    or session.session_id == force_completed_session_id
+                )
+            ):
+                session._stable_messages = list(session.messages)
+                session._stable_history = session.controller.agent.snapshot_history()
         return True
 
     def begin_close_all(self) -> bool:
@@ -886,6 +1269,7 @@ def create_runtime(
     subagent_base_url: str | None = None,
     cwd: str | os.PathLike[str],
     kind: AgentKind,
+    settings: DesktopSettings | None = None,
     stream_callback: StreamCallback | None = None,
 ) -> AgentLoop:
     """Create a runtime using only this session's registered credentials."""
@@ -893,6 +1277,16 @@ def create_runtime(
     defaults = AgentConfig()
     fallback_model = file_config.get("fallback_model", defaults.fallback_model)
     config = _config_from_environment(model, fallback_model, file_config)
+    selected_settings = settings or DesktopSettings.defaults()
+    if settings is not None:
+        config = replace(
+            config,
+            max_tool_rounds=selected_settings.max_tool_rounds,
+            bash_timeout_seconds=selected_settings.bash_timeout_seconds,
+            todo_reminder_tool_calls=selected_settings.todo_reminder_tool_calls,
+            subagent_max_workers=selected_settings.subagent_max_workers,
+            subagent_max_tasks=selected_settings.subagent_max_tasks,
+        )
 
     from openai import OpenAI
 
@@ -916,6 +1310,15 @@ def create_runtime(
         fallback_model,
         file_config,
     )
+    if settings is not None:
+        subagent_config = replace(
+            subagent_config,
+            max_tool_rounds=selected_settings.max_tool_rounds,
+            bash_timeout_seconds=selected_settings.bash_timeout_seconds,
+            todo_reminder_tool_calls=selected_settings.todo_reminder_tool_calls,
+            subagent_max_workers=selected_settings.subagent_max_workers,
+            subagent_max_tasks=selected_settings.subagent_max_tasks,
+        )
     subagent_options = _client_options(file_config)
     subagent_options["api_key"] = subagent_api_key
     if subagent_base_url:
@@ -1643,10 +2046,16 @@ class MyAgentWindow:
             self.show_conversation()
             self._rebuild_tabs()
             self._render_active()
+        elif self.manager.last_error:
+            self.status.set(self.manager.last_error)
 
     def new_session(self) -> None:
         self._save_draft()
-        self.manager.new_session()
+        try:
+            self.manager.new_session()
+        except ConversationStoreError as exc:
+            self.status.set(str(exc))
+            return
         self.show_conversation()
         self._rebuild_tabs()
         self._render_active()
@@ -1658,7 +2067,7 @@ class MyAgentWindow:
         try:
             self._save_draft()
             self.manager.open_folder(selected)
-        except ValueError as exc:
+        except (ValueError, ConversationStoreError) as exc:
             self.status.set(str(exc))
             return
         self.show_conversation()
@@ -2028,9 +2437,9 @@ class MyAgentWindow:
     def _on_kind_selected(self, _selection: object | None = None) -> None:
         session = self.manager.active
         kind = LABEL_AGENT_KINDS[self.kind_value.get()]
-        if not session.controller.set_kind(kind):
+        if not self.manager.set_kind(session.session_id, kind):
             self.kind_value.set(AGENT_KIND_LABELS[session.controller.kind])
-            self.status.set(session.controller.last_error)
+            self.status.set(self.manager.last_error)
             return
         session.status = f"Agent：{AGENT_KIND_LABELS[kind]}"
         self.status.set(session.status)
@@ -2111,6 +2520,10 @@ class MyAgentWindow:
                 else:
                     session.messages.append(("错误", str(event.payload)))
                     session.status = "请求失败，可继续发送"
+                if not self.manager.persist_completed_turn(
+                    session.session_id
+                ):
+                    session.status = self.manager.conversation_error or self.manager.last_error
                 if close_ready:
                     session.controller.close_agent_once()
                 if session.session_id == self.manager.active_session_id:
