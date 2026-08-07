@@ -28,6 +28,31 @@ def response(
     return SimpleNamespace(output=output, output_text=output_text, **fields)
 
 
+class FakeStream:
+    def __init__(self, events: list[object]) -> None:
+        self._events = events
+        self.closed = False
+
+    def __iter__(self):
+        return iter(self._events)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def response_stream(
+    final_response: SimpleNamespace,
+    *deltas: str,
+    final_event_type: str = "response.completed",
+) -> FakeStream:
+    return FakeStream(
+        [
+            *(SimpleNamespace(type="response.output_text.delta", delta=item) for item in deltas),
+            SimpleNamespace(type=final_event_type, response=final_response),
+        ]
+    )
+
+
 class FakeAPIError(RuntimeError):
     def __init__(
         self,
@@ -43,11 +68,11 @@ class FakeAPIError(RuntimeError):
 
 
 class FakeResponses:
-    def __init__(self, responses: list[SimpleNamespace | BaseException]) -> None:
+    def __init__(self, responses: list[object | BaseException]) -> None:
         self._responses = iter(responses)
         self.requests: list[dict[str, Any]] = []
 
-    def create(self, **kwargs: Any) -> SimpleNamespace:
+    def create(self, **kwargs: Any) -> object:
         # A real request consumes the input at call time. Keep the same semantics
         # here so later in-place history compaction cannot rewrite test evidence.
         self.requests.append(copy.deepcopy(kwargs))

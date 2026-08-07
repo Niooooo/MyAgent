@@ -61,6 +61,7 @@ CONTINUATION_PROMPT = (
 )
 
 InstructionsProvider = Callable[[], str]
+StreamCallback = Callable[[str, str], None]
 
 
 class AgentLoopLimitError(RuntimeError):
@@ -126,6 +127,7 @@ class AgentLoop:
         background_bash_runner: BackgroundBashRunner | None = None,
         scheduled_task_runtime: ScheduledTaskRuntime | None = None,
         inbox_reader: InboxReader | None = None,
+        stream_callback: StreamCallback | None = None,
         close_callback: Callable[[], None] | None = None,
     ) -> None:
         if max_tool_rounds < 0:
@@ -138,6 +140,8 @@ class AgentLoop:
             raise TypeError("instructions_provider must be callable")
         if inbox_reader is not None and not callable(inbox_reader):
             raise TypeError("inbox_reader must be callable")
+        if stream_callback is not None and not callable(stream_callback):
+            raise TypeError("stream_callback must be callable")
         if context_memory is not None and not isinstance(
             context_memory,
             ContextMemory,
@@ -198,6 +202,7 @@ class AgentLoop:
         self.scheduled_task_runtime = scheduled_task_runtime
         self.mcp_runtime = None
         self.inbox_reader = inbox_reader
+        self.stream_callback = stream_callback
         if tool_registry is not None:
             if hooks is not None and tool_registry.hooks is not hooks:
                 raise ValueError(
@@ -377,6 +382,7 @@ class AgentLoop:
                     ),
                 }
             ],
+            stream_to_callback=False,
         )
         summary = response.output_text.strip()
         if not summary:
@@ -390,6 +396,7 @@ class AgentLoop:
         instructions: str,
         tools: list[dict[str, Any]],
         input: list[object],
+        stream_to_callback: bool = True,
     ) -> ModelResponse:
         request = {
             "model": model,
@@ -400,6 +407,7 @@ class AgentLoop:
         first = self._create_with_transient_retries(
             **request,
             max_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS,
+            stream_to_callback=stream_to_callback,
         )
         if not _is_output_truncated(first):
             return first
@@ -407,6 +415,7 @@ class AgentLoop:
         expanded = self._create_with_transient_retries(
             **request,
             max_output_tokens=EXPANDED_MAX_OUTPUT_TOKENS,
+            stream_to_callback=stream_to_callback,
         )
         if not _is_output_truncated(expanded):
             return expanded
@@ -421,14 +430,22 @@ class AgentLoop:
             input=[{"role": "user", "content": CONTINUATION_PROMPT}],
             previous_response_id=response_id,
             max_output_tokens=EXPANDED_MAX_OUTPUT_TOKENS,
+            stream_to_callback=stream_to_callback,
         )
         if getattr(continuation, "status", None) == "incomplete":
             raise RuntimeError("The response continuation did not complete")
         return _merge_responses(expanded, continuation)
 
-    def _create_with_transient_retries(self, **request: Any) -> ModelResponse:
+    def _create_with_transient_retries(
+        self,
+        *,
+        stream_to_callback: bool = True,
+        **request: Any,
+    ) -> ModelResponse:
         for retry_number in range(MAX_TRANSIENT_RETRIES + 1):
             try:
+                if self.stream_callback is not None and stream_to_callback:
+                    return self._create_streaming_response(request)
                 return self.client.responses.create(**request)
             except Exception as exc:
                 status_code = getattr(exc, "status_code", None)
@@ -443,6 +460,42 @@ class AgentLoop:
                     else request["model"]
                 )
         raise AssertionError("unreachable")
+
+    def _create_streaming_response(self, request: Mapping[str, Any]) -> ModelResponse:
+        callback = self.stream_callback
+        if callback is None:
+            return self.client.responses.create(**request)
+
+        callback("start", "")
+        stream = self.client.responses.create(**request, stream=True)
+        if hasattr(stream, "output") and hasattr(stream, "output_text"):
+            # Some compatible providers accept but ignore ``stream=True``.
+            return cast(ModelResponse, stream)
+
+        completed: ModelResponse | None = None
+        try:
+            for event in stream:
+                event_type = _event_field(event, "type")
+                if event_type == "response.output_text.delta":
+                    delta = _event_field(event, "delta")
+                    if isinstance(delta, str) and delta:
+                        callback("delta", delta)
+                elif event_type in {"response.completed", "response.incomplete"}:
+                    response = _event_field(event, "response")
+                    if response is not None:
+                        completed = cast(ModelResponse, response)
+                elif event_type in {"response.failed", "error"}:
+                    raise RuntimeError(_stream_error_message(event))
+        finally:
+            close = getattr(stream, "close", None)
+            if callable(close):
+                close()
+
+        if completed is None:
+            raise RuntimeError(
+                "Streaming response ended without a completed response event"
+            )
+        return completed
 
     def _effective_instructions(self) -> str:
         provider = self.instructions_provider
@@ -557,6 +610,28 @@ class AgentLoop:
                 raise
             if hasattr(failure, "add_note"):
                 failure.add_note(f"A Stop hook also failed: {exc}")
+
+
+def _event_field(value: object, name: str) -> object:
+    if isinstance(value, Mapping):
+        return value.get(name)
+    return getattr(value, name, None)
+
+
+def _stream_error_message(event: object) -> str:
+    candidates = [event]
+    response = _event_field(event, "response")
+    if response is not None:
+        candidates.append(response)
+    for candidate in tuple(candidates):
+        error = _event_field(candidate, "error")
+        if error is not None:
+            candidates.append(error)
+    for candidate in candidates:
+        message = _event_field(candidate, "message")
+        if isinstance(message, str) and message.strip():
+            return message
+    return "The streaming response failed"
 
 
 def _combine_instructions_providers(

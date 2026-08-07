@@ -15,6 +15,7 @@ from .agent import (
     AgentLoop,
     InstructionsProvider,
     ResponsesClient,
+    StreamCallback,
 )
 from .filesystem import WorkspaceFiles, WorkspaceRoot, filesystem_tools
 from .hooks import HookRegistry, PreToolUse
@@ -688,14 +689,17 @@ def create_default_agent(
     client: ResponsesClient,
     *,
     config: AgentConfig | None = None,
+    cwd: str | os.PathLike[str] | None = None,
     approval_callback: ApprovalCallback | None = None,
     hooks: HookRegistry | None = None,
     mcp_client_target_factory: ClientTargetFactory | None = None,
+    stream_callback: StreamCallback | None = None,
 ) -> AgentLoop:
     """Create one fully connected default agent for an application boundary."""
     selected = config if config is not None else AgentConfig()
     components = build_default_components(
         client=client,
+        cwd=cwd,
         bash_timeout_seconds=selected.bash_timeout_seconds,
         allowed_tools=selected.allowed_tools,
         approval_callback=approval_callback,
@@ -723,6 +727,7 @@ def create_default_agent(
             background_bash_runner=components.background_bash_runner,
             scheduled_task_runtime=components.scheduled_task_runtime,
             inbox_reader=components.inbox_reader,
+            stream_callback=stream_callback,
             close_callback=components.close,
         )
     except BaseException:
@@ -735,5 +740,73 @@ def create_default_agent(
     agent.task_store = components.task_store
     agent.scheduled_task_runtime = components.scheduled_task_runtime
     agent.agent_team_manager = components.agent_team_manager
+    agent.mcp_runtime = components.mcp_runtime
+    return agent
+
+
+def create_default_subagent(
+    client: ResponsesClient,
+    *,
+    config: AgentConfig | None = None,
+    cwd: str | os.PathLike[str] | None = None,
+    approval_callback: ApprovalCallback | None = None,
+    hooks: HookRegistry | None = None,
+    mcp_client_target_factory: ClientTargetFactory | None = None,
+    stream_callback: StreamCallback | None = None,
+) -> AgentLoop:
+    """Create one isolated standalone sub-agent for an application boundary.
+
+    Unlike :func:`create_default_agent`, this factory does not construct the
+    SubAgent, Scheduled Task, Agent Team, or Worktree management runtimes.  Its
+    ordinary tools still use the standard registry, permission hook, handlers,
+    and post-tool hooks assembled by the composition root.
+    """
+    selected = config if config is not None else AgentConfig()
+    if selected.allowed_tools is None:
+        allowed_tools = DEFAULT_TOOL_ALLOWLIST
+    else:
+        allowed_tools = selected.allowed_tools
+    isolated_tools = frozenset(allowed_tools).difference(
+        SUBAGENT_TOOL_NAMES
+        | SCHEDULED_TASK_TOOL_NAMES
+        | AGENT_TEAM_TOOL_NAMES
+        | WORKTREE_TOOL_NAMES
+    )
+    components = build_default_components(
+        cwd=cwd,
+        bash_timeout_seconds=selected.bash_timeout_seconds,
+        allowed_tools=isolated_tools,
+        approval_callback=approval_callback,
+        hooks=hooks,
+        todo_reminder_tool_calls=selected.todo_reminder_tool_calls,
+        model=selected.model,
+        fallback_model=selected.fallback_model,
+        max_tool_rounds=selected.max_tool_rounds,
+        memory_config=selected.memory,
+        mcp_servers=selected.mcp_servers,
+        mcp_client_target_factory=mcp_client_target_factory,
+    )
+    try:
+        agent = AgentLoop(
+            client,
+            model=selected.model,
+            fallback_model=selected.fallback_model,
+            instructions=DEFAULT_INSTRUCTIONS + _SUBAGENT_INSTRUCTIONS_SUFFIX,
+            max_tool_rounds=selected.max_tool_rounds,
+            tool_registry=components.tool_registry,
+            hooks=components.hooks,
+            instructions_provider=components.instructions_provider,
+            context_memory=components.context_memory,
+            stream_callback=stream_callback,
+            close_callback=components.close,
+        )
+    except BaseException:
+        components.close()
+        raise
+    agent.todo_list = components.todo_list
+    agent.skill_store = components.skill_store
+    agent.long_term_memory_store = components.long_term_memory_store
+    agent.task_store = components.task_store
+    agent.agent_team_manager = None
     agent.mcp_runtime = components.mcp_runtime
     return agent

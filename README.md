@@ -11,6 +11,25 @@
 
 每轮都会保留完整的 `response.output`，因此 reasoning item 也会正确传回后续请求。
 
+## 桌面工作台
+
+桌面入口使用 Electron 渲染本地 Web UI，并通过受限 preload 与 JSON Lines sidecar 调用现有 Python 会话运行链。模型凭据不进入 renderer 状态；Agent 运行、权限审批与关闭语义仍由 Python 的 `SessionManager`、`ConversationController` 和默认 composition root 负责。
+
+桌面会话使用 Responses API 流事件增量显示模型文本，并在完成事件到达后用最终响应替换临时消息。历史压缩和内部子 Agent 不会写入主会话的可见流；跨分片出现的模型 API Key 也会在进入 renderer 前脱敏。
+
+首次使用需要 Python 3.11+ 与 Node.js 22.12+：
+
+```powershell
+cd desktop
+npm install
+cd ..
+.\start_gui.cmd
+```
+
+`start_gui.cmd --check` 执行 Electron 与 sidecar 启动检查；`--tk` 可临时使用保留的 Tk 回退界面，`--tk-check` 只检查该回退入口。Electron 窗口使用 MyAgent 自有 AppUserModelID 与运行时生成的 MyAgent 图标，不再以 Python 图标标识主桌面进程。
+
+“添加模型”支持为每条记录填写可选 `Base URL`。留空时沿用 `OPENAI_BASE_URL`、`myagent.config.json` 或 OpenAI SDK 默认地址；填写后只覆盖该模型的连接地址。旧版 `models.json` 会按空 `Base URL` 兼容读取。
+
 ## 架构与模块边界
 
 默认运行时通过 `composition.py` 统一创建和连接组件，CLI 不再把具体工具逐个塞进 Agent Loop：

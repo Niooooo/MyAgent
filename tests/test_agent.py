@@ -14,7 +14,13 @@ from myagent.tasks import TASK_TOOL_NAMES
 from myagent.tooling import FunctionTool, ToolExecutionError, ToolRegistry
 from myagent.tools import BackgroundBashRunner, build_background_bash_function_tool
 from myagent.worktrees import WORKTREE_TOOL_NAMES
-from tests.fakes import FakeAPIError, FakeResponses, function_call, response
+from tests.fakes import (
+    FakeAPIError,
+    FakeResponses,
+    function_call,
+    response,
+    response_stream,
+)
 
 
 class AgentLoopTests(unittest.TestCase):
@@ -36,6 +42,52 @@ class AgentLoopTests(unittest.TestCase):
 
         self.assertEqual(agent.run("answer"), "done")
         self.assertEqual(responses.requests[0]["max_output_tokens"], 16_384)
+        self.assertNotIn("stream", responses.requests[0])
+
+    def test_stream_callback_receives_text_deltas_and_completed_response(self) -> None:
+        stream = response_stream(response([], "你好"), "你", "好")
+        responses = FakeResponses([stream])
+        events: list[tuple[str, str]] = []
+        agent = AgentLoop(
+            SimpleNamespace(responses=responses),
+            tool_registry=ToolRegistry(),
+            stream_callback=lambda kind, text: events.append((kind, text)),
+        )
+
+        self.assertEqual(agent.run("问候"), "你好")
+        self.assertEqual(events, [("start", ""), ("delta", "你"), ("delta", "好")])
+        self.assertTrue(responses.requests[0]["stream"])
+        self.assertTrue(stream.closed)
+
+    def test_each_tool_round_restarts_the_visible_stream(self) -> None:
+        first = response_stream(response([function_call()]))
+        second = response_stream(response([], "完成"), "完", "成")
+        responses = FakeResponses([first, second])
+        events: list[tuple[str, str]] = []
+        agent = AgentLoop(
+            SimpleNamespace(responses=responses),
+            bash_tool=lambda _command: {"ok": True},
+            stream_callback=lambda kind, text: events.append((kind, text)),
+        )
+
+        self.assertEqual(agent.run("执行"), "完成")
+        self.assertEqual(
+            events,
+            [("start", ""), ("start", ""), ("delta", "完"), ("delta", "成")],
+        )
+
+    def test_history_summary_stays_internal_when_visible_streaming_is_enabled(self) -> None:
+        responses = FakeResponses([response([], "摘要")])
+        events: list[tuple[str, str]] = []
+        agent = AgentLoop(
+            SimpleNamespace(responses=responses),
+            tool_registry=ToolRegistry(),
+            stream_callback=lambda kind, text: events.append((kind, text)),
+        )
+
+        self.assertEqual(agent._request_history_summary("旧内容", 20), "摘要")
+        self.assertEqual(events, [])
+        self.assertNotIn("stream", responses.requests[0])
 
     def test_executes_tool_and_returns_final_text(self) -> None:
         reasoning = SimpleNamespace(type="reasoning")
