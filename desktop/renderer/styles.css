@@ -155,6 +155,19 @@ dialog {
   color: #6f9fff;
 }
 
+#settings-dialog form {
+  width: min(520px, calc(100vw - 48px));
+}
+
+#settings-form > label {
+  grid-template-columns: minmax(0, 1fr) 140px;
+  align-items: center;
+}
+
+#settings-form input {
+  text-align: right;
+}
+
 .header-workspace {
   min-width: 0;
   overflow: hidden;
@@ -372,6 +385,15 @@ dialog {
 .tab-context-menu button:focus-visible {
   outline: 0;
   background: var(--raised);
+}
+
+.tab-context-menu button.danger {
+  color: #ff8b8b;
+}
+
+.tab-context-menu button.danger:hover,
+.tab-context-menu button.danger:focus-visible {
+  background: #3a2023;
 }
 
 #page-host,

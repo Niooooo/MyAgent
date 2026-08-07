@@ -27,6 +27,7 @@ from myagent.gui import (
     main,
 )
 from myagent.gui_models import ModelRecord, ModelStore
+from myagent.gui_conversations import ConversationStoreError
 from myagent.permissions import ApprovalRequest
 
 
@@ -470,6 +471,262 @@ class SessionManagerTests(unittest.TestCase):
         self.assertIn("不能为空", self.manager.last_error)
         self.assertFalse(self.manager.rename_session(session.session_id, "x" * 81))
         self.assertIn("80", self.manager.last_error)
+
+    def test_sessions_restore_order_active_models_kind_messages_and_history(self) -> None:
+        self.manager.register_model("one", "key-one", "https://one.example/v1")
+        self.manager.register_model("two", "key-two")
+        first = self.manager.active
+        self.assertTrue(self.manager.select_model(first.session_id, "one"))
+        first_history = [
+            {"role": "user", "content": "first"},
+            {"type": "reasoning", "id": "reason-1", "summary": []},
+            {"type": "function_call", "call_id": "call-1", "name": "inspect"},
+            {"type": "function_call_output", "call_id": "call-1", "output": "ok"},
+        ]
+        first.controller.agent.restore_history(first_history)
+        first.messages.extend([("你", "first"), ("MyAgent", "done")])
+        self.assertTrue(self.manager.persist_completed_turn(first.session_id))
+
+        second = self.manager.new_session(self.workspace_b)
+        self.assertTrue(self.manager.select_model(second.session_id, "two"))
+        self.assertTrue(self.manager.set_kind(second.session_id, "sub"))
+        second.controller.agent.restore_history([{"role": "user", "content": "second"}])
+        second.messages.append(("你", "second"))
+        self.assertTrue(self.manager.persist_completed_turn(second.session_id))
+        self.assertTrue(self.manager.rename_session(first.session_id, "第一段对话"))
+        self.assertTrue(self.manager.activate(first.session_id))
+
+        factory = RuntimeFactory()
+        restored = SessionManager(
+            store=self.store,
+            default_cwd=self.workspace_a,
+            runtime_factory=factory,
+        )
+        self.addCleanup(restored.begin_close_all)
+        self.assertEqual([item.session_id for item in restored.sessions], [1, 2])
+        self.assertEqual(restored.active_session_id, 1)
+        restored_first, restored_second = restored.sessions
+        self.assertEqual(restored_first.title, "第一段对话")
+        self.assertEqual(restored_first.controller.model, "one")
+        self.assertEqual(restored_second.controller.model, "two")
+        self.assertEqual(restored_second.controller.kind, "sub")
+        self.assertEqual(restored_first.messages[-1], ("MyAgent", "done"))
+        self.assertEqual(restored_first.controller.agent.snapshot_history(), first_history)
+        self.assertTrue(restored_first.controller.has_started)
+        self.assertFalse(restored_first.controller.set_kind("sub"))
+        self.assertTrue(restored_first.controller.submit("continue"))
+        consume(restored_first.controller)
+        self.assertEqual(factory.runtimes[0].history[: len(first_history)], first_history)
+        self.assertEqual(restored.new_session(self.workspace_a).session_id, 3)
+        serialized = restored.conversation_store.path.read_text(encoding="utf-8")
+        self.assertNotIn("key-one", serialized)
+        self.assertNotIn("key-two", serialized)
+
+    def test_delete_store_failure_keeps_memory_and_runtime_owner(self) -> None:
+        first = self.manager.active
+        second = self.manager.new_session(self.workspace_b)
+        with patch.object(
+            self.manager.conversation_store,
+            "save",
+            side_effect=ConversationStoreError("disk unavailable"),
+        ):
+            self.assertFalse(self.manager.close_session(second.session_id))
+        self.assertEqual(self.manager.sessions, [first, second])
+        self.assertEqual(second.controller.state, "idle")
+        self.assertIn("disk unavailable", self.manager.conversation_error)
+
+    def test_busy_turn_is_not_committed_by_an_unrelated_session_change(self) -> None:
+        self.manager.register_model("one", "key-one")
+        first = self.manager.active
+        self.assertTrue(self.manager.select_model(first.session_id, "one"))
+        self.factory.next_block = True
+        self.assertTrue(first.controller.submit("unfinished"))
+        self.assertTrue(self.factory.runtimes[0].started.wait(1))
+        first.messages.append(("你", "unfinished"))
+
+        self.manager.new_session(self.workspace_b)
+        saved_first = self.manager.conversation_store.load()["sessions"][0]
+        self.assertEqual(saved_first["messages"], [])
+        self.assertEqual(saved_first["history"], [])
+
+        self.factory.runtimes[0].release.set()
+        consume(first.controller)
+
+    def test_conversation_rejects_all_registered_keys_and_base_urls(self) -> None:
+        self.manager.register_model("selected", "selected-key", "https://selected.test/v1")
+        self.manager.register_model("other", "other-key", "https://other.test/v1")
+        session = self.manager.active
+        self.assertTrue(self.manager.select_model(session.session_id, "selected"))
+        secrets = "selected-key https://selected.test/v1 other-key https://other.test/v1"
+        session.messages.append(("你", secrets))
+        session.controller.agent.restore_history([{"role": "user", "content": secrets}])
+        self.assertFalse(self.manager.persist_completed_turn(session.session_id))
+        serialized = self.manager.conversation_store.path.read_text(encoding="utf-8")
+        for secret in (
+            "selected-key", "https://selected.test/v1",
+            "other-key", "https://other.test/v1",
+        ):
+            self.assertNotIn(secret, serialized)
+
+    def test_model_save_failure_keeps_loaded_main_and_sub_runtime(self) -> None:
+        self.manager.register_model("one", "key-one")
+        self.manager.register_model("two", "key-two")
+        session = self.manager.active
+        self.assertTrue(self.manager.select_model(session.session_id, "one"))
+        self.assertTrue(session.controller.submit("first"))
+        consume(session.controller)
+        runtime = self.factory.runtimes[0]
+        history = list(runtime.history)
+        with patch.object(
+            self.manager.conversation_store,
+            "save",
+            side_effect=ConversationStoreError("disk unavailable"),
+        ):
+            self.assertFalse(self.manager.select_model(session.session_id, "two"))
+            self.assertFalse(
+                self.manager.configure_agent_model(session.session_id, "sub", "two")
+            )
+        self.assertEqual(session.controller.model, "one")
+        self.assertEqual(session.controller.subagent_model, "")
+        self.assertTrue(session.controller.agent.loaded)
+        self.assertEqual(runtime.history, history)
+        self.assertEqual(runtime.close_calls, 0)
+
+    def test_closing_terminal_is_persisted_before_runtime_close(self) -> None:
+        self.manager.register_model("one", "key-one")
+        session = self.manager.active
+        self.assertTrue(self.manager.select_model(session.session_id, "one"))
+        self.factory.next_block = True
+        self.assertTrue(session.controller.submit("finish during shutdown"))
+        session.messages.append(("你", "finish during shutdown"))
+        self.assertTrue(self.factory.runtimes[0].started.wait(1))
+        self.assertFalse(self.manager.begin_close_all())
+        self.factory.runtimes[0].release.set()
+        event = next_result(session.controller)
+        self.assertTrue(session.controller.consume_result())
+        session.messages.append(("MyAgent", str(event.payload)))
+        self.assertTrue(self.manager.persist_completed_turn(session.session_id))
+        session.controller.close_agent_once()
+        persisted = self.manager.conversation_store.load()["sessions"][0]
+        self.assertEqual(len(persisted["messages"]), 2)
+        self.assertEqual(persisted["history"][-1]["role"], "assistant")
+
+    def test_two_closing_terminals_survive_sequential_saves_and_restart(self) -> None:
+        self.manager.register_model("one", "key-one")
+        first = self.manager.active
+        second = self.manager.new_session(self.workspace_b)
+        self.assertTrue(self.manager.select_model(first.session_id, "one"))
+        self.assertTrue(self.manager.select_model(second.session_id, "one"))
+        for session in (first, second):
+            self.factory.next_block = True
+            self.assertTrue(session.controller.submit(f"turn-{session.session_id}"))
+            session.messages.append(("你", f"turn-{session.session_id}"))
+        self.assertFalse(self.manager.begin_close_all())
+        for index, session in enumerate((first, second)):
+            runtime = self.factory.runtimes[index]
+            self.assertTrue(runtime.started.wait(1))
+            runtime.release.set()
+            event = next_result(session.controller)
+            self.assertTrue(session.controller.consume_result())
+            session.messages.append(("MyAgent", str(event.payload)))
+            self.assertTrue(self.manager.persist_completed_turn(session.session_id))
+            session.controller.close_agent_once()
+        restored = SessionManager(
+            store=self.store,
+            default_cwd=self.workspace_a,
+            runtime_factory=RuntimeFactory(),
+        )
+        self.addCleanup(restored.begin_close_all)
+        self.assertEqual([len(item.messages) for item in restored.sessions], [2, 2])
+        self.assertEqual(
+            [len(item.controller.agent.snapshot_history()) for item in restored.sessions],
+            [2, 2],
+        )
+
+    def test_delete_model_save_failure_rolls_back_store_and_loaded_runtime(self) -> None:
+        self.manager.register_model("one", "key-one")
+        session = self.manager.active
+        self.assertTrue(self.manager.select_model(session.session_id, "one"))
+        self.assertTrue(session.controller.submit("remember"))
+        consume(session.controller)
+        runtime = self.factory.runtimes[0]
+        history = list(runtime.history)
+        original_models = self.store.path.read_bytes()
+        original_conversations = self.manager.conversation_store.path.read_bytes()
+        with patch.object(
+            self.manager.conversation_store,
+            "save",
+            side_effect=ConversationStoreError("disk unavailable"),
+        ):
+            self.assertFalse(self.manager.delete_model("one"))
+        self.assertEqual(self.store.path.read_bytes(), original_models)
+        self.assertEqual(
+            self.manager.conversation_store.path.read_bytes(), original_conversations
+        )
+        self.assertEqual(session.controller.model, "one")
+        self.assertEqual(runtime.history, history)
+        self.assertTrue(session.controller.agent.loaded)
+        self.assertEqual(runtime.reset_calls, 0)
+        self.assertEqual(runtime.close_calls, 0)
+
+    def test_missing_model_keeps_history_and_can_be_reselected(self) -> None:
+        self.manager.register_model("one", "old-key")
+        session = self.manager.active
+        self.assertTrue(self.manager.select_model(session.session_id, "one"))
+        history = [{"role": "user", "content": "remember me"}]
+        session.controller.agent.restore_history(history)
+        session.messages.append(("你", "remember me"))
+        self.assertTrue(self.manager.persist_completed_turn(session.session_id))
+        self.assertTrue(self.store.delete("one"))
+
+        factory = RuntimeFactory()
+        restored = SessionManager(
+            store=self.store,
+            default_cwd=self.workspace_a,
+            runtime_factory=factory,
+        )
+        self.addCleanup(restored.begin_close_all)
+        recovered = restored.active
+        self.assertEqual(recovered.controller.model, "")
+        self.assertEqual(recovered.controller.agent.snapshot_history(), history)
+        self.assertIn("模型已缺失", restored.conversation_error)
+        restored.register_model("one", "new-key")
+        self.assertTrue(restored.select_model(recovered.session_id, "one"))
+        self.assertTrue(recovered.controller.submit("continue"))
+        consume(recovered.controller)
+        self.assertEqual(factory.runtimes[0].history[:1], history)
+
+    def test_all_missing_workspaces_fall_back_without_overwriting_source(self) -> None:
+        missing = self.root / "missing"
+        candidate = {
+            "version": 1,
+            "activeSessionId": 4,
+            "nextSessionId": 5,
+            "sessions": [{
+                "id": 4,
+                "title": "失效工作区",
+                "workspace": str(missing.resolve()),
+                "mainModel": "",
+                "subModel": "",
+                "kind": "main",
+                "messages": [],
+                "history": [],
+            }],
+        }
+        self.manager.conversation_store.save(candidate)
+        original = self.manager.conversation_store.path.read_text(encoding="utf-8")
+        restored = SessionManager(
+            store=self.store,
+            default_cwd=self.workspace_a,
+            runtime_factory=RuntimeFactory(),
+        )
+        self.addCleanup(restored.begin_close_all)
+        self.assertEqual(restored.active.session_id, 5)
+        self.assertEqual(restored.active.workspace, self.workspace_a.resolve())
+        self.assertIn("安全空白对话", restored.conversation_error)
+        self.assertEqual(
+            self.manager.conversation_store.path.read_text(encoding="utf-8"), original
+        )
 
     def test_delete_busy_rejected_then_clears_idle_selected_runtimes(self) -> None:
         self.manager.register_model("one", "key-one")

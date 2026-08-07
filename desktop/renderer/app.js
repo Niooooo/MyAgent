@@ -16,6 +16,7 @@ const elements = {
   approvalReason: document.querySelector("#approval-reason"),
   approvalTool: document.querySelector("#approval-tool"),
   conversationPage: document.querySelector("#conversation-page"),
+  deleteTabMenuItem: document.querySelector("#delete-tab-menu-item"),
   errorToast: document.querySelector("#error-toast"),
   headerWorkspace: document.querySelector("#header-workspace"),
   mainAgentModelSelector: document.querySelector("#main-agent-model-selector"),
@@ -37,6 +38,16 @@ const elements = {
   prompt: document.querySelector("#prompt-input"),
   renameTabMenuItem: document.querySelector("#rename-tab-menu-item"),
   send: document.querySelector("#send-button"),
+  settingsButton: document.querySelector("#settings-button"),
+  settingsCancel: document.querySelector("#settings-cancel-button"),
+  settingsDialog: document.querySelector("#settings-dialog"),
+  settingsDialogError: document.querySelector("#settings-dialog-error"),
+  settingsForm: document.querySelector("#settings-form"),
+  maxToolRounds: document.querySelector("#max-tool-rounds-input"),
+  bashTimeoutSeconds: document.querySelector("#bash-timeout-seconds-input"),
+  todoReminderToolCalls: document.querySelector("#todo-reminder-tool-calls-input"),
+  subagentMaxWorkers: document.querySelector("#subagent-max-workers-input"),
+  subagentMaxTasks: document.querySelector("#subagent-max-tasks-input"),
   status: document.querySelector("#session-status"),
   subAgentModelSelector: document.querySelector("#sub-agent-model-selector"),
   tabContextMenu: document.querySelector("#tab-context-menu"),
@@ -52,6 +63,9 @@ let state = {
   sessions: [],
   models: [],
   modelError: "",
+  conversationError: "",
+  settings: {},
+  settingsError: "",
   lastError: "",
   closing: false,
 }
@@ -111,6 +125,23 @@ function showErrorToast(error) {
   }, ERROR_TOAST_DURATION_MS)
 }
 
+function closeAgentConfig() {
+  elements.agentConfig.open = false
+}
+
+function openSettings() {
+  const values = state.settings || {}
+  for (const [name, input] of [
+    ["maxToolRounds", elements.maxToolRounds],
+    ["bashTimeoutSeconds", elements.bashTimeoutSeconds],
+    ["todoReminderToolCalls", elements.todoReminderToolCalls],
+    ["subagentMaxWorkers", elements.subagentMaxWorkers],
+    ["subagentMaxTasks", elements.subagentMaxTasks],
+  ]) input.value = values[name] ?? ""
+  elements.settingsDialogError.textContent = state.settingsError || ""
+  elements.settingsDialog.showModal()
+}
+
 function setStatus(message, error = false) {
   elements.status.textContent = message
   elements.status.classList.toggle("error", error)
@@ -139,9 +170,12 @@ function renderTabs() {
     const title = document.createElement("span")
     title.className = "tab-title"
     title.textContent = session.title
-    title.title = `${session.title}（右键可修改名称）`
+    title.title = `${session.title}（右键可修改名称或删除对话）`
     title.tabIndex = 0
-    title.setAttribute("aria-label", `${session.title}，右键、双击或按 F2 修改名称`)
+    title.setAttribute(
+      "aria-label",
+      `${session.title}，右键可修改名称或删除对话，双击或按 F2 修改名称`,
+    )
     title.addEventListener("click", async () => {
       if (session.id === state.activeSessionId) return
       storeDraft()
@@ -199,6 +233,18 @@ function renameTabFromContextMenu() {
   if (session && title) beginTabRename(session, title)
 }
 
+async function deleteTabFromContextMenu() {
+  const sessionId = tabContextSessionId
+  const session = state.sessions.find((item) => item.id === sessionId)
+  closeTabContextMenu()
+  if (!session) return
+  const confirmed = window.confirm(
+    `确定删除对话“${session.title}”吗？\n\n这会删除本机持久化记录，且无法撤销。`,
+  )
+  if (!confirmed) return
+  await request("session.delete", { sessionId: session.id }).catch(() => undefined)
+}
+
 function beginTabRename(session, titleElement) {
   const input = document.createElement("input")
   input.className = "tab-title-input"
@@ -253,6 +299,7 @@ function renderConversation() {
   elements.status.textContent = session.status || "就绪"
   elements.status.classList.toggle("busy", session.state === "busy")
   elements.status.classList.toggle("error", session.status?.includes("失败") || false)
+  if (state.conversationError) setStatus(state.conversationError, true)
 
   renderAgentConfiguration(session)
   elements.prompt.disabled = state.closing
@@ -545,6 +592,7 @@ elements.modelBack.addEventListener("click", showConversation)
 elements.addModel.addEventListener("click", openModelDialog)
 elements.modelCancel.addEventListener("click", () => elements.modelDialog.close())
 elements.renameTabMenuItem.addEventListener("click", renameTabFromContextMenu)
+elements.deleteTabMenuItem.addEventListener("click", deleteTabFromContextMenu)
 elements.send.addEventListener("click", send)
 elements.prompt.addEventListener("input", () => {
   const session = activeSession()
@@ -573,6 +621,29 @@ elements.subAgentModelSelector.addEventListener("change", async () => {
     role: "sub",
     name: elements.subAgentModelSelector.value,
   }).catch(() => undefined)
+})
+elements.settingsButton.addEventListener("click", openSettings)
+elements.settingsCancel.addEventListener("click", () => elements.settingsDialog.close())
+elements.settingsForm.addEventListener("submit", async (event) => {
+  event.preventDefault()
+  elements.settingsDialogError.textContent = ""
+  const payload = {
+    maxToolRounds: elements.maxToolRounds.valueAsNumber,
+    bashTimeoutSeconds: elements.bashTimeoutSeconds.valueAsNumber,
+    todoReminderToolCalls: elements.todoReminderToolCalls.valueAsNumber,
+    subagentMaxWorkers: elements.subagentMaxWorkers.valueAsNumber,
+    subagentMaxTasks: elements.subagentMaxTasks.valueAsNumber,
+  }
+  if (!Object.values(payload).every(Number.isInteger)) {
+    elements.settingsDialogError.textContent = "所有运行设置都必须是整数"
+    return
+  }
+  try {
+    await request("settings.update", payload, { notifyError: false })
+    elements.settingsDialog.close()
+  } catch (error) {
+    elements.settingsDialogError.textContent = errorMessage(error)
+  }
 })
 elements.modelForm.addEventListener("submit", async (event) => {
   event.preventDefault()
@@ -604,7 +675,10 @@ document.querySelectorAll("[data-window-action]").forEach((button) => {
   button.addEventListener("click", () => api.windowAction(button.dataset.windowAction))
 })
 document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape" && !elements.tabContextMenu.hidden) {
+  if (event.key === "Escape" && elements.agentConfig.open) {
+    event.preventDefault()
+    closeAgentConfig()
+  } else if (event.key === "Escape" && !elements.tabContextMenu.hidden) {
     event.preventDefault()
     closeTabContextMenu()
   } else if (event.ctrlKey && event.key.toLowerCase() === "n") {
@@ -619,13 +693,18 @@ document.addEventListener("keydown", (event) => {
   }
 })
 document.addEventListener("pointerdown", (event) => {
+  if (elements.agentConfig.open && !elements.agentConfig.contains(event.target)) {
+    closeAgentConfig()
+  }
   if (!elements.tabContextMenu.hidden && !elements.tabContextMenu.contains(event.target)) {
     closeTabContextMenu()
   }
 })
 window.addEventListener("resize", updateResponsiveLayout, { passive: true })
 window.addEventListener("resize", closeTabContextMenu, { passive: true })
+window.addEventListener("resize", closeAgentConfig, { passive: true })
 window.addEventListener("blur", closeTabContextMenu)
+window.addEventListener("blur", closeAgentConfig)
 
 api.onEvent((message) => {
   if (message.event === "state") applyState(message.payload)

@@ -20,6 +20,7 @@ const IPC_METHODS = new Set([
   "session.new",
   "session.activate",
   "session.close",
+  "session.delete",
   "session.rename",
   "session.select_model",
   "session.configure_agent_model",
@@ -27,6 +28,7 @@ const IPC_METHODS = new Set([
   "model.register",
   "model.delete",
   "model.refresh",
+  "settings.update",
   "approval.decide",
 ])
 
@@ -241,6 +243,7 @@ function createWindow() {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
+      backgroundThrottling: !smokeTest,
     },
   })
   mainWindow.loadFile(path.join(rendererRoot, "index.html"))
@@ -283,6 +286,59 @@ function createWindow() {
         if (!renderedText.tab.includes("对话") || JSON.stringify(renderedText).includes("�")) {
           throw new Error("Renderer received mojibake from the Python sidecar")
         }
+        const settingsAndAgentConfig = await mainWindow.webContents.executeJavaScript(`(() => {
+          document.querySelector("#settings-button")?.click()
+          const settingsDialog = document.querySelector("#settings-dialog")
+          const settingsOpened = settingsDialog.open
+          const settingValues = [...settingsDialog.querySelectorAll('input[type="number"]')]
+            .map((input) => input.value)
+          settingsDialog.close()
+          const details = document.querySelector("#agent-config")
+          const select = document.querySelector("#main-agent-model-selector")
+          details.open = true
+          select.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }))
+          const internalStayedOpen = details.open
+          let changeFired = false
+          select.addEventListener("change", () => { changeFired = true }, { once: true })
+          select.dispatchEvent(new Event("change", { bubbles: true }))
+          const selectStayedOpen = details.open
+          document.body.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }))
+          const externalClosed = !details.open
+          details.open = true
+          document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }))
+          const escapeClosed = !details.open
+          details.open = true
+          window.dispatchEvent(new Event("blur"))
+          const blurClosed = !details.open
+          details.open = true
+          window.dispatchEvent(new Event("resize"))
+          const resizeClosed = !details.open
+          return {
+            settingsOpened,
+            settingValues,
+            internalStayedOpen,
+            selectStayedOpen,
+            changeFired,
+            externalClosed,
+            escapeClosed,
+            blurClosed,
+            resizeClosed,
+          }
+        })()`)
+        if (
+          !settingsAndAgentConfig.settingsOpened ||
+          settingsAndAgentConfig.settingValues.length !== 5 ||
+          settingsAndAgentConfig.settingValues.some((value) => value === "") ||
+          !settingsAndAgentConfig.internalStayedOpen ||
+          !settingsAndAgentConfig.selectStayedOpen ||
+          !settingsAndAgentConfig.changeFired ||
+          !settingsAndAgentConfig.externalClosed ||
+          !settingsAndAgentConfig.escapeClosed ||
+          !settingsAndAgentConfig.blurClosed ||
+          !settingsAndAgentConfig.resizeClosed
+        ) {
+          throw new Error("Settings dialog or Agent configuration dismissal behavior failed")
+        }
         const renameStarted = await mainWindow.webContents.executeJavaScript(`(() => {
           const title = document.querySelector(".tab-title")
           const rect = title?.getBoundingClientRect()
@@ -312,6 +368,74 @@ function createWindow() {
           await new Promise((resolve) => setTimeout(resolve, 25))
         }
         if (renamedTitle !== "冒烟会话") throw new Error("Conversation title rename did not persist")
+        const secondConversation = await sidecar.request("session.new", {})
+        mainWindow.webContents.send("myagent:event", {
+          event: "state",
+          payload: secondConversation.state,
+        })
+        await new Promise((resolve) => setTimeout(resolve, 25))
+        const menuBehavior = await mainWindow.webContents.executeJavaScript(`(() => {
+          const open = () => {
+            const title = document.querySelector(".tab.active .tab-title")
+            const rect = title?.getBoundingClientRect()
+            title?.dispatchEvent(new MouseEvent("contextmenu", {
+              bubbles: true,
+              cancelable: true,
+              clientX: rect?.left || 20,
+              clientY: rect?.bottom || 20,
+            }))
+          }
+          const menu = document.querySelector("#tab-context-menu")
+          const deleteItem = document.querySelector("#delete-tab-menu-item")
+          open()
+          const hasActions = !menu.hidden &&
+            document.querySelector("#rename-tab-menu-item")?.textContent === "修改名称" &&
+            deleteItem?.textContent === "删除对话"
+          document.body.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }))
+          const externalClosed = menu.hidden
+          open()
+          document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }))
+          const escapeClosed = menu.hidden
+          open()
+          window.dispatchEvent(new Event("blur"))
+          const blurClosed = menu.hidden
+          open()
+          window.dispatchEvent(new Event("resize"))
+          const resizeClosed = menu.hidden
+          open()
+          window.confirm = () => false
+          deleteItem.click()
+          return { hasActions, externalClosed, escapeClosed, blurClosed, resizeClosed }
+        })()`)
+        if (Object.values(menuBehavior).some((value) => !value)) {
+          throw new Error("Conversation context menu actions or dismissal behavior failed")
+        }
+        await new Promise((resolve) => setTimeout(resolve, 25))
+        const afterCancel = await sidecar.request("app.snapshot")
+        if (afterCancel.state.sessions.length !== 2) {
+          throw new Error("Cancelled conversation deletion changed persisted state")
+        }
+        await mainWindow.webContents.executeJavaScript(`(() => {
+          const title = document.querySelector(".tab.active .tab-title")
+          title?.dispatchEvent(new MouseEvent("contextmenu", {
+            bubbles: true,
+            cancelable: true,
+            clientX: 20,
+            clientY: 20,
+          }))
+          window.confirm = () => true
+          document.querySelector("#delete-tab-menu-item")?.click()
+        })()`)
+        let afterDelete
+        for (let attempt = 0; attempt < 20; attempt += 1) {
+          afterDelete = await sidecar.request("app.snapshot")
+          if (afterDelete.state.sessions.length === 1) break
+          await new Promise((resolve) => setTimeout(resolve, 25))
+        }
+        const remainingTitle = afterDelete?.state?.sessions?.[0]?.title
+        if (afterDelete?.state?.sessions?.length !== 1 || remainingTitle !== "冒烟会话") {
+          throw new Error("Confirmed conversation deletion removed the wrong tab")
+        }
         await mainWindow.webContents.executeJavaScript(
           'document.querySelector(".tab-close")?.click()',
         )
@@ -322,7 +446,7 @@ function createWindow() {
         if (toast.hidden || !toast.text.includes("至少保留一个对话标签") || toast.text.includes("remote method")) {
           throw new Error("Desktop request errors are not shown as a clean toast")
         }
-        await new Promise((resolve) => setTimeout(resolve, 5100))
+        await new Promise((resolve) => setTimeout(resolve, 5200))
         const toastDismissed = await mainWindow.webContents.executeJavaScript(
           'document.querySelector("#error-toast")?.hidden === true && document.querySelector("#error-toast")?.textContent === ""',
         )

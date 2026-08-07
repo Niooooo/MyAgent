@@ -24,7 +24,7 @@
           <button id="new-session-button" class="quiet-button" type="button">新建对话</button>
           <button id="open-folder-button" class="quiet-button" type="button">打开文件夹</button>
           <button id="models-button" class="quiet-button" type="button">模型</button>
-          <button class="quiet-button" type="button" disabled>设置</button>
+          <button id="settings-button" class="quiet-button" type="button">设置</button>
         </nav>
         <div id="header-workspace" class="header-workspace">LOCAL</div>
         <div class="window-controls no-drag" aria-label="窗口控制">
@@ -105,8 +105,9 @@
     </div>
 
     <div id="error-toast" class="error-toast" role="alert" aria-live="assertive" hidden></div>
-    <div id="tab-context-menu" class="tab-context-menu" role="menu" aria-label="对话标签操作" hidden>
+    <div id="tab-context-menu" class="tab-context-menu" role="menu" aria-label="修改或删除对话" hidden>
       <button id="rename-tab-menu-item" type="button" role="menuitem">修改名称</button>
+      <button id="delete-tab-menu-item" class="danger" type="button" role="menuitem" title="删除本机对话记录">删除对话</button>
     </div>
 
     <dialog id="model-dialog">
@@ -150,6 +151,25 @@
         <footer>
           <button id="approval-deny-button" class="secondary-button" type="button">拒绝</button>
           <button id="approval-allow-button" class="primary-button" type="button">允许一次</button>
+        </footer>
+      </form>
+    </dialog>
+
+    <dialog id="settings-dialog">
+      <form id="settings-form" method="dialog">
+        <header>
+          <h2>运行设置</h2>
+          <p>保存后应用到所有空闲对话，并用于之后的新对话。</p>
+        </header>
+        <label><span>最大工具调用轮次</span><input id="max-tool-rounds-input" name="maxToolRounds" type="number" min="0" max="1000" step="1" required /></label>
+        <label><span>Bash 超时秒数</span><input id="bash-timeout-seconds-input" name="bashTimeoutSeconds" type="number" min="1" max="86400" step="1" required /></label>
+        <label><span>TODO 提醒调用数</span><input id="todo-reminder-tool-calls-input" name="todoReminderToolCalls" type="number" min="1" max="100000" step="1" required /></label>
+        <label><span>子 Agent 最大并发数</span><input id="subagent-max-workers-input" name="subagentMaxWorkers" type="number" min="1" max="256" step="1" required /></label>
+        <label><span>子 Agent 最大任务数</span><input id="subagent-max-tasks-input" name="subagentMaxTasks" type="number" min="1" max="100000" step="1" required /></label>
+        <p id="settings-dialog-error" class="dialog-error" aria-live="polite"></p>
+        <footer>
+          <button id="settings-cancel-button" class="secondary-button" type="button">取消</button>
+          <button class="primary-button" type="submit">保存设置</button>
         </footer>
       </form>
     </dialog>

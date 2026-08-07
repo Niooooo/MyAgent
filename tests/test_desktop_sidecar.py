@@ -1,8 +1,10 @@
 import json
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import MagicMock
 
 from myagent.desktop_sidecar import DesktopSidecar, ProtocolError
 from myagent.gui import SessionManager
@@ -18,6 +20,7 @@ class FakeRuntime:
         request_approval: bool = False,
         stream_callback=None,
         stream_chunks=None,
+        block=False,
     ) -> None:
         self.approval = approval
         self.request_approval = request_approval
@@ -25,13 +28,19 @@ class FakeRuntime:
         self.close_calls = 0
         self.stream_callback = stream_callback
         self.stream_chunks = stream_chunks
+        self.block = block
+        self.started = threading.Event()
+        self.release = threading.Event()
 
     def run(self, prompt: str) -> str:
+        self.started.set()
         self.history.append({"role": "user", "content": prompt})
         if self.stream_chunks is not None and self.stream_callback is not None:
             self.stream_callback("start", "")
             for chunk in self.stream_chunks:
                 self.stream_callback("delta", chunk)
+        if self.block and not self.release.wait(2):
+            raise TimeoutError("test runtime timed out")
         if self.request_approval:
             approved = self.approval(
                 ApprovalRequest(
@@ -57,6 +66,7 @@ class RuntimeFactory:
     def __init__(self) -> None:
         self.next_request_approval = False
         self.next_stream_chunks = None
+        self.next_block = False
         self.calls: list[tuple[object, dict]] = []
         self.runtimes: list[FakeRuntime] = []
 
@@ -67,9 +77,11 @@ class RuntimeFactory:
             request_approval=self.next_request_approval,
             stream_callback=_kwargs.get("stream_callback"),
             stream_chunks=self.next_stream_chunks,
+            block=self.next_block,
         )
         self.next_request_approval = False
         self.next_stream_chunks = None
+        self.next_block = False
         self.runtimes.append(runtime)
         return runtime
 
@@ -136,6 +148,82 @@ class DesktopSidecarTests(unittest.TestCase):
             "https://gateway.example/v1",
         )
 
+    def test_settings_update_is_strict_and_rebuilds_idle_runtime_with_history(self) -> None:
+        session_id = self.register_and_select()
+        self.sidecar.dispatch(
+            "session.submit", {"sessionId": session_id, "prompt": "first"}
+        )
+        self.pump_until(lambda: self.sidecar.snapshot()["sessions"][0]["state"] == "idle")
+        first_history = list(self.factory.runtimes[0].history)
+        values = dict(self.sidecar.snapshot()["settings"])
+        values["maxToolRounds"] = 23
+        result = self.sidecar.dispatch("settings.update", values)
+        self.assertEqual(result["state"]["settings"]["maxToolRounds"], 23)
+        self.assertEqual(self.factory.runtimes[0].close_calls, 1)
+        self.sidecar.dispatch(
+            "session.submit", {"sessionId": session_id, "prompt": "继续"}
+        )
+        self.pump_until(lambda: len(self.factory.runtimes) == 2)
+        self.assertEqual(self.factory.runtimes[1].history[: len(first_history)], first_history)
+        self.assertEqual(self.factory.calls[1][1]["settings"].max_tool_rounds, 23)
+        new_session = self.sidecar.dispatch("session.new")["state"]["activeSessionId"]
+        self.sidecar.dispatch(
+            "session.select_model", {"sessionId": new_session, "name": "model-one"}
+        )
+        self.sidecar.dispatch(
+            "session.submit", {"sessionId": new_session, "prompt": "new"}
+        )
+        self.pump_until(lambda: len(self.factory.runtimes) == 3)
+        self.assertEqual(self.factory.calls[2][1]["settings"].public_dict(), values)
+        invalid = dict(values)
+        invalid["maxToolRounds"] = True
+        with self.assertRaisesRegex(ProtocolError, "必须是整数"):
+            self.sidecar.dispatch("settings.update", invalid)
+
+    def test_busy_settings_update_does_not_save_or_partially_apply(self) -> None:
+        session_id = self.register_and_select()
+        self.factory.next_request_approval = True
+        original = dict(self.sidecar.snapshot()["settings"])
+        self.sidecar.dispatch(
+            "session.submit", {"sessionId": session_id, "prompt": "wait"}
+        )
+        self.pump_until(lambda: any(name == "approval" for name, _ in self.events))
+        proposed = dict(original)
+        proposed["maxToolRounds"] = original["maxToolRounds"] + 1
+        with self.assertRaisesRegex(ProtocolError, "暂不能保存"):
+            self.sidecar.dispatch("settings.update", proposed)
+        self.assertEqual(self.sidecar.snapshot()["settings"], original)
+        self.assertFalse(self.sidecar.manager.settings_store.path.exists())
+        approval = next(payload for name, payload in self.events if name == "approval")
+        self.sidecar.dispatch(
+            "approval.decide",
+            {"approvalId": approval["approvalId"], "approved": False},
+        )
+        self.pump_until(lambda: self.sidecar.snapshot()["sessions"][0]["state"] == "idle")
+
+    def test_runtime_close_failure_cannot_split_committed_settings(self) -> None:
+        session_id = self.register_and_select()
+        self.sidecar.dispatch(
+            "session.submit", {"sessionId": session_id, "prompt": "first"}
+        )
+        self.pump_until(lambda: self.sidecar.snapshot()["sessions"][0]["state"] == "idle")
+        self.factory.runtimes[0].close = MagicMock(
+            side_effect=RuntimeError("close failed")
+        )
+        values = dict(self.sidecar.snapshot()["settings"])
+        values["maxToolRounds"] += 1
+
+        result = self.sidecar.dispatch("settings.update", values)
+
+        self.assertEqual(result["state"]["settings"], values)
+        self.assertEqual(self.sidecar.manager.settings.public_dict(), values)
+        self.assertEqual(
+            self.sidecar.manager.sessions[0].controller.agent._settings.public_dict(),
+            values,
+        )
+        self.assertEqual(self.sidecar.manager.settings_store.load().public_dict(), values)
+        self.factory.runtimes[0].close.assert_called_once_with()
+
     def test_submit_reuses_headless_session_runtime_and_publishes_state(self) -> None:
         session_id = self.register_and_select()
         result = self.sidecar.dispatch(
@@ -154,6 +242,9 @@ class DesktopSidecarTests(unittest.TestCase):
         self.assertTrue(session["canChangeModel"])
         self.assertTrue(session["canConfigureAgents"])
         self.assertTrue(any(name == "state" for name, _payload in self.events))
+        persisted = self.sidecar.manager.conversation_store.load()["sessions"][0]
+        self.assertEqual([item["speaker"] for item in persisted["messages"]], ["你", "MyAgent"])
+        self.assertEqual(persisted["history"][-1]["role"], "assistant")
 
     def test_main_and_subagent_models_are_configured_independently(self) -> None:
         session_id = self.register_and_select()
@@ -213,6 +304,53 @@ class DesktopSidecarTests(unittest.TestCase):
                 "session.rename",
                 {"sessionId": session_id, "title": "x" * 81},
             )
+
+    def test_session_delete_removes_only_the_target_and_is_persistent(self) -> None:
+        first_id = self.sidecar.snapshot()["activeSessionId"]
+        second = self.sidecar.dispatch("session.new")["state"]["activeSessionId"]
+        result = self.sidecar.dispatch("session.delete", {"sessionId": second})
+        self.assertEqual([item["id"] for item in result["state"]["sessions"]], [first_id])
+        self.assertEqual(result["state"]["activeSessionId"], first_id)
+        with self.assertRaisesRegex(ProtocolError, "至少保留"):
+            self.sidecar.dispatch("session.delete", {"sessionId": first_id})
+        restored = SessionManager(
+            store=ModelStore(self.sidecar.manager.store.path),
+            default_cwd=self.temp.name,
+            runtime_factory=RuntimeFactory(),
+        )
+        self.addCleanup(restored.begin_close_all)
+        self.assertEqual([item.session_id for item in restored.sessions], [first_id])
+
+    def test_two_busy_shutdown_terminals_both_persist_and_restore(self) -> None:
+        first_id = self.register_and_select()
+        second_id = self.sidecar.dispatch("session.new")["state"]["activeSessionId"]
+        self.sidecar.dispatch(
+            "session.configure_agent_model",
+            {"sessionId": second_id, "role": "main", "name": "model-one"},
+        )
+        for session_id in (first_id, second_id):
+            self.factory.next_block = True
+            self.sidecar.dispatch(
+                "session.submit", {"sessionId": session_id, "prompt": f"turn-{session_id}"}
+            )
+            self.assertTrue(self.factory.runtimes[-1].started.wait(1))
+        self.sidecar.dispatch("app.shutdown")
+        self.factory.runtimes[0].release.set()
+        self.pump_until(
+            lambda: self.sidecar.manager.sessions[0].controller.state == "closed"
+        )
+        self.factory.runtimes[1].release.set()
+        self.pump_until(self.sidecar.manager.all_closed)
+        persisted = self.sidecar.manager.conversation_store.load()
+        self.assertEqual([len(item["messages"]) for item in persisted["sessions"]], [2, 2])
+        self.assertEqual([len(item["history"]) for item in persisted["sessions"]], [2, 2])
+        restored = SessionManager(
+            store=ModelStore(self.sidecar.manager.store.path),
+            default_cwd=self.temp.name,
+            runtime_factory=RuntimeFactory(),
+        )
+        self.addCleanup(restored.begin_close_all)
+        self.assertEqual([len(item.messages) for item in restored.sessions], [2, 2])
 
     def test_stream_events_precede_final_state_and_never_expose_split_key(self) -> None:
         session_id = self.register_and_select()

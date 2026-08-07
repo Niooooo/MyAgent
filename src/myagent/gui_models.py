@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Callable
 from urllib.parse import urlsplit
 
+from .composition import AgentConfig
+
 
 MAX_MODEL_NAME_LENGTH = 120
 MAX_API_KEY_LENGTH = 2048
@@ -51,6 +53,119 @@ def default_model_store_path() -> Path:
     if not appdata:
         appdata = str(Path.home() / "AppData" / "Roaming")
     return Path(appdata).expanduser().resolve() / "MyAgent" / "models.json"
+
+
+def default_settings_store_path() -> Path:
+    """Keep desktop runtime settings beside the repository-external model file."""
+    return default_model_store_path().with_name("settings.json")
+
+
+class DesktopSettingsError(RuntimeError):
+    """A stable, user-presentable desktop settings failure."""
+
+
+@dataclass(frozen=True)
+class DesktopSettings:
+    max_tool_rounds: int
+    bash_timeout_seconds: int
+    todo_reminder_tool_calls: int
+    subagent_max_workers: int
+    subagent_max_tasks: int
+
+    @classmethod
+    def defaults(cls) -> "DesktopSettings":
+        values = AgentConfig()
+        return cls(
+            values.max_tool_rounds,
+            values.bash_timeout_seconds,
+            values.todo_reminder_tool_calls,
+            values.subagent_max_workers,
+            values.subagent_max_tasks,
+        )
+
+    def public_dict(self) -> dict[str, int]:
+        return {
+            "maxToolRounds": self.max_tool_rounds,
+            "bashTimeoutSeconds": self.bash_timeout_seconds,
+            "todoReminderToolCalls": self.todo_reminder_tool_calls,
+            "subagentMaxWorkers": self.subagent_max_workers,
+            "subagentMaxTasks": self.subagent_max_tasks,
+        }
+
+
+class DesktopSettingsStore:
+    """Validate and atomically persist the five desktop runtime limits."""
+
+    _FIELDS = {
+        "maxToolRounds": ("max_tool_rounds", 0, 1_000),
+        "bashTimeoutSeconds": ("bash_timeout_seconds", 1, 86_400),
+        "todoReminderToolCalls": ("todo_reminder_tool_calls", 1, 100_000),
+        "subagentMaxWorkers": ("subagent_max_workers", 1, 256),
+        "subagentMaxTasks": ("subagent_max_tasks", 1, 100_000),
+    }
+
+    def __init__(self, path: str | os.PathLike[str] | None = None) -> None:
+        self.path = Path(path) if path is not None else default_settings_store_path()
+
+    def load(self) -> DesktopSettings:
+        if not self.path.exists():
+            return DesktopSettings.defaults()
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError) as exc:
+            raise DesktopSettingsError(f"无法读取桌面设置：{exc}") from None
+        except json.JSONDecodeError as exc:
+            raise DesktopSettingsError(
+                f"桌面设置 JSON 已损坏（第 {exc.lineno} 行第 {exc.colno} 列）"
+            ) from None
+        try:
+            return self.validate(raw)
+        except DesktopSettingsError as exc:
+            raise DesktopSettingsError(f"桌面设置格式无效：{exc}") from None
+
+    @classmethod
+    def validate(cls, raw: object) -> DesktopSettings:
+        if not isinstance(raw, dict):
+            raise DesktopSettingsError("设置必须是对象")
+        if set(raw) != set(cls._FIELDS):
+            raise DesktopSettingsError("设置字段必须完整且不能包含未知字段")
+        selected: dict[str, int] = {}
+        for public_name, (field_name, minimum, maximum) in cls._FIELDS.items():
+            value = raw[public_name]
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise DesktopSettingsError(f"{public_name} 必须是整数")
+            if value < minimum or value > maximum:
+                raise DesktopSettingsError(
+                    f"{public_name} 必须在 {minimum} 到 {maximum} 之间"
+                )
+            selected[field_name] = value
+        return DesktopSettings(**selected)
+
+    def save(self, settings: DesktopSettings) -> None:
+        validated = self.validate(settings.public_dict())
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise DesktopSettingsError(f"无法创建桌面设置目录：{exc}") from None
+        temporary: Path | None = None
+        try:
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=f".{self.path.name}.", suffix=".tmp", dir=self.path.parent
+            )
+            temporary = Path(temporary_name)
+            with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
+                json.dump(validated.public_dict(), stream, ensure_ascii=False, indent=2)
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, self.path)
+        except OSError as exc:
+            if temporary is not None:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            raise DesktopSettingsError(f"无法保存桌面设置：{exc}") from None
 
 
 class ModelStore:

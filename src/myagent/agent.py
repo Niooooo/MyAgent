@@ -280,6 +280,8 @@ class AgentLoop:
                             continue
                     return output_text
 
+                if tool_rounds >= self.max_tool_rounds:
+                    self._record_unexecuted_calls(calls)
                 self._ensure_tool_round_available(tool_rounds)
                 self._execute_calls(calls)
                 self._drain_background_results()
@@ -542,6 +544,30 @@ class AgentLoop:
         outputs: list[object] = []
         for call, result in results:
             serialized = json.dumps(result, ensure_ascii=False)
+            if self.context_memory is not None:
+                serialized = self.context_memory.prepare_tool_output(serialized)
+            outputs.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": call.call_id,
+                    "output": serialized,
+                }
+            )
+        self.history.extend(outputs)
+        if self.context_memory is not None:
+            self.context_memory.record_tool_outputs(outputs)
+
+    def _record_unexecuted_calls(self, calls: Sequence[FunctionCallItem]) -> None:
+        """Close every received call without running tools when the round is denied."""
+        outputs: list[object] = []
+        for call in calls:
+            serialized = json.dumps(
+                {
+                    "ok": False,
+                    "error": "Tool was not executed because the tool round limit was reached",
+                },
+                ensure_ascii=False,
+            )
             if self.context_memory is not None:
                 serialized = self.context_memory.prepare_tool_output(serialized)
             outputs.append(

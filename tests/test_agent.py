@@ -244,7 +244,11 @@ class AgentLoopTests(unittest.TestCase):
         )
 
     def test_stops_before_tool_execution_at_limit(self) -> None:
-        responses = FakeResponses([response([function_call()])])
+        calls = [
+            function_call(call_id="call_1", arguments='{"command":"pwd"}'),
+            function_call(call_id="call_2", arguments='{"command":"ls"}'),
+        ]
+        responses = FakeResponses([response(calls), response([], "continued")])
         executed = []
         agent = AgentLoop(
             SimpleNamespace(responses=responses),
@@ -255,6 +259,11 @@ class AgentLoopTests(unittest.TestCase):
         with self.assertRaises(AgentLoopLimitError):
             agent.run("run forever")
         self.assertEqual(executed, [])
+        outputs = agent.history[-2:]
+        self.assertEqual([item["call_id"] for item in outputs], ["call_1", "call_2"])
+        self.assertTrue(all(not json.loads(item["output"])["ok"] for item in outputs))
+        self.assertEqual(agent.run("继续"), "continued")
+        self.assertEqual(responses.requests[1]["input"][-1]["content"], "继续")
 
     def test_conversation_history_is_reused_across_user_turns(self) -> None:
         responses = FakeResponses([response([], "first"), response([], "second")])
