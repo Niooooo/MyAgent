@@ -21,6 +21,7 @@ from .hooks import (
 )
 from .memory import ContextMemory, HISTORY_COMPACTION_INSTRUCTIONS
 from .runtime_inbox import InboxReader
+from .session_timeline import SessionTimeline, TimelineSnapshot
 from .tooling import ToolRegistry, ToolResult
 from .tools import BackgroundBashRunner
 
@@ -118,6 +119,7 @@ class AgentLoop:
         bash_tool: Callable[[str], dict[str, Any]] | None = None,
         tool_registry: ToolRegistry | None = None,
         context_memory: ContextMemory | None = None,
+        session_timeline: SessionTimeline | None = None,
         workspace_root: str | PathLike[str] | None = None,
         allowed_tools: Iterable[str] | None = None,
         approval_callback: ApprovalCallback | None = None,
@@ -147,6 +149,11 @@ class AgentLoop:
             ContextMemory,
         ):
             raise TypeError("context_memory must be a ContextMemory")
+        if session_timeline is not None and not isinstance(
+            session_timeline,
+            SessionTimeline,
+        ):
+            raise TypeError("session_timeline must be a SessionTimeline")
         if tool_registry is None and context_memory is not None:
             raise ValueError("context_memory requires an explicit tool_registry")
         if background_bash_runner is not None and not isinstance(
@@ -190,7 +197,7 @@ class AgentLoop:
         self.instructions = instructions
         self.instructions_provider = instructions_provider
         self.max_tool_rounds = max_tool_rounds
-        self.history: list[object] = []
+        selected_timeline = session_timeline
         self._close_callback = close_callback
         self._close_lock = Lock()
         self._closed = False
@@ -234,6 +241,8 @@ class AgentLoop:
             self.long_term_memory_store = components.long_term_memory_store
             self.task_store = components.task_store
             self.context_memory = components.context_memory
+            if selected_timeline is None:
+                selected_timeline = components.session_timeline
             self.background_bash_runner = components.background_bash_runner
             self.scheduled_task_runtime = components.scheduled_task_runtime
             self.inbox_reader = components.inbox_reader
@@ -244,6 +253,9 @@ class AgentLoop:
             )
             if self._close_callback is None:
                 self._close_callback = components.close
+        self.session_timeline = (
+            selected_timeline if selected_timeline is not None else SessionTimeline()
+        )
         self.hooks = self.tool_registry.hooks
 
     def run(self, user_input: str) -> str:
@@ -304,9 +316,26 @@ class AgentLoop:
         """Clear the in-memory conversation history."""
         if self.background_bash_runner is not None:
             self.background_bash_runner.reset_and_discard()
-        self.history.clear()
-        if self.context_memory is not None:
-            self.context_memory.reset()
+        self.session_timeline.reset()
+
+    @property
+    def history(self) -> list[object]:
+        """Compatibility snapshot; mutations never affect the live timeline."""
+        return self.snapshot_history()
+
+    def snapshot_history(self) -> list[object]:
+        """Return a legacy flat compatibility snapshot without provenance."""
+        return self.session_timeline.snapshot_history()
+
+    def restore_history(self, history: Sequence[object]) -> None:
+        """Restore a legacy flat snapshot using conservative reconstruction."""
+        self.session_timeline.restore_history(history)
+
+    def snapshot_timeline(self) -> TimelineSnapshot:
+        return self.session_timeline.snapshot()
+
+    def restore_timeline(self, snapshot: TimelineSnapshot) -> None:
+        self.session_timeline.restore(snapshot)
 
     def close(self) -> None:
         """Release resources attached by the runtime composition root."""
@@ -334,15 +363,13 @@ class AgentLoop:
             *submitted.context,
             {"role": "user", "content": submitted.prompt},
         ]
-        self.history.extend(items)
-        if self.context_memory is not None:
-            self.context_memory.record_user_turn(items)
+        self.session_timeline.record_user_input(items)
 
     def _request_response(self) -> ModelResponse:
         self._drain_background_results()
         if self.context_memory is not None:
             self.context_memory.prepare_request(
-                self.history,
+                self.session_timeline,
                 self._request_history_summary,
             )
         instructions = self._effective_instructions()
@@ -351,23 +378,22 @@ class AgentLoop:
                 model=self.model,
                 instructions=instructions,
                 tools=self.tool_registry.definitions,
-                input=self.history,
+                input=self.session_timeline.build_model_input(),
             )
         except Exception as exc:
             if self.context_memory is None or not _is_context_length_error(exc):
                 raise
             self.context_memory.emergency_compact(
-                self.history,
+                self.session_timeline,
                 self._request_history_summary,
             )
             response = self._request_model(
                 model=self.model,
                 instructions=instructions,
                 tools=self.tool_registry.definitions,
-                input=self.history,
+                input=self.session_timeline.build_model_input(),
             )
-        if self.context_memory is not None:
-            self.context_memory.mark_request_succeeded()
+        self.session_timeline.record_request_succeeded()
         return response
 
     def _request_history_summary(self, source: str, max_chars: int) -> str:
@@ -515,9 +541,7 @@ class AgentLoop:
         response: ModelResponse,
     ) -> list[FunctionCallItem]:
         # Reasoning items are protocol state, so every output item must survive.
-        self.history.extend(response.output)
-        if self.context_memory is not None:
-            self.context_memory.record_response(response.output)
+        self.session_timeline.record_response_output(response.output)
         return [
             cast(FunctionCallItem, item)
             for item in response.output
@@ -553,9 +577,7 @@ class AgentLoop:
                     "output": serialized,
                 }
             )
-        self.history.extend(outputs)
-        if self.context_memory is not None:
-            self.context_memory.record_tool_outputs(outputs)
+        self.session_timeline.record_tool_outputs(outputs)
 
     def _record_unexecuted_calls(self, calls: Sequence[FunctionCallItem]) -> None:
         """Close every received call without running tools when the round is denied."""
@@ -577,9 +599,7 @@ class AgentLoop:
                     "output": serialized,
                 }
             )
-        self.history.extend(outputs)
-        if self.context_memory is not None:
-            self.context_memory.record_tool_outputs(outputs)
+        self.session_timeline.record_tool_outputs(outputs)
 
     def _execute_call(self, call: FunctionCallItem) -> ToolResult:
         return self.tool_registry.execute(
@@ -608,9 +628,7 @@ class AgentLoop:
                 )
             ),
         }
-        self.history.append(message)
-        if self.context_memory is not None:
-            self.context_memory.record_runtime_items([message])
+        self.session_timeline.record_runtime_items([message])
         return True
 
     def _drain_inbox(self) -> bool:
@@ -621,9 +639,7 @@ class AgentLoop:
         if batch is None or not batch.items:
             return False
         items = list(batch.items)
-        self.history.extend(items)
-        if self.context_memory is not None:
-            self.context_memory.record_runtime_items(items)
+        self.session_timeline.record_runtime_items(items)
         batch.acknowledge()
         return True
 

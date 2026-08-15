@@ -1,3 +1,4 @@
+import json
 import queue
 import sys
 import tempfile
@@ -27,7 +28,8 @@ from myagent.gui import (
     main,
 )
 from myagent.gui_models import ModelRecord, ModelStore
-from myagent.gui_conversations import ConversationStoreError
+from myagent.gui_conversations import ConversationStore, ConversationStoreError
+from myagent.session_store import SessionStoreError
 from myagent.permissions import ApprovalRequest
 
 
@@ -39,12 +41,14 @@ class FakeRuntime:
         block=False,
         stream_callback=None,
         stream_chunks=None,
+        timeline=None,
     ) -> None:
         self.result = result
         self.block = block
         self.started = threading.Event()
         self.release = threading.Event()
-        self.history = []
+        from myagent.session_timeline import SessionTimeline
+        self.session_timeline = timeline or SessionTimeline()
         self.run_calls = []
         self.close_calls = 0
         self.reset_calls = 0
@@ -54,7 +58,7 @@ class FakeRuntime:
     def run(self, prompt: str) -> str:
         self.started.set()
         self.run_calls.append(prompt)
-        self.history.append({"role": "user", "content": prompt})
+        self.session_timeline.record_user_input([{"role": "user", "content": prompt}])
         if self.stream_chunks is not None and self.stream_callback is not None:
             self.stream_callback("start", "")
             for chunk in self.stream_chunks:
@@ -63,12 +67,25 @@ class FakeRuntime:
             raise TimeoutError("test runtime timed out")
         if isinstance(self.result, BaseException):
             raise self.result
-        self.history.append({"role": "assistant", "content": self.result})
+        self.session_timeline.record_response_output(
+            [{"role": "assistant", "content": self.result}]
+        )
+        self.session_timeline.record_request_succeeded()
         return self.result
+
+    @property
+    def history(self):
+        return self.session_timeline.snapshot_history()
+
+    def snapshot_timeline(self):
+        return self.session_timeline.snapshot()
+
+    def restore_timeline(self, snapshot):
+        self.session_timeline.restore(snapshot)
 
     def reset(self) -> None:
         self.reset_calls += 1
-        self.history.clear()
+        self.session_timeline.reset()
 
     def close(self) -> None:
         self.close_calls += 1
@@ -89,6 +106,7 @@ class RuntimeFactory:
             block=self.next_block,
             stream_callback=kwargs.get("stream_callback"),
             stream_chunks=self.next_stream_chunks,
+            timeline=kwargs.get("timeline"),
         )
         self.runtimes.append(runtime)
         self.next_block = False
@@ -112,6 +130,24 @@ def consume(controller: ConversationController) -> UIEvent:
 
 
 class DeferredAgentTests(unittest.TestCase):
+    def test_model_switch_keeps_timeline_when_detached_runtime_close_fails(self) -> None:
+        factory = RuntimeFactory()
+        agent = DeferredAgent(
+            lambda request: False,
+            model="one",
+            api_key="key-one",
+            runtime_factory=factory,
+        )
+        agent.run("first")
+        timeline = agent.timeline
+        factory.runtimes[0].close = MagicMock(side_effect=RuntimeError("close failed"))
+
+        agent.configure_model("two", "key-two")
+
+        self.assertIs(agent.timeline, timeline)
+        self.assertEqual(agent.model, "two")
+        self.assertTrue(agent.snapshot_history())
+
     def test_lazy_runtime_carries_secret_workspace_kind_and_safe_repr(self) -> None:
         factory = RuntimeFactory()
         approval = MagicMock(return_value=False)
@@ -368,6 +404,10 @@ class ConversationControllerTests(unittest.TestCase):
 
 
 class SessionManagerTests(unittest.TestCase):
+    @staticmethod
+    def _jsonl(path: Path) -> list[dict]:
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -411,6 +451,129 @@ class SessionManagerTests(unittest.TestCase):
         self.assertIsNot(initial.controller, second.controller)
         self.assertEqual(self.manager.active_session_id, second.session_id)
         self.assertEqual(Path.cwd(), process_cwd)
+
+    def test_session_actions_append_only_their_target_events(self) -> None:
+        first = self.manager.active
+        second = self.manager.new_session(self.workspace_b)
+        catalog = self.manager.session_store.catalog_path
+        first_path = self.manager.session_store.root / f"{first.session_id}.jsonl"
+        second_path = self.manager.session_store.root / f"{second.session_id}.jsonl"
+
+        catalog_lines = self._jsonl(catalog)
+        first_bytes, second_bytes = first_path.read_bytes(), second_path.read_bytes()
+        self.assertTrue(self.manager.activate(first.session_id))
+        self.assertEqual(self._jsonl(catalog)[len(catalog_lines):][-1]["event"], "session_activated")
+        self.assertEqual(first_path.read_bytes(), first_bytes)
+        self.assertEqual(second_path.read_bytes(), second_bytes)
+
+        self.manager.register_model("event-model", "event-key")
+        for action in (
+            lambda: self.manager.rename_session(first.session_id, "renamed"),
+            lambda: self.manager.select_model(first.session_id, "event-model"),
+            lambda: self.manager.configure_agent_model(first.session_id, "sub", "event-model"),
+            lambda: self.manager.set_kind(first.session_id, "sub"),
+        ):
+            before = self._jsonl(first_path)
+            other = second_path.read_bytes()
+            self.assertTrue(action())
+            self.assertEqual(
+                [item["event"] for item in self._jsonl(first_path)[len(before):]],
+                ["metadata_changed"],
+            )
+            self.assertEqual(second_path.read_bytes(), other)
+
+        before_catalog = self._jsonl(catalog)
+        other = second_path.read_bytes()
+        self.assertTrue(self.manager.close_session(first.session_id))
+        self.assertEqual(
+            [item["event"] for item in self._jsonl(catalog)[len(before_catalog):]],
+            ["session_deleted", "session_activated"],
+        )
+        self.assertEqual(second_path.read_bytes(), other)
+
+    def test_delete_model_partial_metadata_failure_is_compensated(self) -> None:
+        self.manager.register_model("shared", "shared-key")
+        first = self.manager.active
+        second = self.manager.new_session(self.workspace_b)
+        self.assertTrue(self.manager.select_model(first.session_id, "shared"))
+        self.assertTrue(self.manager.select_model(second.session_id, "shared"))
+        first_path = self.manager.session_store.root / f"{first.session_id}.jsonl"
+        before = self._jsonl(first_path)
+        append_metadata = self.manager.session_store.append_metadata
+
+        def fail_second(session_id, metadata, **kwargs):
+            if session_id == second.session_id:
+                raise SessionStoreError("second failed")
+            return append_metadata(session_id, metadata, **kwargs)
+
+        with patch.object(
+            self.manager.session_store,
+            "append_metadata",
+            side_effect=fail_second,
+        ):
+            self.assertFalse(self.manager.delete_model("shared"))
+
+        self.assertIn("shared", self.manager.model_names)
+        self.assertEqual([first.controller.model, second.controller.model], ["shared", "shared"])
+        self.assertEqual(
+            [
+                self.manager.session_store.load_session(item.session_id).metadata.main_model
+                for item in (first, second)
+            ],
+            ["shared", "shared"],
+        )
+        self.assertEqual(
+            [item["event"] for item in self._jsonl(first_path)[len(before):]],
+            ["metadata_changed", "metadata_changed"],
+        )
+
+    def test_manager_secret_migration_rejects_without_jsonl(self) -> None:
+        config = self.root / "secret-migration"
+        model_store = ModelStore(config / "models.json")
+        model_store.add("secret-model", "registered-key", "https://secret.example/v1")
+        legacy_store = ConversationStore(config / "conversations.json")
+        secret_text = "registered-key https://secret.example/v1"
+        legacy_store.save({
+            "version": 1,
+            "activeSessionId": 1,
+            "nextSessionId": 2,
+            "sessions": [{
+                "id": 1,
+                "title": "legacy",
+                "workspace": str(self.workspace_a.resolve()),
+                "mainModel": "secret-model",
+                "subModel": "",
+                "kind": "main",
+                "messages": [{"speaker": "你", "text": secret_text}],
+                "history": [{"role": "user", "content": secret_text}],
+            }],
+        })
+        before = legacy_store.path.read_bytes()
+
+        manager = SessionManager(store=model_store, default_cwd=self.workspace_a)
+        self.addCleanup(manager.begin_close_all)
+
+        self.assertEqual(list(manager.session_store.root.glob("*.jsonl")), [])
+        self.assertEqual(legacy_store.path.read_bytes(), before)
+        self.assertIn("sensitive value", manager.conversation_error)
+
+    def test_committed_model_change_survives_runtime_cleanup_failure(self) -> None:
+        self.manager.register_model("one", "key-one")
+        self.manager.register_model("two", "key-two")
+        session = self.manager.active
+        self.assertTrue(self.manager.select_model(session.session_id, "one"))
+        session.controller.agent.run("first")
+        timeline = session.controller.agent.timeline
+        self.factory.runtimes[0].close = MagicMock(side_effect=RuntimeError("close failed"))
+
+        self.assertTrue(self.manager.select_model(session.session_id, "two"))
+
+        self.assertEqual(session.controller.model, "two")
+        self.assertIs(session.controller.agent.timeline, timeline)
+        self.assertEqual(
+            self.manager.session_store.load_session(session.session_id).metadata.main_model,
+            "two",
+        )
 
     def test_corrupt_model_registry_remains_user_visible_at_startup(self) -> None:
         corrupt_path = self.root / "broken" / "models.json"
@@ -518,7 +681,10 @@ class SessionManagerTests(unittest.TestCase):
         consume(restored_first.controller)
         self.assertEqual(factory.runtimes[0].history[: len(first_history)], first_history)
         self.assertEqual(restored.new_session(self.workspace_a).session_id, 3)
-        serialized = restored.conversation_store.path.read_text(encoding="utf-8")
+        serialized = "".join(
+            path.read_text(encoding="utf-8")
+            for path in restored.session_store.root.glob("*.jsonl")
+        )
         self.assertNotIn("key-one", serialized)
         self.assertNotIn("key-two", serialized)
 
@@ -526,9 +692,9 @@ class SessionManagerTests(unittest.TestCase):
         first = self.manager.active
         second = self.manager.new_session(self.workspace_b)
         with patch.object(
-            self.manager.conversation_store,
-            "save",
-            side_effect=ConversationStoreError("disk unavailable"),
+            self.manager.session_store,
+            "delete_session",
+            side_effect=SessionStoreError("disk unavailable"),
         ):
             self.assertFalse(self.manager.close_session(second.session_id))
         self.assertEqual(self.manager.sessions, [first, second])
@@ -545,9 +711,9 @@ class SessionManagerTests(unittest.TestCase):
         first.messages.append(("你", "unfinished"))
 
         self.manager.new_session(self.workspace_b)
-        saved_first = self.manager.conversation_store.load()["sessions"][0]
-        self.assertEqual(saved_first["messages"], [])
-        self.assertEqual(saved_first["history"], [])
+        saved_first = self.manager.session_store.load_session(first.session_id)
+        self.assertEqual(saved_first.messages, ())
+        self.assertEqual(saved_first.timeline.snapshot_history(), [])
 
         self.factory.runtimes[0].release.set()
         consume(first.controller)
@@ -561,7 +727,10 @@ class SessionManagerTests(unittest.TestCase):
         session.messages.append(("你", secrets))
         session.controller.agent.restore_history([{"role": "user", "content": secrets}])
         self.assertFalse(self.manager.persist_completed_turn(session.session_id))
-        serialized = self.manager.conversation_store.path.read_text(encoding="utf-8")
+        serialized = "".join(
+            path.read_text(encoding="utf-8")
+            for path in self.manager.session_store.root.glob("*.jsonl")
+        )
         for secret in (
             "selected-key", "https://selected.test/v1",
             "other-key", "https://other.test/v1",
@@ -578,9 +747,9 @@ class SessionManagerTests(unittest.TestCase):
         runtime = self.factory.runtimes[0]
         history = list(runtime.history)
         with patch.object(
-            self.manager.conversation_store,
-            "save",
-            side_effect=ConversationStoreError("disk unavailable"),
+            self.manager.session_store,
+            "append_metadata",
+            side_effect=SessionStoreError("disk unavailable"),
         ):
             self.assertFalse(self.manager.select_model(session.session_id, "two"))
             self.assertFalse(
@@ -607,9 +776,9 @@ class SessionManagerTests(unittest.TestCase):
         session.messages.append(("MyAgent", str(event.payload)))
         self.assertTrue(self.manager.persist_completed_turn(session.session_id))
         session.controller.close_agent_once()
-        persisted = self.manager.conversation_store.load()["sessions"][0]
-        self.assertEqual(len(persisted["messages"]), 2)
-        self.assertEqual(persisted["history"][-1]["role"], "assistant")
+        persisted = self.manager.session_store.load_session(session.session_id)
+        self.assertEqual(len(persisted.messages), 2)
+        self.assertEqual(persisted.timeline.snapshot_history()[-1]["role"], "assistant")
 
     def test_two_closing_terminals_survive_sequential_saves_and_restart(self) -> None:
         self.manager.register_model("one", "key-one")
@@ -652,16 +821,17 @@ class SessionManagerTests(unittest.TestCase):
         runtime = self.factory.runtimes[0]
         history = list(runtime.history)
         original_models = self.store.path.read_bytes()
-        original_conversations = self.manager.conversation_store.path.read_bytes()
+        session_path = self.manager.session_store.root / f"{session.session_id}.jsonl"
+        original_conversations = session_path.read_bytes()
         with patch.object(
-            self.manager.conversation_store,
-            "save",
-            side_effect=ConversationStoreError("disk unavailable"),
+            self.manager.session_store,
+            "append_metadata",
+            side_effect=SessionStoreError("disk unavailable"),
         ):
             self.assertFalse(self.manager.delete_model("one"))
         self.assertEqual(self.store.path.read_bytes(), original_models)
         self.assertEqual(
-            self.manager.conversation_store.path.read_bytes(), original_conversations
+            session_path.read_bytes(), original_conversations
         )
         self.assertEqual(session.controller.model, "one")
         self.assertEqual(runtime.history, history)
@@ -689,7 +859,7 @@ class SessionManagerTests(unittest.TestCase):
         recovered = restored.active
         self.assertEqual(recovered.controller.model, "")
         self.assertEqual(recovered.controller.agent.snapshot_history(), history)
-        self.assertIn("模型已缺失", restored.conversation_error)
+        self.assertIn("模型已缺失", recovered.status)
         restored.register_model("one", "new-key")
         self.assertTrue(restored.select_model(recovered.session_id, "one"))
         self.assertTrue(recovered.controller.submit("continue"))
@@ -713,10 +883,12 @@ class SessionManagerTests(unittest.TestCase):
                 "history": [],
             }],
         }
-        self.manager.conversation_store.save(candidate)
-        original = self.manager.conversation_store.path.read_text(encoding="utf-8")
+        config = self.root / "legacy-config"
+        legacy_store = ConversationStore(config / "conversations.json")
+        legacy_store.save(candidate)
+        original = legacy_store.path.read_bytes()
         restored = SessionManager(
-            store=self.store,
+            store=ModelStore(config / "models.json"),
             default_cwd=self.workspace_a,
             runtime_factory=RuntimeFactory(),
         )
@@ -725,7 +897,7 @@ class SessionManagerTests(unittest.TestCase):
         self.assertEqual(restored.active.workspace, self.workspace_a.resolve())
         self.assertIn("安全空白对话", restored.conversation_error)
         self.assertEqual(
-            self.manager.conversation_store.path.read_text(encoding="utf-8"), original
+            legacy_store.path.read_bytes(), original
         )
 
     def test_delete_busy_rejected_then_clears_idle_selected_runtimes(self) -> None:
@@ -741,12 +913,27 @@ class SessionManagerTests(unittest.TestCase):
         self.assertIn("运行中的对话", self.manager.last_error)
         self.factory.runtimes[0].release.set()
         consume(first.controller)
+        first_history = first.controller.agent.snapshot_history()
+        first_operations = first.controller.agent.timeline.operations
+        first_pending = first.controller.agent.pending_operations
+        second_operations = second.controller.agent.timeline.operations
 
         self.assertTrue(self.manager.delete_model("one"))
         self.assertEqual(first.controller.model, "")
         self.assertEqual(second.controller.model, "")
         self.assertFalse(first.controller.submit("again"))
         self.assertEqual(self.manager.model_names, ())
+        self.assertEqual(first.controller.agent.snapshot_history(), first_history)
+        self.assertEqual(first.controller.agent.timeline.operations, first_operations)
+        self.assertEqual(first.controller.agent.pending_operations, first_pending)
+        self.assertEqual(second.controller.agent.timeline.operations, second_operations)
+        self.assertEqual(
+            [
+                self.manager.session_store.load_session(item.session_id).metadata.main_model
+                for item in (first, second)
+            ],
+            ["", ""],
+        )
 
 
 class RuntimeCreationTests(unittest.TestCase):

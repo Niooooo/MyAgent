@@ -21,26 +21,32 @@ class FakeRuntime:
         stream_callback=None,
         stream_chunks=None,
         block=False,
+        timeline=None,
+        error=None,
     ) -> None:
         self.approval = approval
         self.request_approval = request_approval
-        self.history = []
+        from myagent.session_timeline import SessionTimeline
+        self.session_timeline = timeline or SessionTimeline()
         self.close_calls = 0
         self.stream_callback = stream_callback
         self.stream_chunks = stream_chunks
         self.block = block
         self.started = threading.Event()
         self.release = threading.Event()
+        self.error = error
 
     def run(self, prompt: str) -> str:
         self.started.set()
-        self.history.append({"role": "user", "content": prompt})
+        self.session_timeline.record_user_input([{"role": "user", "content": prompt}])
         if self.stream_chunks is not None and self.stream_callback is not None:
             self.stream_callback("start", "")
             for chunk in self.stream_chunks:
                 self.stream_callback("delta", chunk)
         if self.block and not self.release.wait(2):
             raise TimeoutError("test runtime timed out")
+        if self.error is not None:
+            raise self.error
         if self.request_approval:
             approved = self.approval(
                 ApprovalRequest(
@@ -52,11 +58,24 @@ class FakeRuntime:
             answer = "已允许" if approved else "已拒绝"
         else:
             answer = f"回答：{prompt}"
-        self.history.append({"role": "assistant", "content": answer})
+        self.session_timeline.record_response_output(
+            [{"role": "assistant", "content": answer}]
+        )
+        self.session_timeline.record_request_succeeded()
         return answer
 
+    @property
+    def history(self):
+        return self.session_timeline.snapshot_history()
+
+    def snapshot_timeline(self):
+        return self.session_timeline.snapshot()
+
+    def restore_timeline(self, snapshot):
+        self.session_timeline.restore(snapshot)
+
     def reset(self) -> None:
-        self.history.clear()
+        self.session_timeline.reset()
 
     def close(self) -> None:
         self.close_calls += 1
@@ -67,6 +86,7 @@ class RuntimeFactory:
         self.next_request_approval = False
         self.next_stream_chunks = None
         self.next_block = False
+        self.next_error = None
         self.calls: list[tuple[object, dict]] = []
         self.runtimes: list[FakeRuntime] = []
 
@@ -78,10 +98,13 @@ class RuntimeFactory:
             stream_callback=_kwargs.get("stream_callback"),
             stream_chunks=self.next_stream_chunks,
             block=self.next_block,
+            timeline=_kwargs.get("timeline"),
+            error=self.next_error,
         )
         self.next_request_approval = False
         self.next_stream_chunks = None
         self.next_block = False
+        self.next_error = None
         self.runtimes.append(runtime)
         return runtime
 
@@ -242,9 +265,54 @@ class DesktopSidecarTests(unittest.TestCase):
         self.assertTrue(session["canChangeModel"])
         self.assertTrue(session["canConfigureAgents"])
         self.assertTrue(any(name == "state" for name, _payload in self.events))
-        persisted = self.sidecar.manager.conversation_store.load()["sessions"][0]
-        self.assertEqual([item["speaker"] for item in persisted["messages"]], ["你", "MyAgent"])
-        self.assertEqual(persisted["history"][-1]["role"], "assistant")
+        persisted = self.sidecar.manager.session_store.load_session(session_id)
+        self.assertEqual([item["speaker"] for item in persisted.messages], ["你", "MyAgent"])
+        self.assertEqual(persisted.timeline.snapshot_history()[-1]["role"], "assistant")
+
+    def test_stream_chunks_do_not_commit_and_each_terminal_commits_once(self) -> None:
+        session_id = self.register_and_select()
+        path = self.sidecar.manager.session_store.root / f"{session_id}.jsonl"
+        before = path.read_bytes()
+        before_lines = path.read_text(encoding="utf-8").splitlines()
+        self.factory.next_stream_chunks = ["a", "b"]
+        self.factory.next_block = True
+        self.sidecar.dispatch(
+            "session.submit", {"sessionId": session_id, "prompt": "streamed"}
+        )
+        self.assertTrue(self.factory.runtimes[-1].started.wait(1))
+        self.sidecar.poll_once()
+        self.assertEqual(path.read_bytes(), before)
+        self.factory.runtimes[-1].release.set()
+        self.pump_until(lambda: self.sidecar.manager.sessions[0].controller.state == "idle")
+        after_assistant = path.read_text(encoding="utf-8").splitlines()
+        appended = [json.loads(line)["event"] for line in after_assistant[len(before_lines):]]
+        self.assertEqual(appended, ["turn_committed"])
+        self.sidecar.poll_once()
+        self.assertEqual(path.read_text(encoding="utf-8").splitlines(), after_assistant)
+
+        second_id = self.sidecar.dispatch("session.new")["state"]["activeSessionId"]
+        self.sidecar.dispatch(
+            "session.configure_agent_model",
+            {"sessionId": second_id, "role": "main", "name": "model-one"},
+        )
+        second_path = self.sidecar.manager.session_store.root / f"{second_id}.jsonl"
+        second_before = second_path.read_text(encoding="utf-8").splitlines()
+        self.factory.next_error = RuntimeError("terminal error")
+        self.sidecar.dispatch(
+            "session.submit", {"sessionId": second_id, "prompt": "fails"}
+        )
+        self.pump_until(
+            lambda: next(
+                item for item in self.sidecar.snapshot()["sessions"] if item["id"] == second_id
+            )["state"] == "idle"
+        )
+        second_after = second_path.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(
+            [json.loads(line)["event"] for line in second_after[len(second_before):]],
+            ["turn_committed"],
+        )
+        self.sidecar.poll_once()
+        self.assertEqual(second_path.read_text(encoding="utf-8").splitlines(), second_after)
 
     def test_main_and_subagent_models_are_configured_independently(self) -> None:
         session_id = self.register_and_select()
@@ -341,9 +409,12 @@ class DesktopSidecarTests(unittest.TestCase):
         )
         self.factory.runtimes[1].release.set()
         self.pump_until(self.sidecar.manager.all_closed)
-        persisted = self.sidecar.manager.conversation_store.load()
-        self.assertEqual([len(item["messages"]) for item in persisted["sessions"]], [2, 2])
-        self.assertEqual([len(item["history"]) for item in persisted["sessions"]], [2, 2])
+        persisted = [
+            self.sidecar.manager.session_store.load_session(session_id)
+            for session_id in (first_id, second_id)
+        ]
+        self.assertEqual([len(item.messages) for item in persisted], [2, 2])
+        self.assertEqual([len(item.timeline.snapshot_history()) for item in persisted], [2, 2])
         restored = SessionManager(
             store=ModelStore(self.sidecar.manager.store.path),
             default_cwd=self.temp.name,

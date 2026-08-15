@@ -7,13 +7,13 @@ import os
 import re
 import secrets
 import tempfile
-from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, fields
 from pathlib import Path
 from threading import RLock
 from typing import Any
 
+from .session_timeline import SessionTimeline, TimelineBlockView
 from .tooling import FunctionTool
 
 
@@ -51,9 +51,6 @@ _STATUS_KEYS = (
     "returncode",
     "exit_code",
 )
-_MANAGED_REPRESENTATIONS = frozenset({"preview", "summary"})
-
-
 @dataclass(frozen=True)
 class MemoryConfig:
     """Thresholds and bounds for one agent's context-memory policy."""
@@ -293,17 +290,8 @@ class ToolResultStore:
             raise
 
 
-@dataclass
-class _HistoryBlock:
-    kind: str
-    items: list[object]
-    turn_id: int | None
-    sent: bool = False
-    complete: bool = True
-
-
 class ContextMemory:
-    """Track atomic history blocks and apply the three bounded policies."""
+    """Apply context policy to a SessionTimeline-owned conversation."""
 
     def __init__(
         self,
@@ -316,120 +304,50 @@ class ContextMemory:
             raise TypeError("config must be a MemoryConfig")
         self.store = store
         self.config = config if config is not None else MemoryConfig()
-        self._blocks: list[_HistoryBlock] = []
-        self._current_turn = 0
-        self._open_exchange: _HistoryBlock | None = None
-        self._managed_output_ids: set[int] = set()
-
-    def reset(self) -> None:
-        """Forget in-memory block and summary state without deleting stored files."""
-        self._blocks.clear()
-        self._current_turn = 0
-        self._open_exchange = None
-        self._managed_output_ids.clear()
-
-    def record_user_turn(self, items: Sequence[object]) -> None:
-        self._current_turn += 1
-        self._blocks.append(
-            _HistoryBlock("user", list(items), self._current_turn)
-        )
-
-    def record_response(self, items: Sequence[object]) -> None:
-        recorded = list(items)
-        if not recorded:
-            self._open_exchange = None
-            return
-        call_ids = tuple(
-            _item_field(item, "call_id")
-            for item in recorded
-            if _item_type(item) == "function_call"
-        )
-        block = _HistoryBlock(
-            "exchange",
-            recorded,
-            self._current_turn or None,
-            complete=not call_ids,
-        )
-        self._blocks.append(block)
-        self._open_exchange = block if call_ids else None
-
-    def record_tool_outputs(self, items: Sequence[object]) -> None:
-        recorded = list(items)
-        block = self._open_exchange
-        if block is None:
-            block = _HistoryBlock(
-                "exchange",
-                [],
-                self._current_turn or None,
-                complete=False,
-            )
-            self._blocks.append(block)
-        block.items.extend(recorded)
-        block.complete = True
-        block.complete = _block_has_atomic_protocol(block)
-        self._open_exchange = None
-        for item in recorded:
-            if _is_managed_output(item, self.store):
-                self._managed_output_ids.add(id(item))
-
-    def record_runtime_items(self, items: Sequence[object]) -> None:
-        """Track complete runtime messages already appended to flat history."""
-        recorded = list(items)
-        if not recorded:
-            return
-        self._blocks.append(
-            _HistoryBlock(
-                "runtime",
-                recorded,
-                self._current_turn or None,
-                complete=True,
-            )
-        )
 
     def prepare_tool_output(self, serialized_result: str) -> str:
-        """Eagerly offload one oversized serialized result, or return it unchanged."""
+        """Prepare one tool result before it enters the immutable timeline log."""
         if not isinstance(serialized_result, str):
             raise TypeError("serialized_result must be a string")
         original_bytes = len(serialized_result.encode("utf-8"))
-        if original_bytes <= self.config.eager_persist_threshold_bytes:
+        if original_bytes <= self.config.tool_summary_threshold_bytes:
             return serialized_result
         return self._persist_and_represent(
             serialized_result,
             original_bytes,
-            representation="preview",
+            representation=(
+                "preview"
+                if original_bytes > self.config.eager_persist_threshold_bytes
+                else "summary"
+            ),
         )
 
     def prepare_request(
         self,
-        history: list[object],
+        timeline: SessionTimeline,
         summarizer: HistorySummarizer | None = None,
     ) -> None:
-        """Summarize large results, then model-compress safe sent blocks."""
-        self._summarize_tool_outputs(history)
+        """Model-compress only safe, sent blocks from the active projection."""
+        if not isinstance(timeline, SessionTimeline):
+            raise TypeError("timeline must be a SessionTimeline")
+        history = timeline.build_model_input()
         if _context_size_bytes(history) <= (
             self.config.context_compaction_threshold_bytes
         ):
             return
-        if not self._history_matches(history):
-            # Public history remains mutable for compatibility. If a caller changes
-            # its structure behind this component, preserve it instead of guessing
-            # protocol boundaries and pruning potentially unpaired items.
-            return
-        self._compact_sent_history(history, summarizer)
-
-    def mark_request_succeeded(self) -> None:
-        """Make every block included in the completed request eligible later."""
-        for block in self._blocks:
-            block.sent = True
+        self._compact_sent_history(timeline, summarizer)
 
     def emergency_compact(
         self,
-        history: list[object],
+        timeline: SessionTimeline,
         summarizer: HistorySummarizer,
     ) -> None:
-        """Replace the complete flat history after a real context-limit failure."""
+        """Summarize the complete active projection after a real context error."""
+        if not isinstance(timeline, SessionTimeline):
+            raise TypeError("timeline must be a SessionTimeline")
+        blocks = timeline.active_blocks()
         source = _history_compaction_source(
-            [_HistoryBlock("emergency", list(history), None)],
+            blocks,
             max_item_chars=max(
                 self.config.preview_chars,
                 self.config.history_summary_chars,
@@ -442,51 +360,7 @@ class ContextMemory:
         )
         if summary_content is None:
             raise RuntimeError("The emergency history summarizer returned empty text")
-
-        summary_message = {
-            "type": "message",
-            "role": "assistant",
-            "content": summary_content,
-        }
-        summary_block = _HistoryBlock(
-            "summary",
-            [summary_message],
-            None,
-            sent=False,
-        )
-        history[:] = [summary_message]
-        self._blocks = [summary_block]
-        self._open_exchange = None
-        self._managed_output_ids.clear()
-
-    @property
-    def block_count(self) -> int:
-        return len(self._blocks)
-
-    @property
-    def summary_count(self) -> int:
-        return sum(block.kind == "summary" for block in self._blocks)
-
-    def _summarize_tool_outputs(self, history: Sequence[object]) -> None:
-        for item in history:
-            if _item_type(item) != "function_call_output":
-                continue
-            if not isinstance(item, dict) or id(item) in self._managed_output_ids:
-                continue
-            serialized_result = item.get("output")
-            if not isinstance(serialized_result, str):
-                continue
-            original_bytes = len(serialized_result.encode("utf-8"))
-            if original_bytes <= self.config.tool_summary_threshold_bytes:
-                continue
-            replacement = self._persist_and_represent(
-                serialized_result,
-                original_bytes,
-                representation="summary",
-            )
-            if replacement != serialized_result:
-                item["output"] = replacement
-                self._managed_output_ids.add(id(item))
+        timeline.emergency_compact(summary_content)
 
     def _persist_and_represent(
         self,
@@ -512,52 +386,56 @@ class ContextMemory:
 
     def _compact_sent_history(
         self,
-        history: list[object],
+        timeline: SessionTimeline,
         summarizer: HistorySummarizer | None,
     ) -> None:
         if summarizer is None:
             return
-        summaries = [block for block in self._blocks if block.kind == "summary"]
+        blocks = timeline.active_blocks()
+        summaries = [block for block in blocks if block.kind == "summary"]
         if any(not block.sent for block in summaries):
             return
 
         user_turns = [
             block.turn_id
-            for block in self._blocks
+            for block in blocks
             if block.kind == "user" and block.turn_id is not None
         ]
         recent_turns = set(user_turns[-self.config.recent_user_turns :])
         candidates = [
             block
-            for block in self._blocks
+            for block in blocks
             if block.kind != "summary"
             and block.sent
             and not (block.kind == "user" and block.turn_id == 1)
             and block.turn_id not in recent_turns
-            and _block_has_atomic_protocol(block)
+            and block.protocol_complete
         ]
         if not candidates:
             return
 
-        selected: list[_HistoryBlock] = []
+        selected: list[TimelineBlockView] = []
         placeholder = HISTORY_SUMMARY_PREFIX + "\n" + "x" * (
             self.config.history_summary_chars - len(HISTORY_SUMMARY_PREFIX) - 1
         )
         for candidate in candidates:
             selected.append(candidate)
-            proposal = self._compaction_proposal(
+            proposal = _compaction_projection(
+                blocks,
                 summaries,
                 selected,
                 placeholder,
             )
-            if _context_size_bytes(_flatten_blocks(proposal)) <= (
+            if _context_size_bytes(proposal) <= (
                 self.config.context_compaction_threshold_bytes
             ):
                 break
 
-        removed_ids = {id(block) for block in [*summaries, *selected]}
+        removed_ids = {
+            block.block_id for block in [*summaries, *selected]
+        }
         summarized_blocks = [
-            block for block in self._blocks if id(block) in removed_ids
+            block for block in blocks if block.block_id in removed_ids
         ]
         source = _history_compaction_source(
             summarized_blocks,
@@ -576,54 +454,9 @@ class ContextMemory:
         )
         if summary_content is None:
             return
-        proposal = self._compaction_proposal(
-            summaries,
-            selected,
+        timeline.compact_blocks(
+            [block.block_id for block in summarized_blocks],
             summary_content,
-        )
-
-        for block in self._blocks:
-            if id(block) not in removed_ids:
-                continue
-            for item in block.items:
-                self._managed_output_ids.discard(id(item))
-        self._blocks = proposal
-        history[:] = _flatten_blocks(self._blocks)
-
-    def _compaction_proposal(
-        self,
-        summaries: Sequence[_HistoryBlock],
-        selected: Sequence[_HistoryBlock],
-        summary_content: str,
-    ) -> list[_HistoryBlock]:
-        removed_ids = {id(block) for block in [*summaries, *selected]}
-        summary_message = {
-            "type": "message",
-            "role": "assistant",
-            "content": summary_content,
-        }
-        remaining = [
-            block for block in self._blocks if id(block) not in removed_ids
-        ]
-        summary_block = _HistoryBlock(
-            "summary",
-            [summary_message],
-            None,
-            sent=False,
-        )
-        insertion_index = 0
-        for index, block in enumerate(remaining):
-            if block.kind == "user" and block.turn_id == 1:
-                insertion_index = index + 1
-                break
-        remaining.insert(insertion_index, summary_block)
-        return remaining
-
-    def _history_matches(self, history: Sequence[object]) -> bool:
-        tracked = _flatten_blocks(self._blocks)
-        return len(tracked) == len(history) and all(
-            tracked_item is history_item
-            for tracked_item, history_item in zip(tracked, history)
         )
 
 
@@ -773,7 +606,7 @@ def _content_hints(value: Any, *, max_chars: int) -> list[dict[str, Any]]:
 
 
 def _history_compaction_source(
-    blocks: Sequence[_HistoryBlock],
+    blocks: Sequence[TimelineBlockView],
     *,
     max_item_chars: int,
 ) -> str:
@@ -859,6 +692,41 @@ def _history_compaction_source(
     return f"{HISTORY_COMPACTION_DATA_PREFIX}\n{serialized}"
 
 
+def _compaction_projection(
+    blocks: Sequence[TimelineBlockView],
+    summaries: Sequence[TimelineBlockView],
+    selected: Sequence[TimelineBlockView],
+    summary_content: str,
+) -> list[object]:
+    removed_ids = {
+        block.block_id for block in [*summaries, *selected]
+    }
+    remaining = [block for block in blocks if block.block_id not in removed_ids]
+    summary_message = {
+        "type": "message",
+        "role": "assistant",
+        "content": summary_content,
+    }
+    insertion_index = 0
+    for index, block in enumerate(remaining):
+        if block.kind == "user" and block.turn_id == 1:
+            insertion_index = index + 1
+            break
+    projected = list(remaining)
+    projected.insert(
+        insertion_index,
+        TimelineBlockView(
+            block_id=-1,
+            kind="summary",
+            items=(summary_message,),
+            turn_id=None,
+            sent=False,
+            protocol_complete=True,
+        ),
+    )
+    return [item for block in projected for item in block.items]
+
+
 def _normalized_history_summary(value: object, max_chars: int) -> str | None:
     if not isinstance(value, str):
         return None
@@ -870,40 +738,6 @@ def _normalized_history_summary(value: object, max_chars: int) -> str | None:
     return _clip_text(
         f"{HISTORY_SUMMARY_PREFIX}\n{body}",
         max_chars,
-    )
-
-
-def _block_has_atomic_protocol(block: _HistoryBlock) -> bool:
-    if not block.complete:
-        return False
-    calls = Counter(
-        _item_field(item, "call_id")
-        for item in block.items
-        if _item_type(item) == "function_call"
-    )
-    outputs = Counter(
-        _item_field(item, "call_id")
-        for item in block.items
-        if _item_type(item) == "function_call_output"
-    )
-    if not calls and not outputs:
-        return True
-    return (
-        calls == outputs
-        and all(isinstance(call_id, str) and call_id for call_id in calls)
-        and all(count == 1 for count in calls.values())
-    )
-
-
-def _is_managed_output(item: object, store: ToolResultStore) -> bool:
-    if not isinstance(item, dict) or _item_type(item) != "function_call_output":
-        return False
-    parsed = _parse_json_object(item.get("output"))
-    return bool(
-        parsed is not None
-        and parsed.get("representation") in _MANAGED_REPRESENTATIONS
-        and store.is_valid_ref(parsed.get("ref"))
-        and isinstance(parsed.get("original_bytes"), int)
     )
 
 
@@ -946,10 +780,6 @@ def _item_field(item: object, name: str) -> Any:
     if isinstance(item, Mapping):
         return item.get(name)
     return getattr(item, name, None)
-
-
-def _flatten_blocks(blocks: Sequence[_HistoryBlock]) -> list[object]:
-    return [item for block in blocks for item in block.items]
 
 
 def _context_size_bytes(history: Sequence[object]) -> int:

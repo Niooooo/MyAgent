@@ -6,13 +6,17 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from myagent.cli import (
+    _CLISession,
     _ask_user_approval,
     _client_options,
     _config_from_environment,
     _load_config,
+    build_parser,
     main,
 )
 from myagent.permissions import ApprovalRequest
+from myagent.session_store import AppendTurnResult, SessionStore
+from myagent.session_timeline import SessionTimeline
 
 
 class ConsoleApprovalTests(unittest.TestCase):
@@ -64,6 +68,25 @@ class EnvironmentConfigTests(unittest.TestCase):
     def test_invalid_numeric_environment_variable_is_reported(self) -> None:
         with self.assertRaisesRegex(SystemExit, "Invalid numeric environment"):
             _config_from_environment("model")
+
+
+class SessionArgumentTests(unittest.TestCase):
+    def test_session_flags_and_positive_resume_id(self) -> None:
+        self.assertTrue(build_parser().parse_args(["-c"]).continue_session)
+        self.assertEqual(build_parser().parse_args(["-r", "7"]).resume, 7)
+        self.assertTrue(build_parser().parse_args(["--no-session"]).no_session)
+        for value in ("0", "-1", "not-an-id"):
+            with self.assertRaises(SystemExit):
+                build_parser().parse_args(["--resume", value])
+
+    def test_session_flags_are_mutually_exclusive(self) -> None:
+        for arguments in (
+            ["-c", "-r", "1"],
+            ["-c", "--no-session"],
+            ["-r", "1", "--no-session"],
+        ):
+            with self.assertRaises(SystemExit):
+                build_parser().parse_args(arguments)
 
 
 class ClientConfigurationTests(unittest.TestCase):
@@ -137,7 +160,7 @@ class ClientConfigurationTests(unittest.TestCase):
         )
 
     @patch.dict("os.environ", {}, clear=True)
-    @patch("sys.argv", ["myagent", "hello"])
+    @patch("sys.argv", ["myagent", "--no-session", "hello"])
     @patch("builtins.print")
     @patch("myagent.cli.create_default_agent")
     def test_cli_disables_sdk_retries(self, create_default_agent, _print) -> None:
@@ -169,6 +192,65 @@ class ClientConfigurationTests(unittest.TestCase):
         self.assertEqual(config.fallback_model, "file-fallback")
         fake_agent.run.assert_called_once_with("hello")
         fake_agent.close.assert_called_once_with()
+
+
+class CLISessionCoordinatorTests(unittest.TestCase):
+    def test_persist_failure_retains_every_cursor_for_retry(self) -> None:
+        timeline = SessionTimeline()
+        timeline.record_user_input([{"role": "user", "content": "first"}])
+        store = MagicMock()
+        store.append_turn.side_effect = [
+            RuntimeError("disk"),
+            AppendTurnResult(4, timeline.pending_operations[-1].operation_id),
+        ]
+        session = _CLISession(
+            Path.cwd(),
+            timeline,
+            (),
+            store=store,
+            session_id=9,
+            revision=3,
+        )
+        session.record_message("你", "first")
+
+        with patch("builtins.print"):
+            self.assertFalse(session.persist())
+        self.assertEqual(session.revision, 3)
+        self.assertEqual(session.message_cursor, 0)
+        self.assertTrue(timeline.pending_operations)
+
+        self.assertTrue(session.persist())
+        self.assertEqual(session.revision, 4)
+        self.assertEqual(session.message_cursor, 1)
+        self.assertEqual(timeline.pending_operations, ())
+        self.assertEqual(store.append_turn.call_args.kwargs["expected_revision"], 3)
+
+    @patch.dict("os.environ", {}, clear=True)
+    @patch("sys.argv", ["myagent", "--no-session", "hello"])
+    @patch("builtins.print")
+    @patch("myagent.cli.SessionStore")
+    @patch("myagent.cli.create_default_agent")
+    def test_no_session_never_constructs_store_and_injects_new_timeline(
+        self,
+        create_default_agent,
+        session_store,
+        _print,
+    ) -> None:
+        fake_agent = MagicMock()
+        fake_agent.run.return_value = "done"
+        create_default_agent.return_value = fake_agent
+        openai_constructor = MagicMock(return_value=object())
+
+        with patch(
+            "sys.modules", {"openai": SimpleNamespace(OpenAI=openai_constructor)}
+        ):
+            main()
+
+        session_store.assert_not_called()
+        timeline = create_default_agent.call_args.kwargs["session_timeline"]
+        self.assertIsInstance(timeline, SessionTimeline)
+        self.assertEqual(timeline.operations, ())
+        self.assertEqual(create_default_agent.call_args.kwargs["cwd"], Path.cwd())
 
 
 if __name__ == "__main__":

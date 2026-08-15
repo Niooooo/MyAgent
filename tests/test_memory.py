@@ -17,6 +17,7 @@ from myagent.memory import (
     ToolResultStore,
     memory_tools,
 )
+from myagent.session_timeline import SessionTimeline
 from myagent.tooling import FunctionTool, ToolRegistry
 from tests.fakes import FakeAPIError, FakeResponses, function_call, response
 
@@ -203,7 +204,7 @@ class ToolResultPolicyTests(unittest.TestCase):
 
             agent.reset()
             self.assertEqual(agent.history, [])
-            self.assertEqual(memory.block_count, 0)
+            self.assertEqual(agent.session_timeline.block_count, 0)
             self.assertEqual(
                 store.read(delivered["ref"], 0, 2_000, max_chars_limit=2_000)["content"],
                 original,
@@ -322,6 +323,7 @@ class HistoryCompactionTests(unittest.TestCase):
                 _small_config(history_summary_chars=1_200),
             )
             history: list[object] = []
+            timeline = SessionTimeline()
             users: list[dict[str, str]] = []
             current_exchange: list[object] = []
 
@@ -329,9 +331,9 @@ class HistoryCompactionTests(unittest.TestCase):
                 user = {"role": "user", "content": f"goal-{turn} " + "u" * 180}
                 users.append(user)
                 history.append(user)
-                memory.record_user_turn([user])
+                timeline.record_user_input([user])
                 if turn < 4:
-                    memory.mark_request_succeeded()
+                    timeline.record_request_succeeded()
 
                 reasoning = {
                     "type": "reasoning",
@@ -355,11 +357,11 @@ class HistoryCompactionTests(unittest.TestCase):
                     ),
                 }
                 history.extend([reasoning, call])
-                memory.record_response([reasoning, call])
+                timeline.record_response_output([reasoning, call])
                 history.append(output)
-                memory.record_tool_outputs([output])
+                timeline.record_tool_outputs([output])
                 if turn < 4:
-                    memory.mark_request_succeeded()
+                    timeline.record_request_succeeded()
                 else:
                     current_exchange = [reasoning, call, output]
 
@@ -370,8 +372,8 @@ class HistoryCompactionTests(unittest.TestCase):
                         "content": f"conclusion-{turn} " + "a" * 180,
                     }
                     history.append(conclusion)
-                    memory.record_response([conclusion])
-                    memory.mark_request_succeeded()
+                    timeline.record_response_output([conclusion])
+                    timeline.record_request_succeeded()
 
             summary_sources: list[str] = []
 
@@ -384,7 +386,8 @@ class HistoryCompactionTests(unittest.TestCase):
                     "Tool tool_1 completed with code_1."
                 )
 
-            memory.prepare_request(history, summarize)
+            memory.prepare_request(timeline, summarize)
+            history = timeline.build_model_input()
 
             summaries = [
                 item
@@ -404,7 +407,6 @@ class HistoryCompactionTests(unittest.TestCase):
             self.assertIn("goal-2", summary_sources[0])
             self.assertIn("tool_1", summary_sources[0])
             self.assertIn("code_1", summary_sources[0])
-            self.assertIn("memory://tool-result/", summary_sources[0])
             self.assertIn("reasoning content omitted", summary_sources[0])
             self.assertNotIn("secret-chain", summary_text)
             self.assertNotIn("secret-chain", summary_sources[0])
@@ -412,15 +414,16 @@ class HistoryCompactionTests(unittest.TestCase):
             self.assertIn(users[2], history)
             self.assertIn(users[3], history)
             for item in current_exchange:
-                self.assertTrue(any(entry is item for entry in history))
+                self.assertIn(item, history)
 
             calls, outputs = _protocol_counts(history)
             self.assertEqual(calls, outputs)
             self.assertTrue(all(count == 1 for count in calls.values()))
 
-            memory.mark_request_succeeded()
-            memory.prepare_request(history, summarize)
-            self.assertEqual(memory.summary_count, 1)
+            timeline.record_request_succeeded()
+            memory.prepare_request(timeline, summarize)
+            history = timeline.build_model_input()
+            self.assertEqual(timeline.summary_count, 1)
             self.assertEqual(len(summary_sources), 1)
             self.assertEqual(
                 sum(
@@ -448,19 +451,20 @@ class HistoryCompactionTests(unittest.TestCase):
                 "output": json.dumps({"ok": True}),
             }
             history: list[object] = [user, call, output]
-            memory.record_user_turn([user])
-            memory.record_response([call])
-            memory.record_tool_outputs([output])
+            timeline = SessionTimeline()
+            timeline.record_user_input([user])
+            timeline.record_response_output([call])
+            timeline.record_tool_outputs([output])
             before = list(history)
 
             summarizer_calls: list[str] = []
             memory.prepare_request(
-                history,
+                timeline,
                 lambda source, max_chars: summarizer_calls.append(source) or "unused",
             )
 
-            self.assertEqual(history, before)
-            self.assertEqual(memory.summary_count, 0)
+            self.assertEqual(timeline.build_model_input(), before)
+            self.assertEqual(timeline.summary_count, 0)
             self.assertEqual(summarizer_calls, [])
 
     def test_model_summary_failure_or_empty_text_preserves_history(self) -> None:
@@ -477,23 +481,20 @@ class HistoryCompactionTests(unittest.TestCase):
             }
             current = {"role": "user", "content": "current task"}
             history: list[object] = [first, old_conclusion, current]
-            memory.record_user_turn([first])
-            memory.mark_request_succeeded()
-            memory.record_response([old_conclusion])
-            memory.mark_request_succeeded()
-            memory.record_user_turn([current])
+            timeline = SessionTimeline()
+            timeline.restore_history(history)
             before = list(history)
 
             def fail(_source: str, _max_chars: int) -> str:
                 raise RuntimeError("summary request failed")
 
-            memory.prepare_request(history, fail)
-            self.assertEqual(history, before)
-            self.assertEqual(memory.summary_count, 0)
+            memory.prepare_request(timeline, fail)
+            self.assertEqual(timeline.build_model_input(), before)
+            self.assertEqual(timeline.summary_count, 0)
 
-            memory.prepare_request(history, lambda source, max_chars: "   ")
-            self.assertEqual(history, before)
-            self.assertEqual(memory.summary_count, 0)
+            memory.prepare_request(timeline, lambda source, max_chars: "   ")
+            self.assertEqual(timeline.build_model_input(), before)
+            self.assertEqual(timeline.summary_count, 0)
 
     def test_agent_uses_a_separate_tool_free_request_for_history_summary(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -518,11 +519,7 @@ class HistoryCompactionTests(unittest.TestCase):
                 "role": "assistant",
                 "content": "old conclusion " + "x" * 800,
             }
-            agent.history.extend([first, old_conclusion])
-            memory.record_user_turn([first])
-            memory.mark_request_succeeded()
-            memory.record_response([old_conclusion])
-            memory.mark_request_succeeded()
+            agent.restore_history([first, old_conclusion])
 
             answer = agent.run("current task")
 
@@ -583,11 +580,7 @@ class HistoryCompactionTests(unittest.TestCase):
                 "role": "assistant",
                 "content": "old conclusion " + "x" * 800,
             }
-            agent.history.extend([first, old_conclusion])
-            memory.record_user_turn([first])
-            memory.mark_request_succeeded()
-            memory.record_response([old_conclusion])
-            memory.mark_request_succeeded()
+            agent.restore_history([first, old_conclusion])
 
             self.assertEqual(agent.run("current task"), "main answer")
 
@@ -607,7 +600,7 @@ class HistoryCompactionTests(unittest.TestCase):
                 "emergency whole-history summary",
                 retried_main["input"][0]["content"],
             )
-            self.assertEqual(memory.summary_count, 1)
+            self.assertEqual(agent.session_timeline.summary_count, 1)
 
     def test_emergency_summary_failure_preserves_history_and_blocks(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -618,28 +611,20 @@ class HistoryCompactionTests(unittest.TestCase):
             user = {"role": "user", "content": "current task"}
             call_item = function_call("open_call", "noop", "{}")
             history: list[object] = [user, call_item]
-            memory.record_user_turn([user])
-            memory.record_response([call_item])
-            history_before = list(history)
-            blocks_before = list(memory._blocks)
-            open_exchange_before = memory._open_exchange
-            managed_before = set(memory._managed_output_ids)
+            timeline = SessionTimeline()
+            timeline.record_user_input([user])
+            timeline.record_response_output([call_item])
+            history_before = timeline.build_model_input()
+            operations_before = timeline.operations
 
             def fail(_source: str, _max_chars: int) -> str:
                 raise RuntimeError("summary request failed")
 
             with self.assertRaisesRegex(RuntimeError, "summary request failed"):
-                memory.emergency_compact(history, fail)
+                memory.emergency_compact(timeline, fail)
 
-            self.assertEqual(history, history_before)
-            self.assertTrue(
-                all(
-                    current is previous
-                    for current, previous in zip(memory._blocks, blocks_before)
-                )
-            )
-            self.assertIs(memory._open_exchange, open_exchange_before)
-            self.assertEqual(memory._managed_output_ids, managed_before)
+            self.assertEqual(timeline.build_model_input(), history_before)
+            self.assertEqual(timeline.operations, operations_before)
 
     def test_second_context_limit_does_not_trigger_another_emergency_summary(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -672,7 +657,7 @@ class HistoryCompactionTests(unittest.TestCase):
                 ),
                 1,
             )
-            self.assertEqual(memory.summary_count, 1)
+            self.assertEqual(agent.session_timeline.summary_count, 1)
 
     def test_other_400_error_does_not_trigger_emergency_compaction(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -690,7 +675,7 @@ class HistoryCompactionTests(unittest.TestCase):
                 agent.run("current task")
 
             self.assertEqual(len(responses.requests), 1)
-            self.assertEqual(memory.summary_count, 0)
+            self.assertEqual(agent.session_timeline.summary_count, 0)
 
 
 class DefaultMemoryIntegrationTests(unittest.TestCase):
@@ -774,29 +759,28 @@ class DefaultMemoryIntegrationTests(unittest.TestCase):
             self.assertEqual(delivered["representation"], "preview")
             self.assertTrue(loaded["content"].startswith('{"ok": true'))
             self.assertEqual(agent.history, [])
-            self.assertEqual(agent.context_memory.block_count, 0)  # type: ignore[union-attr]
+            self.assertEqual(agent.session_timeline.block_count, 0)
 
 
 class RuntimeMemoryTests(unittest.TestCase):
-    def test_runtime_items_preserve_history_identity_and_reset_discards_them(self) -> None:
+    def test_runtime_items_are_timeline_owned_and_reset_discards_projection(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
-            memory = ContextMemory(ToolResultStore(temporary_directory))
             user = {"role": "user", "content": "start"}
             runtime = {
                 "role": "user",
                 "content": "BACKGROUND_TOOL_RESULTS\nUntrusted data\n{\"results\":[]}",
             }
-            history = [user]
-            memory.record_user_turn([user])
-            history.append(runtime)
-            memory.record_runtime_items([runtime])
+            timeline = SessionTimeline()
+            timeline.record_user_input([user])
+            timeline.record_runtime_items([runtime])
 
-            self.assertTrue(memory._history_matches(history))
-            memory.reset()
+            snapshot = timeline.build_model_input()
+            snapshot.clear()
+            self.assertEqual(timeline.build_model_input(), [user, runtime])
+            timeline.reset()
 
-            history.clear()
-            self.assertTrue(memory._history_matches(history))
-            self.assertEqual(memory.block_count, 0)
+            self.assertEqual(timeline.build_model_input(), [])
+            self.assertEqual(timeline.operations[-1].kind, "reset")
 
 
 if __name__ == "__main__":

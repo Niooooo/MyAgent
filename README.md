@@ -75,6 +75,8 @@ $env:OPENAI_API_KEY = "your-api-key"
 
 ```powershell
 myagent
+myagent -c
+myagent -r 3
 ```
 
 执行一次任务后退出：
@@ -83,7 +85,9 @@ myagent
 myagent "列出当前目录中的 Python 文件，并说明每个模块的职责"
 ```
 
-CLI 把启动命令所在的目录当作工作区。文件工具不能访问这个目录之外的路径。
+CLI 默认创建并保存一个会话；`-c` 继续最近激活的会话，`-r SESSION_ID` 恢复指定会话。恢复时会继续使用会话保存的工作区。只需要一次性临时运行、完全不读写会话文件时使用 `--no-session`。
+
+新会话把启动命令所在的目录当作工作区。文件工具不能访问这个目录之外的路径。
 
 ## MyAgent 能做什么
 
@@ -143,9 +147,11 @@ PermissionHook -> PreToolUse -> handler -> PostToolUse
 | `.myagent/memories/` | 长期记忆目录与正文 | 跨会话保留 |
 | `.myagent/memory/tool-results/` | 从上下文卸载的大型工具结果 | 跨会话保留 |
 | `.myagent/agent-team/inboxes/` | Agent Team 消息文件 | 工作区文件，运行时消费 |
-| `%APPDATA%\MyAgent\` | 桌面模型、设置和对话记录 | 当前 Windows 用户下保留 |
+| `%APPDATA%\MyAgent\` | 桌面模型、设置，以及 CLI/桌面共用的 `conversations\` 会话 JSONL | 当前 Windows 用户下保留 |
 
 `myagent.config.json` 已加入 `.gitignore`。桌面端的 API Key 也保存在仓库外，但仍是本机明文文件，请按敏感凭据保护。
+
+设置 `MYAGENT_HOME` 可以覆盖本地数据根目录；共用会话位于 `$env:MYAGENT_HOME\conversations`。
 
 ## 配置
 
