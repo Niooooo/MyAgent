@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,13 @@ from .agent import AgentLoop, AgentLoopLimitError
 from .composition import AgentConfig, create_default_agent
 from .mcp import parse_mcp_servers
 from .permissions import ApprovalRequest
+from .session_store import (
+    SessionMetadata,
+    SessionStore,
+    SessionStoreError,
+    StoredSession,
+)
+from .session_timeline import SessionTimeline
 
 
 CONFIG_PATH = Path("myagent.config.json")
@@ -53,27 +61,57 @@ def build_parser() -> argparse.ArgumentParser:
         default=os.getenv("OPENAI_MODEL", configured_model),
         help="OpenAI model ID (default: %(default)s)",
     )
+    sessions = parser.add_mutually_exclusive_group()
+    sessions.add_argument(
+        "-c",
+        "--continue",
+        dest="continue_session",
+        action="store_true",
+        help="Continue the currently active persistent session",
+    )
+    sessions.add_argument(
+        "-r",
+        "--resume",
+        metavar="SESSION_ID",
+        type=_positive_session_id,
+        help="Resume a persistent session by its positive integer ID",
+    )
+    sessions.add_argument(
+        "--no-session",
+        action="store_true",
+        help="Run without reading or writing persistent session data",
+    )
     return parser
 
 
 def main() -> None:
     args = build_parser().parse_args()
+    prompt = " ".join(args.prompt)
+    client_options = _client_options(args.file_config)
+    sensitive_values = _sensitive_values(client_options)
+    cli_session = _prepare_cli_session(
+        args,
+        prompt=prompt,
+        sensitive_values=sensitive_values,
+    )
 
     # Import lazily so local unit tests for the loop and tools do not require the SDK.
     from openai import OpenAI
 
     agent = create_default_agent(
-        OpenAI(**_client_options(args.file_config)),
+        OpenAI(**client_options),
         config=_config_from_environment(
             args.model,
             args.fallback_model,
             args.file_config,
         ),
+        cwd=cli_session.workspace,
         approval_callback=_ask_user_approval,
+        session_timeline=cli_session.timeline,
     )
     try:
         if args.prompt:
-            _run_turn(agent, " ".join(args.prompt))
+            _run_turn(agent, prompt, cli_session)
             return
 
         print(f"MyAgent ({args.model}). Type 'exit' or 'quit' to leave.")
@@ -88,20 +126,218 @@ def main() -> None:
                 return
             if not user_input:
                 continue
-            _run_turn(agent, user_input)
+            _run_turn(agent, user_input, cli_session)
     finally:
         agent.close()
 
 
-def _run_turn(agent: AgentLoop, user_input: str) -> None:
+def _run_turn(
+    agent: AgentLoop,
+    user_input: str,
+    cli_session: _CLISession | None = None,
+) -> None:
+    selected = cli_session or _CLISession.temporary(Path.cwd().resolve(), ())
+    selected.record_message("你", user_input)
     try:
         answer = agent.run(user_input)
     except AgentLoopLimitError as exc:
-        print(f"agent error: {exc}", file=sys.stderr)
+        error_text = f"agent error: {selected.redact_error(exc)}"
+        print(error_text, file=sys.stderr)
+        selected.record_message("错误", error_text)
     except Exception as exc:
-        print(f"request failed: {exc}", file=sys.stderr)
+        error_text = f"request failed: {selected.redact_error(exc)}"
+        print(error_text, file=sys.stderr)
+        selected.record_message("错误", error_text)
     else:
         print(f"agent> {answer}")
+        selected.record_message("MyAgent", answer)
+    selected.persist()
+
+
+@dataclass
+class _CLISession:
+    """Own one CLI process's durable boundary without coupling it to AgentLoop."""
+
+    workspace: Path
+    timeline: SessionTimeline
+    sensitive_values: tuple[str, ...] = field(repr=False)
+    store: SessionStore | None = None
+    session_id: int | None = None
+    revision: int = 0
+    messages: list[dict[str, str]] = field(default_factory=list)
+    message_cursor: int = 0
+
+    @classmethod
+    def temporary(
+        cls,
+        workspace: Path,
+        sensitive_values: tuple[str, ...],
+    ) -> _CLISession:
+        return cls(workspace, SessionTimeline(), sensitive_values)
+
+    def record_message(self, speaker: str, text: str) -> None:
+        self.messages.append({"speaker": speaker, "text": text})
+
+    def redact_error(self, error: BaseException) -> str:
+        detail = str(error) or type(error).__name__
+        for value in self.sensitive_values:
+            if value:
+                detail = detail.replace(value, "[redacted]")
+        return detail
+
+    def persist(self) -> bool:
+        if self.store is None or self.session_id is None:
+            return True
+        pending = self.timeline.pending_operations
+        if not pending:
+            return True
+        messages = self.messages[self.message_cursor :]
+        try:
+            result = self.store.append_turn(
+                self.session_id,
+                messages,
+                expected_revision=self.revision,
+                pending_operations=pending,
+                sensitive_values=self.sensitive_values,
+            )
+        except Exception as exc:
+            print(
+                f"session persist failed: {self.redact_error(exc)}",
+                file=sys.stderr,
+            )
+            return False
+        self.timeline.acknowledge_operations(result.through_operation_id)
+        self.revision = result.new_revision
+        self.message_cursor = len(self.messages)
+        return True
+
+
+def _prepare_cli_session(
+    args: argparse.Namespace,
+    *,
+    prompt: str,
+    sensitive_values: tuple[str, ...],
+) -> _CLISession:
+    launch_workspace = Path.cwd().resolve()
+    if args.no_session:
+        return _CLISession.temporary(launch_workspace, sensitive_values)
+
+    store = SessionStore(sensitive_values=sensitive_values)
+    try:
+        catalog = store.initialize(sensitive_values=sensitive_values)
+        if args.continue_session or args.resume is not None:
+            session_id = (
+                catalog.active_session_id
+                if args.continue_session
+                else args.resume
+            )
+            if session_id is None:
+                raise SessionStoreError("no active session to continue")
+            stored = store.load_session(session_id)
+            workspace = Path(stored.metadata.workspace)
+            if not workspace.is_dir():
+                raise SessionStoreError(
+                    f"session workspace does not exist: {workspace}"
+                )
+            if args.resume is not None:
+                store.activate_session(
+                    session_id,
+                    sensitive_values=sensitive_values,
+                )
+            stored = _update_session_model(
+                store,
+                stored,
+                args.model,
+                sensitive_values,
+            )
+        else:
+            metadata = SessionMetadata(
+                _new_session_title(prompt, launch_workspace),
+                str(launch_workspace),
+                main_model=args.model,
+            )
+            stored = store.create_session(
+                metadata,
+                sensitive_values=sensitive_values,
+            )
+            workspace = launch_workspace
+    except (OSError, SessionStoreError, ValueError) as exc:
+        detail = str(exc) or type(exc).__name__
+        for value in sensitive_values:
+            if value:
+                detail = detail.replace(value, "[redacted]")
+        raise SystemExit(f"session error: {detail}") from None
+
+    return _CLISession(
+        workspace,
+        stored.timeline,
+        sensitive_values,
+        store=store,
+        session_id=stored.id,
+        revision=stored.revision,
+        messages=list(stored.messages),
+        message_cursor=len(stored.messages),
+    )
+
+
+def _update_session_model(
+    store: SessionStore,
+    stored: StoredSession,
+    model: str,
+    sensitive_values: tuple[str, ...],
+) -> StoredSession:
+    if stored.metadata.main_model == model:
+        return stored
+    metadata = SessionMetadata(
+        stored.metadata.title,
+        stored.metadata.workspace,
+        main_model=model,
+        sub_model=stored.metadata.sub_model,
+        kind=stored.metadata.kind,
+    )
+    revision = store.append_metadata(
+        stored.id,
+        metadata,
+        expected_revision=stored.revision,
+        sensitive_values=sensitive_values,
+    )
+    return StoredSession(
+        stored.id,
+        stored.created_at,
+        metadata,
+        stored.messages,
+        stored.timeline,
+        revision,
+    )
+
+
+def _new_session_title(prompt: str, workspace: Path) -> str:
+    normalized = " ".join(prompt.split())
+    if normalized:
+        return normalized[:80]
+    return f"CLI · {workspace.name or workspace.drive}"[:80]
+
+
+def _positive_session_id(value: str) -> int:
+    try:
+        selected = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            "SESSION_ID must be a positive integer"
+        ) from None
+    if selected <= 0:
+        raise argparse.ArgumentTypeError("SESSION_ID must be a positive integer")
+    return selected
+
+
+def _sensitive_values(client_options: dict[str, Any]) -> tuple[str, ...]:
+    return tuple(
+        dict.fromkeys(
+            value
+            for field in ("api_key", "base_url")
+            if isinstance((value := client_options.get(field)), str) and value
+        )
+    )
 
 
 def _load_config(

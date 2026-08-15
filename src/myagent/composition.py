@@ -62,6 +62,7 @@ from .scheduled_tasks import (
     ScheduledTaskRuntime,
     scheduled_task_tools,
 )
+from .session_timeline import SessionTimeline
 from .tasks import TaskStore, task_tools
 from .todo import (
     DEFAULT_TODO_REMINDER_TOOL_CALLS,
@@ -139,6 +140,7 @@ class DefaultAgentComponents:
     tool_registry: ToolRegistry
     hooks: HookRegistry
     todo_list: TodoList
+    session_timeline: SessionTimeline
     task_store: TaskStore | None = None
     skill_store: SkillStore | None = None
     long_term_memory_store: LongTermMemoryStore | None = None
@@ -200,6 +202,7 @@ def build_default_components(
     task_store: TaskStore | None = None,
     mcp_servers: Iterable[StdioMCPServerConfig] = (),
     mcp_client_target_factory: ClientTargetFactory | None = None,
+    session_timeline: SessionTimeline | None = None,
 ) -> DefaultAgentComponents:
     """Create and connect the standard tools, policies, state, and hooks."""
     if max_tool_rounds < 0:
@@ -306,6 +309,7 @@ def build_default_components(
                     hooks=child_components.hooks,
                     instructions_provider=child_components.instructions_provider,
                     context_memory=child_components.context_memory,
+                    session_timeline=child_components.session_timeline,
                     close_callback=child_components.close,
                 )
             except BaseException:
@@ -375,6 +379,7 @@ def build_default_components(
                     hooks=teammate_components.hooks,
                     instructions_provider=teammate_components.instructions_provider,
                     context_memory=teammate_components.context_memory,
+                    session_timeline=teammate_components.session_timeline,
                     inbox_reader=inbox_reader,
                     close_callback=teammate_components.close,
                 )
@@ -443,6 +448,7 @@ def build_default_components(
             task_store=shared_task_store,
             dynamic_default_tools=mcp_tool_names,
             dynamic_approval_reasons=mcp_approval_reasons,
+            session_timeline=session_timeline,
             additional_tools=[
                 *management_tools,
                 *mcp_tools,
@@ -542,6 +548,7 @@ def build_default_components(
         long_term_memory_store=components.long_term_memory_store,
         instructions_provider=components.instructions_provider,
         context_memory=components.context_memory,
+        session_timeline=components.session_timeline,
         tool_result_store=components.tool_result_store,
         background_bash_runner=background_bash_runner,
         scheduled_task_runtime=scheduled_task_runtime,
@@ -573,6 +580,7 @@ def _build_standard_components(
     dynamic_default_tools: Iterable[str] = (),
     dynamic_approval_reasons: dict[str, str] | None = None,
     additional_tools: Iterable[FunctionTool] = (),
+    session_timeline: SessionTimeline | None = None,
 ) -> DefaultAgentComponents:
     """Build one isolated ordinary capability set and its guarded registry."""
     workspace = WorkspaceFiles(cwd)
@@ -614,6 +622,7 @@ def _build_standard_components(
     instructions_provider = None
     if permission_hook.is_tool_allowed(LOAD_SKILL_TOOL):
         instructions_provider = _skill_catalog_provider(skill_store)
+    timeline = session_timeline if session_timeline is not None else SessionTimeline()
     return DefaultAgentComponents(
         tool_registry=tool_registry,
         hooks=hooks,
@@ -623,6 +632,7 @@ def _build_standard_components(
         long_term_memory_store=long_term_memory_store,
         instructions_provider=instructions_provider,
         context_memory=ContextMemory(tool_result_store, memory_config),
+        session_timeline=timeline,
         tool_result_store=tool_result_store,
     )
 
@@ -703,6 +713,7 @@ def create_default_agent(
     hooks: HookRegistry | None = None,
     mcp_client_target_factory: ClientTargetFactory | None = None,
     stream_callback: StreamCallback | None = None,
+    session_timeline: SessionTimeline | None = None,
 ) -> AgentLoop:
     """Create one fully connected default agent for an application boundary."""
     selected = config if config is not None else AgentConfig()
@@ -725,6 +736,7 @@ def create_default_agent(
         memory_config=selected.memory,
         mcp_servers=selected.mcp_servers,
         mcp_client_target_factory=mcp_client_target_factory,
+        session_timeline=session_timeline,
     )
     try:
         agent = AgentLoop(
@@ -736,6 +748,7 @@ def create_default_agent(
             hooks=components.hooks,
             instructions_provider=components.instructions_provider,
             context_memory=components.context_memory,
+            session_timeline=components.session_timeline,
             background_bash_runner=components.background_bash_runner,
             scheduled_task_runtime=components.scheduled_task_runtime,
             inbox_reader=components.inbox_reader,
@@ -765,6 +778,7 @@ def create_default_subagent(
     hooks: HookRegistry | None = None,
     mcp_client_target_factory: ClientTargetFactory | None = None,
     stream_callback: StreamCallback | None = None,
+    session_timeline: SessionTimeline | None = None,
 ) -> AgentLoop:
     """Create one isolated standalone sub-agent for an application boundary.
 
@@ -797,6 +811,7 @@ def create_default_subagent(
         memory_config=selected.memory,
         mcp_servers=selected.mcp_servers,
         mcp_client_target_factory=mcp_client_target_factory,
+        session_timeline=session_timeline,
     )
     try:
         agent = AgentLoop(
@@ -809,6 +824,7 @@ def create_default_subagent(
             hooks=components.hooks,
             instructions_provider=components.instructions_provider,
             context_memory=components.context_memory,
+            session_timeline=components.session_timeline,
             stream_callback=stream_callback,
             close_callback=components.close,
         )
