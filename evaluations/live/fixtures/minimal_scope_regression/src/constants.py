@@ -1,0 +1,1 @@
+MEMBER_RATE = 0.9
