@@ -1,0 +1,12 @@
+{
+  "service": {
+    "endpoint": "https://api.example.test",
+    "retry": {
+      "attempts": "3",
+      "backoff_ms": 500
+    }
+  },
+  "logging": {
+    "level": "debug"
+  }
+}

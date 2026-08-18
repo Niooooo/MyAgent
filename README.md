@@ -257,6 +257,7 @@ Shell 检查依赖静态分类，无法识别所有脚本、变量展开和解�
 ```text
 MyAgent/
 |-- desktop/                 Electron 主进程、preload 和 renderer
+|-- evaluations/             自建小仓库评测集、隐藏 grader 与离线回放脚本
 |-- src/myagent/             Agent Loop、工具、权限、记忆与协作运行时
 |-- tests/                   Python 单元测试与协议回归测试
 |-- myagent.config.example.json
@@ -295,3 +296,51 @@ Set-Location ..
 ```
 
 `npm run check` 检查 Electron 资源和本地依赖，`start_gui.cmd --check` 还会检查 Python sidecar 入口。
+
+## 评测
+
+首版评测使用四个自建小仓库任务，覆盖单文件 bugfix、功能补齐、配置修复和跨文件修改。
+CI 只运行确定性离线回放；真实模型评测必须手动选择，因此不会在普通 PR 中使用密钥
+或产生模型费用。
+
+校验评测集：
+
+```powershell
+$env:PYTHONPATH = "src"
+python -m myagent.evaluation validate
+```
+
+运行离线评测并生成 `runs.jsonl`、`summary.json` 和 `summary.md`：
+
+```powershell
+python -m myagent.evaluation run `
+  --provider replay `
+  --allow-code-execution `
+  --output eval-results/replay
+```
+
+运行完整开发门禁：
+
+```powershell
+./scripts/quality-gate.ps1
+```
+
+评测会执行临时工作区中的样例代码；临时目录不是操作系统安全沙箱。数据集、真实模型
+命令、判分规则和安全边界见 `evaluations/README.md`。
+
+### 简历展示评测
+
+`resume-eval-v1` 包含 8 条组件题和 8 条集成题。组件题评估必要工具、调用顺序和
+工具克制；集成题评估目标达成、约束遵守和是否过早宣称完成。真实模型使用
+DeepSeek-V4-Flash，建议每题重复 3 次并由 Codex 按固定 rubric 离线判分。
+
+| 评测集 | Agent 模型 | 规模 | 当前状态 |
+| --- | --- | ---: | --- |
+| resume-eval-v1 | DeepSeek-V4-Flash-0731 | 16 题 x 3 次 | 待配置密钥后真实运行 |
+
+    python -m myagent.evaluation validate --dataset evaluations/live/resume-cases.jsonl
+    python -m myagent.evaluation run --provider deepseek --repeat 3 --thinking enabled --dataset evaluations/live/resume-cases.jsonl --allow-code-execution --output eval-results/deepseek-v4-flash-0731
+
+仓库不预填模型成绩。只有真实 48 次运行和 48 条 Codex verdict 完整聚合后，才发布
+Pass@3、Pass^3、三维分数、失败模式、延迟和 Token 指标。完整复现步骤见
+`evaluations/README.md`。

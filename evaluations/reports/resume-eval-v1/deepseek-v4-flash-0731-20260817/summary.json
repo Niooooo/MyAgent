@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "suite": "resume-eval-v1",
+  "evaluated_at": "2026-08-17",
+  "public_benchmark": false,
+  "dataset": {
+    "cases": 16,
+    "attempts_per_case": 3,
+    "runs": 48,
+    "sha256": "ba14dc74212ee6de5f3d6d84fb14e1d9cbb8ca644107f40ee2115098b1ac28f3"
+  },
+  "model": {
+    "provider": "deepseek",
+    "requested_model": "deepseek-v4-flash",
+    "returned_model": "deepseek-v4-flash",
+    "declared_release_label": "DeepSeek-V4-Flash-0731",
+    "release_label_version_pinned": false,
+    "system_fingerprint": "a26a7955944dc5c60445bff77fac9c8e",
+    "thinking": "enabled",
+    "live_model_executed": true
+  },
+  "judge": {
+    "name": "Codex offline",
+    "rubric_version": "resume-eval-v1.0",
+    "rubric_sha256": "16d4c5f5c700514009593564b02915c8abd07e2217bd80e361c647f73e77835d",
+    "prompt_sha256": "625d0b958f58cd8944283f712847df1e8d8be056d103d68857c10a2f73c0ca0e",
+    "interpretation": "strict",
+    "judge_verifier_disagreements": 0
+  },
+  "results": {
+    "passed_runs": 48,
+    "failed_runs": 0,
+    "pass_rate": 1.0,
+    "pass_at_3": 1.0,
+    "pass_power_3": 1.0,
+    "dimension_means": {
+      "required_tool_coverage": 5.0,
+      "order_correctness": 5.0,
+      "tool_restraint": 5.0,
+      "goal_achievement": 5.0,
+      "constraint_compliance": 4.042,
+      "completion_honesty": 5.0
+    },
+    "component": {
+      "runs": 24,
+      "missing_required_tool_rate": 0.0,
+      "wrong_order_rate": 0.0,
+      "unnecessary_tool_rate": 0.0
+    },
+    "integration": {
+      "runs": 24,
+      "goal_success_rate": 1.0,
+      "constraint_violation_rate": 0.0,
+      "premature_completion_rate": 0.0,
+      "non_minimal_path_downgrades": 23
+    }
+  },
+  "efficiency": {
+    "average_tool_calls": 3.812,
+    "latency_ms": {
+      "p50": 6197.584,
+      "p95": 16930.017
+    },
+    "token_usage": {
+      "input_tokens": 281582,
+      "output_tokens": 21868,
+      "total_tokens": 303450,
+      "partial": false
+    },
+    "cost_usd": null
+  },
+  "publication": {
+    "raw_records_tracked": false,
+    "raw_records_location": "ignored eval-results archive",
+    "note": "Private MyAgent evaluation set; not a public benchmark score."
+  }
+}

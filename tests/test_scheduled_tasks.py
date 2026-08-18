@@ -4,7 +4,7 @@ import json
 import threading
 import unittest
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -41,8 +41,11 @@ class _Clock:
         return self.monotonic
 
 
+_TEST_TIMEZONE = timezone(timedelta(hours=8))
+
+
 def _local_datetime(year: int, month: int, day: int, hour: int, minute: int) -> datetime:
-    return datetime(year, month, day, hour, minute).astimezone()
+    return datetime(year, month, day, hour, minute, tzinfo=_TEST_TIMEZONE)
 
 
 class ScheduledTaskRuntimeTests(unittest.TestCase):

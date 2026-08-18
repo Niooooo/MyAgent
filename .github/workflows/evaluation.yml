@@ -1,0 +1,45 @@
+name: evaluation
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  offline-evaluation:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install project
+        run: python -m pip install -e .
+      - name: Run unit tests and deterministic evaluation
+        shell: pwsh
+        run: ./scripts/quality-gate.ps1
+      - name: Add evaluation summary
+        if: always()
+        shell: pwsh
+        run: |
+          $summary = "eval-results/replay/summary.md"
+          if (Test-Path $summary) {
+            Get-Content $summary | Out-File `
+              -FilePath $env:GITHUB_STEP_SUMMARY `
+              -Append `
+              -Encoding utf8
+          }
+      - name: Upload evaluation reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: myagent-evaluation-replay
+          path: eval-results/replay
+          if-no-files-found: warn
+          retention-days: 14
