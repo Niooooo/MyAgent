@@ -13,7 +13,7 @@ from myagent.tooling import FunctionTool, ToolExecutionError, ToolRegistry
 class WorkspaceFilesTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
-        self.root = Path(self.temporary_directory.name)
+        self.root = Path(self.temporary_directory.name).resolve()
         self.workspace = WorkspaceFiles(self.root)
 
     def tearDown(self) -> None:
