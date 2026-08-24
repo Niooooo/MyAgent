@@ -257,7 +257,7 @@ def aggregate_verdicts(
     ]
     summary = {
         "schema_version": 1,
-        "suite": "resume-eval-v1",
+        "suite": "resume-eval-v2",
         "rubric_version": RUBRIC_VERSION,
         "public_benchmark": False,
         "judge": "Codex offline",

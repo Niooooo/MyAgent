@@ -408,7 +408,7 @@ def write_reports(
         "schema_version": 2,
         "run_id": run_id,
         "suite": (
-            "resume-eval-v1"
+            "resume-eval-v2"
             if any(result["track"] == "component" for result in results)
             else "myagent-repository-tasks-v1"
         ),

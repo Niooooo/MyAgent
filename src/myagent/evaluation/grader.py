@@ -42,6 +42,7 @@ def run_hidden_tests(
     """
     environment = os.environ.copy()
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    environment["PYTHONHASHSEED"] = "0"
     python_paths = [str(workspace / "src"), str(workspace)]
     existing = environment.get("PYTHONPATH")
     if existing:

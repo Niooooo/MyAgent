@@ -1,7 +1,14 @@
 [CmdletBinding()]
 param(
     [string]$Python,
-    [string]$OutputDirectory
+    [string]$OutputDirectory,
+    [ValidateRange(1, 10)]
+    [int]$Repeat = 3,
+    [string]$Model = "deepseek-v4-flash",
+    [string]$ReleaseLabel = "DeepSeek-V4-Flash-0731",
+    [ValidateSet("enabled", "disabled")]
+    [string]$Thinking = "enabled",
+    [switch]$SkipSmoke
 )
 
 $ErrorActionPreference = "Stop"
@@ -60,6 +67,13 @@ Set-Location $script:RepoRoot
 
 $script:PythonExecutable = Resolve-PythonExecutable -RequestedPython $Python
 $dataset = Join-Path $script:RepoRoot "evaluations\live\resume-cases.jsonl"
+$caseCount = @(
+    Get-Content -LiteralPath $dataset | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+).Count
+if ($caseCount -ne 50) {
+    throw "Expected exactly 50 resume evaluation cases, found $caseCount in $dataset."
+}
+$totalRuns = $caseCount * $Repeat
 
 if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
     $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
@@ -91,32 +105,35 @@ $env:PYTHONPATH = $pythonPathEntries -join [System.IO.Path]::PathSeparator
 Write-Host "Repository: $script:RepoRoot"
 Write-Host "Python:     $script:PythonExecutable"
 Write-Host "Output:     $OutputDirectory"
+Write-Host "Dataset:    $caseCount cases x $Repeat attempts = $totalRuns live runs"
 
-Invoke-EvaluationCommand -Step "Validate resume-eval-v1 dataset" -Arguments @(
+Invoke-EvaluationCommand -Step "Validate 50-case resume dataset" -Arguments @(
     "validate",
     "--dataset", $dataset
 )
 
-Invoke-EvaluationCommand -Step "Run one-case DeepSeek protocol smoke" -Arguments @(
-    "run",
-    "--provider", "deepseek",
-    "--model", "deepseek-v4-flash",
-    "--release-label", "DeepSeek-V4-Flash-0731",
-    "--repeat", "1",
-    "--thinking", "enabled",
-    "--case", "component_no_tool_answer",
-    "--dataset", $dataset,
-    "--allow-code-execution",
-    "--output", $smokeDirectory
-)
+if (-not $SkipSmoke) {
+    Invoke-EvaluationCommand -Step "Run one-case DeepSeek protocol smoke" -Arguments @(
+        "run",
+        "--provider", "deepseek",
+        "--model", $Model,
+        "--release-label", $ReleaseLabel,
+        "--repeat", "1",
+        "--thinking", $Thinking,
+        "--case", "component_no_tool_answer",
+        "--dataset", $dataset,
+        "--allow-code-execution",
+        "--output", $smokeDirectory
+    )
+}
 
-Invoke-EvaluationCommand -Step "Run 16 cases x 3 attempts (48 live runs)" -Arguments @(
+Invoke-EvaluationCommand -Step "Run $caseCount cases x $Repeat attempts ($totalRuns live runs)" -Arguments @(
     "run",
     "--provider", "deepseek",
-    "--model", "deepseek-v4-flash",
-    "--release-label", "DeepSeek-V4-Flash-0731",
-    "--repeat", "3",
-    "--thinking", "enabled",
+    "--model", $Model,
+    "--release-label", $ReleaseLabel,
+    "--repeat", $Repeat.ToString(),
+    "--thinking", $Thinking,
     "--dataset", $dataset,
     "--allow-code-execution",
     "--output", $OutputDirectory

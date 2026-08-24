@@ -71,17 +71,17 @@ class FakeChatCompletions:
 
 
 class ResumeDatasetTests(unittest.TestCase):
-    def test_resume_dataset_has_eight_cases_per_track(self):
+    def test_resume_dataset_has_twenty_five_cases_per_track(self):
         cases = load_cases(RESUME_DATASET)
 
-        self.assertEqual(len(cases), 16)
+        self.assertEqual(len(cases), 50)
         self.assertEqual(
             sum(case.track == "component" for case in cases),
-            8,
+            25,
         )
         self.assertEqual(
             sum(case.track == "integration" for case in cases),
-            8,
+            25,
         )
         self.assertEqual(
             next(case for case in cases if case.id == "component_no_tool_answer")
