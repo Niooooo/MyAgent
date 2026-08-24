@@ -1,0 +1,5 @@
+{
+  "endpoint": "/v1/run",
+  "timeout_ms": 1000,
+  "retries": 2
+}

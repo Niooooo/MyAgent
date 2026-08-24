@@ -1,0 +1,103 @@
+{
+  "schema_version": 1,
+  "suite": "resume-eval-v2",
+  "evaluated_at": "2026-08-24",
+  "public_benchmark": false,
+  "dataset": {
+    "cases": 50,
+    "attempts_per_case": 3,
+    "runs": 150,
+    "sha256": "02508c7240c36e8be77757b69d5d3fa30a12bd0e17534bb931be65310161892c"
+  },
+  "model": {
+    "provider": "deepseek",
+    "requested_model": "deepseek-v4-flash",
+    "returned_model": "deepseek-v4-flash",
+    "declared_release_label": "DeepSeek-V4-Flash-0731",
+    "release_label_version_pinned": false,
+    "system_fingerprint": "a26a7955944dc5c60445bff77fac9c8e",
+    "thinking": "enabled",
+    "live_model_executed": true
+  },
+  "repair": {
+    "evaluator_invalidated_runs": 1,
+    "replacement_runs": 1,
+    "target": "stable_unique_names#1",
+    "reason": "Randomized Python set iteration made the faulty baseline nondeterministic; the grader subprocess now fixes PYTHONHASHSEED=0.",
+    "raw_evidence_retained": true
+  },
+  "verifier": {
+    "passed_runs": 150,
+    "failed_runs": 0,
+    "pass_rate": 1.0,
+    "pass_at_3": 1.0,
+    "pass_power_3": 1.0
+  },
+  "judge": {
+    "name": "Codex offline",
+    "rubric_version": "resume-eval-v1.0",
+    "rubric_sha256": "7d8d28f14953274347e1f5c08bf64b336aa1589efff4217ae966b97ae52fc886",
+    "prompt_sha256": "95a66c92b379fec13af750e6b790dcf847bdb09eea79dc08ff56d2bc553f995b",
+    "interpretation": "strict",
+    "judge_verifier_disagreements": 0
+  },
+  "results": {
+    "passed_runs": 146,
+    "failed_runs": 4,
+    "pass_rate": 0.9733,
+    "pass_at_3": 1.0,
+    "pass_power_3": 0.94,
+    "labels": {
+      "goal_not_met": 4,
+      "success": 146
+    },
+    "failed_packets": [
+      "component_grep_edit_status#1",
+      "component_grep_edit_status#2",
+      "component_two_file_read_one_edit#2",
+      "component_fix_exact_line#2"
+    ],
+    "dimension_means": {
+      "required_tool_coverage": 4.947,
+      "order_correctness": 4.922,
+      "tool_restraint": 4.893,
+      "goal_achievement": 5.0,
+      "constraint_compliance": 4.08,
+      "completion_honesty": 4.96
+    },
+    "component": {
+      "runs": 75,
+      "successful_runs": 71,
+      "missing_required_tool_rate": 0.0267,
+      "wrong_order_rate": 0.0392,
+      "unnecessary_tool_rate": 0.0533
+    },
+    "integration": {
+      "runs": 75,
+      "successful_runs": 75,
+      "goal_success_rate": 1.0,
+      "constraint_violation_rate": 0.0,
+      "premature_completion_rate": 0.0,
+      "non_minimal_path_downgrades": 69
+    }
+  },
+  "efficiency": {
+    "average_tool_calls": 3.987,
+    "latency_ms": {
+      "p50": 5056.692,
+      "p95": 16589.285
+    },
+    "token_usage": {
+      "input_tokens": 1000871,
+      "output_tokens": 71390,
+      "total_tokens": 1072261,
+      "partial": false
+    },
+    "cost_usd": null
+  },
+  "publication": {
+    "raw_records_tracked": false,
+    "raw_records_location": "ignored eval-results archive",
+    "note": "Private MyAgent evaluation set; not a public benchmark score."
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "logging": {
+    "level": "debug",
+    "json": false,
+    "path": "logs/myagent.log"
+  },
+  "service": "worker"
+}

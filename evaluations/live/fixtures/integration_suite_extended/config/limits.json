@@ -1,0 +1,9 @@
+{
+  "service": "gateway",
+  "limits": {
+    "min": 0,
+    "max": 100,
+    "burst": 110
+  },
+  "enabled": true
+}

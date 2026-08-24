@@ -1,0 +1,6 @@
+{
+  "endpoint": "https://service.invalid/v1",
+  "attempts": "2",
+  "jitter": false,
+  "backoff_ms": 250
+}

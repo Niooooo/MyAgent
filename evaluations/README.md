@@ -90,11 +90,20 @@ Agent 暴露通用 Bash，只提供固定的 `run_acceptance_tests`。不过，�
 代码和受控机器上使用 `--allow-code-execution`。若要发布公开成绩，应先把每条 live
 case 放进真正的容器或受限执行环境，并增加父进程级总超时。
 
-## resume-eval-v1
+## resume-eval-v2
 
-简历展示集位于 live/resume-cases.jsonl，共 16 条：8 条组件题测必要工具、
-调用顺序和工具克制，8 条集成题测目标达成、约束遵守和完成声明。默认建议每题
-运行 3 次，因此真实报告包含 48 条 run。
+简历展示集位于 live/resume-cases.jsonl，共 50 条：25 条组件题测必要工具、
+调用顺序和工具克制，25 条集成题测目标达成、约束遵守和完成声明。评分仍然只有
+原来的两条 track 和六个维度，没有为了增加题量扩张简历表述。默认建议每题运行
+3 次，因此完整真实评测包含 150 条 run。
+
+2026-08-17 的 16 题、48 run 报告仍是 `resume-eval-v1` 的冻结历史结果；新增题目后
+必须重新运行并重新 Judge，不能把旧成绩写成 50 题成绩。
+
+2026-08-24 的 50 题、150 run 脱敏报告位于
+[`reports/resume-eval-v2/deepseek-v4-flash-0731-20260824/`](reports/resume-eval-v2/deepseek-v4-flash-0731-20260824/)。
+硬验证为 150/150，严格 Codex 离线 Judge 为 146/150（97.33%），Judge Pass@3
+为 100%。这是自建私有评测，不是公开 benchmark 成绩。
 
 DeepSeek 官方接口使用 Chat Completions；评测专用适配器把消息、tool_calls、
 reasoning_content 和 usage 转成 AgentLoop 已有的 Responses 子集。适配器不替换
@@ -108,7 +117,11 @@ AgentLoop、ToolRegistry、PermissionHook 或 Hook 链。
 
     python -m myagent.evaluation run --provider deepseek --case component_no_tool_answer --dataset evaluations/live/resume-cases.jsonl --allow-code-execution --output eval-results/deepseek-smoke
 
-运行完整 48 次：
+使用可重复运行脚本执行完整 150 次（默认 50 题 x 3 次）：
+
+    ./scripts/run-resume-eval.ps1
+
+也可以手动运行：
 
     python -m myagent.evaluation run --provider deepseek --model deepseek-v4-flash --repeat 3 --thinking enabled --dataset evaluations/live/resume-cases.jsonl --allow-code-execution --output eval-results/deepseek-v4-flash-0731
 
