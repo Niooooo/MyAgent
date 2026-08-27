@@ -66,28 +66,26 @@ Set-Location ..
 运行环境。首次启动以及 `pyproject.toml` 依赖发生变化后，会自动同步依赖并先做
 sidecar 导入检查；模型和会话数据不放在该运行环境中。
 
-#### 更新后的启动与恢复
+#### 桌面运行环境与数据持久化
 
-拉取新版本后仍然使用 `start_gui.cmd` 启动。启动器会先检查托管 Python 环境；如果
-新版本增加或调整了依赖，会自动安装后再启动 Electron。首次修复可能需要等待依赖
-安装完成，之后未发生依赖变化的启动不会重复安装。
+`start_gui.cmd` 使用独立的托管 Python 环境启动桌面端。首次启动或
+`pyproject.toml` 依赖发生变化时，启动器会同步依赖并验证 sidecar 导入；依赖未变化时
+直接复用现有环境。
 
-桌面数据与源码目录分离，更新仓库不会清空模型或历史会话。启动 sidecar 时会自动：
+桌面数据与源码、运行环境分离。模型配置和设置保存在统一数据目录；会话按 JSONL
+持久化，`catalog.jsonl` 作为侧栏索引。应用启动时会验证会话文件，并可从现存的数字
+命名会话 JSONL 生成缺失的目录索引。索引生成只读取会话文件；遇到无效 JSONL 时会
+报告具体错误，不改写原文件。兼容格式的 `conversations.json` 可转换为逐会话 JSONL，
+转换后保留原文件。
 
-1. 从统一的数据目录读取 `models.json` 和 `settings.json`。
-2. 首次升级时将旧的 `conversations.json` 迁移成逐会话 JSONL，同时保留旧文件。
-3. 如果 `catalog.jsonl` 缺失或只有空目录头，则验证现存的数字命名会话 JSONL，
-   再重建侧栏索引；原会话 JSONL 不会被改写。
-4. 如果 JSONL 损坏，则停止自动恢复并显示具体错误，不会用空记录覆盖原文件。
-
-如果更新后界面一直显示“正在连接桌面后端”，先运行：
+运行环境检查：
 
 ```powershell
 .\start_gui.cmd --check
 ```
 
-检查会先修复依赖，再分别验证 Python sidecar 和 Electron 资源。sidecar 仍然退出时，
-桌面错误提示会包含 Python 报错的最后一行，不再只有 `exit code 1`。
+该命令会同步所需依赖，并分别验证 Python sidecar 和 Electron 资源。sidecar 启动失败时，
+桌面错误提示会包含 Python 报错的最后一行。
 
 ### 3. 使用命令行
 
@@ -178,7 +176,7 @@ PermissionHook -> PreToolUse -> handler -> PostToolUse
 | `%APPDATA%\MyAgent\settings.json` | 桌面运行参数 | 当前 Windows 用户下保留 |
 | `%APPDATA%\MyAgent\conversations\catalog.jsonl` | 会话侧栏索引和活动会话 | 当前 Windows 用户下保留，可由会话 JSONL 重建 |
 | `%APPDATA%\MyAgent\conversations\<id>.jsonl` | CLI/桌面共用的逐会话消息与协议历史 | 当前 Windows 用户下保留 |
-| `%APPDATA%\MyAgent\conversations.json` | 旧版会话快照 | 迁移后继续保留，作为原始恢复来源 |
+| `%APPDATA%\MyAgent\conversations.json` | 兼容格式的会话快照输入 | 转换为逐会话 JSONL 后保留原文件 |
 | `%LOCALAPPDATA%\MyAgent\runtime\` | 桌面专属 Python 环境和依赖指纹 | 可重建，不包含模型或会话数据 |
 
 `myagent.config.json` 已加入 `.gitignore`。桌面端的 API Key 也保存在仓库外，但仍是本机明文文件，请按敏感凭据保护。
@@ -333,8 +331,8 @@ Set-Location ..
 
 ## 评测
 
-CI 快速回放集保留四个自建小仓库任务，覆盖单文件 bugfix、功能补齐、配置修复和
-跨文件修改；它只负责确定性门禁。下方的简历展示集使用 50 题 `resume-eval-v2`。
+CI 快速回放集包含四个自建小仓库任务，覆盖单文件 bugfix、功能补齐、配置调整和
+跨文件修改；它只负责确定性门禁。下方的完整模型评测包含 50 题、150 次真实模型运行。
 真实模型评测必须手动选择，因此不会在普通 PR 中使用密钥或产生模型费用。
 
 校验评测集：
@@ -362,11 +360,11 @@ python -m myagent.evaluation run `
 评测会执行临时工作区中的样例代码；临时目录不是操作系统安全沙箱。数据集、真实模型
 命令、判分规则和安全边界见 `evaluations/README.md`。
 
-### 简历展示评测
+### 完整模型评测
 
-当前简历展示集是 `resume-eval-v2`，共 50 题：25 条组件题评估必要工具、调用顺序和
-工具克制，25 条集成题评估目标达成、约束遵守和完成声明。仍然只保留两条 track 和
-六个评分维度；每题运行 3 次，共 150 次真实模型运行。
+当前评测集共 50 题：25 条组件题评估必要工具、调用顺序和工具克制，25 条集成题
+评估目标达成、约束遵守和完成声明。评测包含两类任务和六个评分维度；每题运行 3 次，
+共 150 次真实模型运行。
 
 2026-08-24 的脱敏审计结果如下。Agent 请求模型为 `deepseek-v4-flash`，API 返回模型
 同名，Thinking 为 enabled；`DeepSeek-V4-Flash-0731` 是本次报告声明的发布标签，
@@ -392,17 +390,8 @@ python -m myagent.evaluation run `
 | 完成声明诚实性 | 4.960 / 5 |
 
 严格 Judge 拒绝了 4 条功能结果正确但违反工具契约的组件运行；75 条集成运行全部通过。
-这是 MyAgent 的自建私有评测，不是公开 benchmark。16 题、48 run 的
-`resume-eval-v1` 只作为冻结的历史结果保留，不能代表当前 50 题评测。
+这是 MyAgent 的自建私有评测，不是公开 benchmark。
 
-验证数据集并运行完整的 50 题 x 3 次评测：
-
-```powershell
-python -m myagent.evaluation validate --dataset evaluations/live/resume-cases.jsonl
-.\scripts\run-resume-eval.ps1
-```
-
-脱敏的 [`report.md`](evaluations/reports/resume-eval-v2/deepseek-v4-flash-0731-20260824/report.md)
-和 [`summary.json`](evaluations/reports/resume-eval-v2/deepseek-v4-flash-0731-20260824/summary.json)
-已纳入仓库。原始运行轨迹、Judge packets 和 verdict 保持在忽略的本地审计目录中；
-完整复现与判分步骤见 [`evaluations/README.md`](evaluations/README.md)。
+脱敏报告和汇总数据已纳入仓库。原始运行轨迹、Judge packets 和 verdict 保持在忽略的
+本地审计目录中；数据集位置、完整复现与判分步骤见
+[`evaluations/README.md`](evaluations/README.md)。
