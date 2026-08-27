@@ -259,6 +259,36 @@ class SessionStoreTests(unittest.TestCase):
         self.assertEqual(store.catalog_path.read_bytes(), catalog_before)
         self.assertEqual(legacy_path.read_bytes(), before)
 
+    def test_missing_catalog_is_rebuilt_from_valid_session_jsonl(self) -> None:
+        first = self.store.create_session(metadata(self.base, "first"))
+        second = self.store.create_session(metadata(self.base, "second"))
+        first_bytes = (self.store.root / "1.jsonl").read_bytes()
+        second_bytes = (self.store.root / "2.jsonl").read_bytes()
+        self.store.catalog_path.unlink()
+
+        recovered = SessionStore(self.store.root, auto_migrate=False).initialize()
+
+        self.assertEqual([item.id for item in recovered.sessions], [first.id, second.id])
+        self.assertEqual(recovered.active_session_id, second.id)
+        self.assertEqual(recovered.next_session_id, second.id + 1)
+        self.assertEqual((self.store.root / "1.jsonl").read_bytes(), first_bytes)
+        self.assertEqual((self.store.root / "2.jsonl").read_bytes(), second_bytes)
+        self.assertEqual(
+            SessionStore(self.store.root, auto_migrate=False).load_session(first.id).metadata.title,
+            "first",
+        )
+
+    def test_invalid_orphan_session_does_not_create_replacement_catalog(self) -> None:
+        self.store.catalog_path.unlink()
+        invalid = self.store.root / "1.jsonl"
+        invalid.write_text("{broken\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(SessionStoreError, "invalid JSON"):
+            SessionStore(self.store.root, auto_migrate=False).initialize()
+
+        self.assertFalse(self.store.catalog_path.exists())
+        self.assertEqual(invalid.read_text(encoding="utf-8"), "{broken\n")
+
     def test_legacy_migration_rejects_runtime_secret_before_creating_jsonl(self) -> None:
         legacy_path = self.base / "secret-conversations.json"
         secret = "registered-api-key"

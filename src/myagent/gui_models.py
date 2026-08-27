@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Callable
 from urllib.parse import urlsplit
 
+from .app_paths import default_data_home
 from .composition import AgentConfig
 
 
@@ -46,13 +47,7 @@ class ModelRecord:
 
 
 def default_model_store_path() -> Path:
-    override = os.getenv("MYAGENT_GUI_HOME")
-    if override:
-        return Path(override).expanduser().resolve() / "models.json"
-    appdata = os.getenv("APPDATA")
-    if not appdata:
-        appdata = str(Path.home() / "AppData" / "Roaming")
-    return Path(appdata).expanduser().resolve() / "MyAgent" / "models.json"
+    return default_data_home() / "models.json"
 
 
 def default_settings_store_path() -> Path:

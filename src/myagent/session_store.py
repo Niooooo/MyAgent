@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from .app_paths import default_data_home
 from .gui_conversations import ConversationStore, ConversationStoreError
 from .session_timeline import SessionTimeline, TimelineOperation
 
@@ -108,17 +109,7 @@ class AppendTurnResult:
 
 def default_session_store_root() -> Path:
     """Return the repository-external ``conversations`` directory."""
-    override = os.getenv("MYAGENT_HOME") or os.getenv("MYAGENT_GUI_HOME")
-    if override:
-        home = Path(override).expanduser().resolve()
-    else:
-        appdata = os.getenv("APPDATA")
-        home = (
-            Path(appdata).expanduser().resolve() / "MyAgent"
-            if appdata
-            else Path.home() / "AppData" / "Roaming" / "MyAgent"
-        )
-    return home / "conversations"
+    return default_data_home() / "conversations"
 
 
 class _StoreLock:
@@ -203,6 +194,8 @@ class SessionStore:
         with _StoreLock(self._lock_path):
             self.root.mkdir(parents=True, exist_ok=True)
             should_migrate = self._auto_migrate if migrate_legacy is None else migrate_legacy
+            if self._recover_catalog_locked(sensitive_values):
+                return self._read_catalog_locked()[1]
             if should_migrate and self._migrate_legacy_locked(sensitive_values):
                 return self._read_catalog_locked()[1]
             self._ensure_catalog_locked(sensitive_values)
@@ -481,9 +474,61 @@ class SessionStore:
         self,
         sensitive_values: Sequence[str] = (),
     ) -> None:
+        if self._recover_catalog_locked(sensitive_values):
+            return
         if self._auto_migrate and self._migrate_legacy_locked(sensitive_values):
             return
         self._ensure_catalog_locked(sensitive_values)
+
+    def _recover_catalog_locked(
+        self,
+        sensitive_values: Sequence[str] = (),
+    ) -> bool:
+        """Rebuild a missing/empty catalog from intact numeric session JSONL files."""
+        catalog_records: list[dict[str, Any]] = []
+        if self.catalog_path.exists():
+            catalog_records, state = self._read_catalog_locked()
+            if len(catalog_records) != 1 or state.sessions or state.legacy_migrated:
+                return False
+        session_ids = sorted(
+            int(path.stem)
+            for path in self.root.glob("*.jsonl")
+            if path != self.catalog_path
+            and path.stem.isdigit()
+            and str(int(path.stem)) == path.stem
+            and int(path.stem) > 0
+        )
+        if not session_ids:
+            return False
+        stored_sessions = [self._read_session_locked(session_id) for session_id in session_ids]
+        now = self._timestamp()
+        records = catalog_records or [self._catalog_header(now)]
+        revision = len(records) - 1
+        for stored in stored_sessions:
+            revision += 1
+            records.append({
+                "version": SCHEMA_VERSION,
+                "event": "session_created",
+                "timestamp": now,
+                "revision": revision,
+                "session_id": stored.id,
+                "created_at": stored.created_at,
+                "metadata": stored.metadata.to_json(),
+            })
+        revision += 1
+        records.append({
+            "version": SCHEMA_VERSION,
+            "event": "session_activated",
+            "timestamp": now,
+            "revision": revision,
+            "session_id": stored_sessions[-1].id,
+        })
+        self._parse_catalog_records(records)
+        self._atomic_write(
+            self.catalog_path,
+            self._records_bytes(records, self._secrets(sensitive_values)),
+        )
+        return True
 
     def _ensure_catalog_locked(
         self,

@@ -46,12 +46,24 @@ class SidecarBridge extends EventEmitter {
     this.pending = new Map()
     this.sequence = 0
     this.buffer = ""
+    this.sidecarStderr = ""
     this.exited = false
+    this.failure = undefined
   }
 
   start() {
     if (this.process) return
-    const executable = process.env.MYAGENT_PYTHON || (process.platform === "win32" ? "python.exe" : "python3")
+    const runtimeRoot = process.env.MYAGENT_RUNTIME_HOME || path.join(
+      process.env.LOCALAPPDATA || path.join(process.env.USERPROFILE || "", "AppData", "Local"),
+      "MyAgent",
+      "runtime",
+    )
+    const managedPython = process.platform === "win32"
+      ? path.join(runtimeRoot, "venv", "Scripts", "python.exe")
+      : path.join(runtimeRoot, "venv", "bin", "python")
+    const executable = process.env.MYAGENT_PYTHON || (existsSync(managedPython)
+      ? managedPython
+      : (process.platform === "win32" ? "python.exe" : "python3"))
     const pythonPath = [path.join(projectRoot, "src"), process.env.PYTHONPATH].filter(Boolean).join(path.delimiter)
     const child = spawn(executable, ["-X", "utf8", "-u", "-m", "myagent.desktop_sidecar"], {
       cwd: projectRoot,
@@ -68,12 +80,18 @@ class SidecarBridge extends EventEmitter {
     child.stdout.setEncoding("utf8")
     child.stderr.setEncoding("utf8")
     child.stdout.on("data", (chunk) => this.#read(chunk))
-    child.stderr.on("data", (chunk) => console.error(`[MyAgent sidecar] ${chunk}`.trimEnd()))
+    child.stderr.on("data", (chunk) => {
+      const text = String(chunk)
+      this.sidecarStderr = `${this.sidecarStderr}${text}`.slice(-4000)
+      console.error(`[MyAgent sidecar] ${text}`.trimEnd())
+    })
     child.on("error", (error) => this.#fail(error))
     child.on("exit", (code, signal) => {
       this.exited = true
       const detail = signal ? `signal ${signal}` : `code ${code}`
-      this.#fail(new Error(`Python sidecar exited with ${detail}`))
+      const lastLine = this.sidecarStderr.trim().split(/\r?\n/).at(-1) || ""
+      const cause = lastLine ? `: ${lastLine.slice(0, 500)}` : ""
+      this.#fail(new Error(`Python sidecar exited with ${detail}${cause}`))
       this.emit("exit", { code, signal })
     })
   }
@@ -81,7 +99,7 @@ class SidecarBridge extends EventEmitter {
   request(method, params = {}) {
     if (!IPC_METHODS.has(method)) return Promise.reject(new Error(`Blocked desktop method: ${method}`))
     if (!this.process || this.exited || !this.process.stdin.writable) {
-      return Promise.reject(new Error("Python sidecar is unavailable"))
+      return Promise.reject(this.failure || new Error("Python sidecar is unavailable"))
     }
     const id = `desktop-${++this.sequence}`
     const message = `${JSON.stringify({ id, method, params })}\n`
@@ -137,6 +155,7 @@ class SidecarBridge extends EventEmitter {
   }
 
   #fail(error) {
+    this.failure = error
     for (const pending of this.pending.values()) pending.reject(error)
     this.pending.clear()
   }
