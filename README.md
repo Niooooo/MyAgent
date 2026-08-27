@@ -66,6 +66,29 @@ Set-Location ..
 运行环境。首次启动以及 `pyproject.toml` 依赖发生变化后，会自动同步依赖并先做
 sidecar 导入检查；模型和会话数据不放在该运行环境中。
 
+#### 更新后的启动与恢复
+
+拉取新版本后仍然使用 `start_gui.cmd` 启动。启动器会先检查托管 Python 环境；如果
+新版本增加或调整了依赖，会自动安装后再启动 Electron。首次修复可能需要等待依赖
+安装完成，之后未发生依赖变化的启动不会重复安装。
+
+桌面数据与源码目录分离，更新仓库不会清空模型或历史会话。启动 sidecar 时会自动：
+
+1. 从统一的数据目录读取 `models.json` 和 `settings.json`。
+2. 首次升级时将旧的 `conversations.json` 迁移成逐会话 JSONL，同时保留旧文件。
+3. 如果 `catalog.jsonl` 缺失或只有空目录头，则验证现存的数字命名会话 JSONL，
+   再重建侧栏索引；原会话 JSONL 不会被改写。
+4. 如果 JSONL 损坏，则停止自动恢复并显示具体错误，不会用空记录覆盖原文件。
+
+如果更新后界面一直显示“正在连接桌面后端”，先运行：
+
+```powershell
+.\start_gui.cmd --check
+```
+
+检查会先修复依赖，再分别验证 Python sidecar 和 Electron 资源。sidecar 仍然退出时，
+桌面错误提示会包含 Python 报错的最后一行，不再只有 `exit code 1`。
+
 ### 3. 使用命令行
 
 先复制配置示例：
@@ -151,7 +174,12 @@ PermissionHook -> PreToolUse -> handler -> PostToolUse
 | `.myagent/memories/` | 长期记忆目录与正文 | 跨会话保留 |
 | `.myagent/memory/tool-results/` | 从上下文卸载的大型工具结果 | 跨会话保留 |
 | `.myagent/agent-team/inboxes/` | Agent Team 消息文件 | 工作区文件，运行时消费 |
-| `%APPDATA%\MyAgent\` | 桌面模型、设置，以及 CLI/桌面共用的 `conversations\` 会话 JSONL | 当前 Windows 用户下保留 |
+| `%APPDATA%\MyAgent\models.json` | 桌面模型 ID、API Key 和 Base URL | 当前 Windows 用户下保留 |
+| `%APPDATA%\MyAgent\settings.json` | 桌面运行参数 | 当前 Windows 用户下保留 |
+| `%APPDATA%\MyAgent\conversations\catalog.jsonl` | 会话侧栏索引和活动会话 | 当前 Windows 用户下保留，可由会话 JSONL 重建 |
+| `%APPDATA%\MyAgent\conversations\<id>.jsonl` | CLI/桌面共用的逐会话消息与协议历史 | 当前 Windows 用户下保留 |
+| `%APPDATA%\MyAgent\conversations.json` | 旧版会话快照 | 迁移后继续保留，作为原始恢复来源 |
+| `%LOCALAPPDATA%\MyAgent\runtime\` | 桌面专属 Python 环境和依赖指纹 | 可重建，不包含模型或会话数据 |
 
 `myagent.config.json` 已加入 `.gitignore`。桌面端的 API Key 也保存在仓库外，但仍是本机明文文件，请按敏感凭据保护。
 
@@ -305,9 +333,9 @@ Set-Location ..
 
 ## 评测
 
-首版评测使用四个自建小仓库任务，覆盖单文件 bugfix、功能补齐、配置修复和跨文件修改。
-CI 只运行确定性离线回放；真实模型评测必须手动选择，因此不会在普通 PR 中使用密钥
-或产生模型费用。
+CI 快速回放集保留四个自建小仓库任务，覆盖单文件 bugfix、功能补齐、配置修复和
+跨文件修改；它只负责确定性门禁。下方的简历展示集使用 50 题 `resume-eval-v2`。
+真实模型评测必须手动选择，因此不会在普通 PR 中使用密钥或产生模型费用。
 
 校验评测集：
 
@@ -336,17 +364,45 @@ python -m myagent.evaluation run `
 
 ### 简历展示评测
 
-`resume-eval-v1` 包含 8 条组件题和 8 条集成题。组件题评估必要工具、调用顺序和
-工具克制；集成题评估目标达成、约束遵守和是否过早宣称完成。真实模型使用
-DeepSeek-V4-Flash，建议每题重复 3 次并由 Codex 按固定 rubric 离线判分。
+当前简历展示集是 `resume-eval-v2`，共 50 题：25 条组件题评估必要工具、调用顺序和
+工具克制，25 条集成题评估目标达成、约束遵守和完成声明。仍然只保留两条 track 和
+六个评分维度；每题运行 3 次，共 150 次真实模型运行。
 
-| 评测集 | Agent 模型 | 规模 | 当前状态 |
-| --- | --- | ---: | --- |
-| resume-eval-v1 | DeepSeek-V4-Flash-0731 | 16 题 x 3 次 | 待配置密钥后真实运行 |
+2026-08-24 的脱敏审计结果如下。Agent 请求模型为 `deepseek-v4-flash`，API 返回模型
+同名，Thinking 为 enabled；`DeepSeek-V4-Flash-0731` 是本次报告声明的发布标签，
+不是服务端版本锁定。
 
-    python -m myagent.evaluation validate --dataset evaluations/live/resume-cases.jsonl
-    python -m myagent.evaluation run --provider deepseek --repeat 3 --thinking enabled --dataset evaluations/live/resume-cases.jsonl --allow-code-execution --output eval-results/deepseek-v4-flash-0731
+| 指标 | 结果 |
+| --- | ---: |
+| Hard-verifier | 150 / 150 |
+| 严格 Codex 离线 Judge | 146 / 150（97.33%） |
+| Judge Pass@3 | 100% |
+| Judge Pass^3 | 94% |
+| 平均工具调用 | 3.987 |
+| P50 / P95 延迟 | 5.057 s / 16.589 s |
+| 总 Token | 1,072,261 |
 
-仓库不预填模型成绩。只有真实 48 次运行和 48 条 Codex verdict 完整聚合后，才发布
-Pass@3、Pass^3、三维分数、失败模式、延迟和 Token 指标。完整复现步骤见
-`evaluations/README.md`。
+| 评分维度 | 均分 |
+| --- | ---: |
+| 必要工具覆盖 | 4.947 / 5 |
+| 调用顺序正确性 | 4.922 / 5 |
+| 工具克制 | 4.893 / 5 |
+| 目标达成 | 5.000 / 5 |
+| 约束遵守 | 4.080 / 5 |
+| 完成声明诚实性 | 4.960 / 5 |
+
+严格 Judge 拒绝了 4 条功能结果正确但违反工具契约的组件运行；75 条集成运行全部通过。
+这是 MyAgent 的自建私有评测，不是公开 benchmark。16 题、48 run 的
+`resume-eval-v1` 只作为冻结的历史结果保留，不能代表当前 50 题评测。
+
+验证数据集并运行完整的 50 题 x 3 次评测：
+
+```powershell
+python -m myagent.evaluation validate --dataset evaluations/live/resume-cases.jsonl
+.\scripts\run-resume-eval.ps1
+```
+
+脱敏的 [`report.md`](evaluations/reports/resume-eval-v2/deepseek-v4-flash-0731-20260824/report.md)
+和 [`summary.json`](evaluations/reports/resume-eval-v2/deepseek-v4-flash-0731-20260824/summary.json)
+已纳入仓库。原始运行轨迹、Judge packets 和 verdict 保持在忽略的本地审计目录中；
+完整复现与判分步骤见 [`evaluations/README.md`](evaluations/README.md)。
