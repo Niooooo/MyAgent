@@ -62,6 +62,10 @@ Set-Location ..
 
 `--tk` 会启动保留的 Tk 界面，默认入口仍是 Electron。
 
+桌面启动器会在 `%LOCALAPPDATA%\MyAgent\runtime` 维护独立的 Python
+运行环境。首次启动以及 `pyproject.toml` 依赖发生变化后，会自动同步依赖并先做
+sidecar 导入检查；模型和会话数据不放在该运行环境中。
+
 ### 3. 使用命令行
 
 先复制配置示例：
@@ -151,7 +155,9 @@ PermissionHook -> PreToolUse -> handler -> PostToolUse
 
 `myagent.config.json` 已加入 `.gitignore`。桌面端的 API Key 也保存在仓库外，但仍是本机明文文件，请按敏感凭据保护。
 
-设置 `MYAGENT_HOME` 可以覆盖本地数据根目录；共用会话位于 `$env:MYAGENT_HOME\conversations`。
+设置 `MYAGENT_HOME` 可以同时覆盖模型、设置和会话的数据根目录；共用会话位于
+`$env:MYAGENT_HOME\conversations`。旧的 `MYAGENT_GUI_HOME` 仍兼容，但仅在没有设置
+`MYAGENT_HOME` 时使用。
 
 ## 配置
 

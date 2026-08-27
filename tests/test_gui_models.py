@@ -57,12 +57,31 @@ class ModelStoreTests(unittest.TestCase):
         self.now = datetime(2026, 8, 6, 2, 3, 4, tzinfo=timezone.utc)
         self.store = ModelStore(self.path, clock=lambda: self.now)
 
-    def test_missing_is_empty_and_override_stays_outside_repo(self) -> None:
+    def test_missing_is_empty_and_data_home_precedence_stays_outside_repo(self) -> None:
         self.assertEqual(self.store.load(), [])
-        with patch.dict(os.environ, {"MYAGENT_GUI_HOME": self.temp.name}):
+        with patch.dict(os.environ, {
+            "MYAGENT_HOME": str(Path(self.temp.name) / "new"),
+            "MYAGENT_GUI_HOME": str(Path(self.temp.name) / "gui"),
+            "APPDATA": str(Path(self.temp.name) / "appdata"),
+        }, clear=True):
             self.assertEqual(
                 default_model_store_path(),
-                Path(self.temp.name).resolve() / "models.json",
+                (Path(self.temp.name) / "new" / "models.json").resolve(),
+            )
+        with patch.dict(os.environ, {
+            "MYAGENT_GUI_HOME": str(Path(self.temp.name) / "gui"),
+            "APPDATA": str(Path(self.temp.name) / "appdata"),
+        }, clear=True):
+            self.assertEqual(
+                default_model_store_path(),
+                (Path(self.temp.name) / "gui" / "models.json").resolve(),
+            )
+        with patch.dict(os.environ, {
+            "APPDATA": str(Path(self.temp.name) / "appdata"),
+        }, clear=True):
+            self.assertEqual(
+                default_model_store_path(),
+                (Path(self.temp.name) / "appdata" / "MyAgent" / "models.json").resolve(),
             )
 
     def test_add_reload_created_at_delete_and_safe_repr(self) -> None:
