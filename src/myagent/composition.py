@@ -30,6 +30,8 @@ from .mcp import (
     ClientTargetFactory,
     MCPRuntime,
     StdioMCPServerConfig,
+    MCPServerConfig,
+    StreamableHTTPMCPServerConfig,
 )
 from .agent_team import (
     AGENT_TEAM_TOOL_NAMES,
@@ -117,7 +119,7 @@ class AgentConfig:
     subagent_max_tasks: int = DEFAULT_SUBAGENT_MAX_TASKS
     allowed_tools: frozenset[str] | None = None
     memory: MemoryConfig = field(default_factory=MemoryConfig)
-    mcp_servers: tuple[StdioMCPServerConfig, ...] = ()
+    mcp_servers: tuple[MCPServerConfig, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.model, str) or not self.model.strip():
@@ -127,10 +129,10 @@ class AgentConfig:
         if not isinstance(self.memory, MemoryConfig):
             raise TypeError("memory must be a MemoryConfig")
         if not isinstance(self.mcp_servers, tuple) or any(
-            not isinstance(server, StdioMCPServerConfig)
+            not isinstance(server, (StdioMCPServerConfig, StreamableHTTPMCPServerConfig))
             for server in self.mcp_servers
         ):
-            raise TypeError("mcp_servers must be a tuple of StdioMCPServerConfig")
+            raise TypeError("mcp_servers must be a tuple of MCP server configs")
 
 
 @dataclass(frozen=True)
@@ -200,7 +202,7 @@ def build_default_components(
     memory_config: MemoryConfig | None = None,
     tool_result_store: ToolResultStore | None = None,
     task_store: TaskStore | None = None,
-    mcp_servers: Iterable[StdioMCPServerConfig] = (),
+    mcp_servers: Iterable[MCPServerConfig] = (),
     mcp_client_target_factory: ClientTargetFactory | None = None,
     session_timeline: SessionTimeline | None = None,
 ) -> DefaultAgentComponents:
@@ -212,10 +214,10 @@ def build_default_components(
     selected_subagent_fallback = (subagent_fallback_model or fallback_model).strip()
     selected_mcp_servers = tuple(mcp_servers)
     if any(
-        not isinstance(server, StdioMCPServerConfig)
+        not isinstance(server, (StdioMCPServerConfig, StreamableHTTPMCPServerConfig))
         for server in selected_mcp_servers
     ):
-        raise TypeError("mcp_servers must contain StdioMCPServerConfig values")
+        raise TypeError("mcp_servers must contain MCP server configs")
 
     workspace_root = WorkspaceFiles(cwd).root
     if skill_store is not None and skill_store.workspace_root != workspace_root:
