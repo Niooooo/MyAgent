@@ -123,7 +123,7 @@ CLI 默认创建并保存一个会话；`-c` 继续最近激活的会话，`-r S
 | 上下文与记忆 | 大型工具结果卸载、历史压缩、长期记忆、渐进式 Skill 加载 |
 | 任务分派 | 同步 SubAgent、后台 Fork、可持续通信的 Agent Team |
 | 工作区隔离 | 可为 Task 创建独立 Git worktree，成员只在任务执行期间切换工作目录 |
-| 自动化与扩展 | 生命周期 Hooks、进程内定时任务、stdio MCP 工具接入 |
+| 自动化与扩展 | 生命周期 Hooks、进程内定时任务、stdio / Streamable HTTP MCP 工具接入 |
 | 桌面使用 | 多标签对话、工作区历史、流式输出、模型管理、敏感操作审批 |
 
 这些能力共用同一条工具执行链。模型不能绕过注册表直接调用本地 handler，子 Agent 和 Agent Team 成员也有各自的工具范围与审批规则。
@@ -231,7 +231,32 @@ CLI 会读取当前目录中的 `myagent.config.json`。可以先复制仓库里
 ]
 ```
 
-远端工具会以 `mcp__local__<tool-name>` 注册到主 Agent。当前实现只支持 stdio transport 和启动时工具发现，不支持 HTTP、SSE、resources、prompts 或运行中刷新。MCP 工具不会暴露给 SubAgent、Agent Team 成员和定时任务。
+远端工具会以 `mcp__local__<tool-name>` 注册到主 Agent。支持 stdio、Streamable HTTP 和启动时工具发现；不支持旧版 SSE transport、resources、prompts 或运行中刷新。MCP 工具不会暴露给 SubAgent、Agent Team 成员和定时任务。
+
+</details>
+
+
+<details>
+<summary>连接 RAG 的 Streamable HTTP MCP Server</summary>
+
+RAG 独立运行，MyAgent 只连接它的 `/mcp` URL。配置示例见
+[`myagent.rag.config.example.json`](./myagent.rag.config.example.json)，两边的启动、鉴权、验证步骤见
+[`docs/rag-mcp.md`](./docs/rag-mcp.md)。
+
+```json
+{
+  "mcp_servers": [{
+    "name": "rag",
+    "transport": "streamable_http",
+    "url": "http://127.0.0.1:8080/mcp",
+    "connect_timeout_seconds": 10,
+    "call_timeout_seconds": 120,
+    "headers": {}
+  }]
+}
+```
+
+远程服务使用对应主机的 URL，可通过 `headers.Authorization` 配置 Bearer 令牌。HTTP 连接直接访问指定地址，不使用进程的代理环境变量。现有 stdio 配置仍可同时使用。
 
 </details>
 
@@ -280,7 +305,7 @@ Shell 检查依赖静态分类，无法识别所有脚本、变量展开和解�
 
 - 定时任务、TODO 状态和未收取的 Fork 记录只存在于当前进程，重启后不会恢复。
 - Agent Team 成员会持续到收到关闭请求或运行时退出，但正在执行的模型请求不会被强制取消。
-- MCP 目前只有 stdio tools 接入，能力范围见上面的配置说明。
+- MCP 支持 stdio 与 Streamable HTTP tools 接入，能力范围见上面的配置说明。
 - 工作区中的 Skill、Task、记忆和工具结果可能包含敏感信息，项目不会自动加密、过期或清理这些文件。
 - 多个独立 MyAgent 进程同时写同一个工作区时，需要调用方自行协调。
 

@@ -18,7 +18,7 @@ from .hooks import (
     UserPromptSubmit,
 )
 from .memory import ContextMemory, MemoryConfig, ToolResultStore, memory_tools
-from .mcp import MCPRuntime, StdioMCPServerConfig, parse_mcp_servers
+from .mcp import MCPRuntime, MCPServerConfig, StdioMCPServerConfig, StreamableHTTPMCPServerConfig, parse_mcp_servers
 from .long_term_memory import (
     ExtractedMemory,
     LongTermMemoryStore,
@@ -107,6 +107,8 @@ __all__ = [
     "Stop",
     "StopReason",
     "StdioMCPServerConfig",
+    "StreamableHTTPMCPServerConfig",
+    "MCPServerConfig",
     "SubAgentManager",
     "ScheduledTask",
     "ScheduledTaskRuntime",

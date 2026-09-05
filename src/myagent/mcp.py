@@ -1,4 +1,4 @@
-"""Long-lived stdio MCP clients adapted to MyAgent function tools."""
+"""Long-lived MCP clients adapted to MyAgent function tools."""
 
 from __future__ import annotations
 
@@ -6,13 +6,19 @@ import asyncio
 import json
 import re
 from collections.abc import Callable, Mapping, Sequence
-from concurrent.futures import TimeoutError as FutureTimeoutError
-from dataclasses import dataclass, field
+from concurrent.futures import Future, TimeoutError as FutureTimeoutError
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from threading import Event, Lock, Thread, current_thread
-from types import MappingProxyType
 from typing import Any, AsyncContextManager
 
 from .tooling import FunctionTool
+from .mcp_config import (
+    MCPServerConfig,
+    StdioMCPServerConfig,
+    StreamableHTTPMCPServerConfig,
+    parse_mcp_servers,
+)
 
 
 MCP_CALL_TIMEOUT_SECONDS = 30.0
@@ -20,89 +26,10 @@ MCP_MAX_RESULT_JSON_BYTES = 65_536
 _MCP_CLOSE_TIMEOUT_SECONDS = 5.0
 _FUNCTION_NAME = re.compile(r"^[A-Za-z0-9_-]+$")
 _MAX_FUNCTION_NAME_LENGTH = 64
-_SERVER_FIELDS = frozenset({"name", "transport", "command", "args", "env"})
-
-
-@dataclass(frozen=True)
-class StdioMCPServerConfig:
-    """Validated, immutable configuration for one stdio MCP server."""
-
-    name: str
-    command: str
-    args: tuple[str, ...] = ()
-    env: Mapping[str, str] = field(
-        default_factory=lambda: MappingProxyType({}),
-        compare=False,
-    )
-    transport: str = "stdio"
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.name, str) or not self.name.strip():
-            raise ValueError("MCP server name must be a non-empty string")
-        if not _FUNCTION_NAME.fullmatch(self.name):
-            raise ValueError(
-                f"MCP server name {self.name!r} contains unsupported characters"
-            )
-        if self.transport != "stdio":
-            raise ValueError("MCP server transport must be 'stdio'")
-        if not isinstance(self.command, str) or not self.command.strip():
-            raise ValueError("MCP server command must be a non-empty string")
-        if not isinstance(self.args, tuple) or any(
-            not isinstance(value, str) for value in self.args
-        ):
-            raise TypeError("MCP server args must be a string array")
-        if not isinstance(self.env, Mapping) or any(
-            not isinstance(key, str) or not isinstance(value, str)
-            for key, value in self.env.items()
-        ):
-            raise TypeError("MCP server env must map strings to strings")
-        object.__setattr__(self, "env", MappingProxyType(dict(self.env)))
-
-
-def parse_mcp_servers(value: object) -> tuple[StdioMCPServerConfig, ...]:
-    """Parse the JSON-facing ``mcp_servers`` value into immutable configs."""
-    if not isinstance(value, list):
-        raise ValueError("mcp_servers must be an array")
-    configs: list[StdioMCPServerConfig] = []
-    names: set[str] = set()
-    for index, item in enumerate(value):
-        prefix = f"mcp_servers[{index}]"
-        if not isinstance(item, dict):
-            raise ValueError(f"{prefix} must be an object")
-        unknown = sorted(set(item).difference(_SERVER_FIELDS))
-        if unknown:
-            raise ValueError(f"{prefix} has unsupported fields {', '.join(unknown)}")
-        missing = sorted({"name", "transport", "command"}.difference(item))
-        if missing:
-            raise ValueError(f"{prefix} is missing fields {', '.join(missing)}")
-        args = item.get("args", [])
-        env = item.get("env", {})
-        if not isinstance(args, list) or any(not isinstance(arg, str) for arg in args):
-            raise ValueError(f"{prefix}.args must be a string array")
-        if not isinstance(env, dict) or any(
-            not isinstance(key, str) or not isinstance(entry, str)
-            for key, entry in env.items()
-        ):
-            raise ValueError(f"{prefix}.env must map strings to strings")
-        try:
-            config = StdioMCPServerConfig(
-                name=item["name"],
-                transport=item["transport"],
-                command=item["command"],
-                args=tuple(args),
-                env=env,
-            )
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"{prefix}: {exc}") from exc
-        if config.name in names:
-            raise ValueError(f"duplicate MCP server name {config.name!r}")
-        names.add(config.name)
-        configs.append(config)
-    return tuple(configs)
 
 
 ClientTargetFactory = Callable[
-    [StdioMCPServerConfig],
+    [MCPServerConfig],
     AsyncContextManager[Any],
 ]
 
@@ -121,7 +48,7 @@ class MCPRuntime:
 
     def __init__(
         self,
-        servers: Sequence[StdioMCPServerConfig],
+        servers: Sequence[MCPServerConfig],
         *,
         client_target_factory: ClientTargetFactory | None = None,
         call_timeout_seconds: float = MCP_CALL_TIMEOUT_SECONDS,
@@ -141,6 +68,10 @@ class MCPRuntime:
         self._started = False
         self._clients: dict[str, Any] = {}
         self._targets: list[AsyncContextManager[Any]] = []
+        self._configs = {server.name: server for server in servers}
+        self._startup: Future[list[_RemoteTool]] = Future()
+        self._lifecycle: Future[None] | None = None
+        self._stop_clients: asyncio.Event | None = None
 
     def start(self) -> tuple[FunctionTool, ...]:
         """Connect once, discover every tools page, and return local adapters."""
@@ -160,10 +91,12 @@ class MCPRuntime:
             self.close()
             raise RuntimeError("MCP event loop did not start")
         try:
-            remote_tools = self._submit(
-                self._start_clients(),
-                timeout=self._call_timeout_seconds,
+            self._lifecycle = asyncio.run_coroutine_threadsafe(self._manage_clients(), self._require_loop())
+            startup_timeout = sum(
+                config.connect_timeout_seconds if isinstance(config, StreamableHTTPMCPServerConfig)
+                else self._call_timeout_seconds for config in self.servers
             )
+            remote_tools = self._startup.result(timeout=startup_timeout + 1)
             return tuple(self._adapt_tool(tool) for tool in remote_tools)
         except BaseException:
             self.close()
@@ -196,13 +129,15 @@ class MCPRuntime:
             client.call_tool(remote_tool, dict(arguments)),
             self._require_loop(),
         )
+        config = self._configs[server]
+        timeout = config.call_timeout_seconds if isinstance(config, StreamableHTTPMCPServerConfig) else self._call_timeout_seconds
         try:
-            result = future.result(timeout=self._call_timeout_seconds)
+            result = future.result(timeout=timeout)
         except FutureTimeoutError:
             future.cancel()
             return _call_error(
                 "mcp_timeout",
-                f"MCP tool call timed out after {self._call_timeout_seconds:g} seconds",
+                f"MCP tool call timed out after {timeout:g} seconds",
                 server,
                 remote_tool,
             )
@@ -216,7 +151,7 @@ class MCPRuntime:
         return _convert_call_result(result, server, remote_tool)
 
     def close(self) -> None:
-        """Idempotently close clients, their stdio transports, and the loop thread."""
+        """Close each transport in the same task that entered its context."""
         with self._lock:
             if self._closed:
                 return
@@ -224,39 +159,58 @@ class MCPRuntime:
             loop = self._loop
             thread = self._thread
         if loop is not None and loop.is_running():
-            future = asyncio.run_coroutine_threadsafe(self._close_clients(), loop)
+            if self._stop_clients is not None:
+                loop.call_soon_threadsafe(self._stop_clients.set)
             try:
-                future.result(timeout=_MCP_CLOSE_TIMEOUT_SECONDS)
+                if self._lifecycle is not None:
+                    self._lifecycle.result(timeout=_MCP_CLOSE_TIMEOUT_SECONDS)
             except Exception:
-                future.cancel()
+                if self._lifecycle is not None:
+                    self._lifecycle.cancel()
             finally:
                 loop.call_soon_threadsafe(loop.stop)
         if thread is not None and thread is not current_thread():
             thread.join(timeout=_MCP_CLOSE_TIMEOUT_SECONDS)
+
+    async def _manage_clients(self) -> None:
+        # SDK transports own AnyIO cancel scopes; enter and exit on one task.
+        self._stop_clients = asyncio.Event()
+        try:
+            discovered = await self._start_clients()
+            self._startup.set_result(discovered)
+            await self._stop_clients.wait()
+        except BaseException as exc:
+            if not self._startup.done():
+                self._startup.set_exception(exc)
+            raise
+        finally:
+            await self._close_clients()
 
     async def _start_clients(self) -> list[_RemoteTool]:
         discovered: list[_RemoteTool] = []
         local_names: set[str] = set()
         try:
             for config in self.servers:
-                target = self._factory(config)
-                client = await target.__aenter__()
-                self._targets.append(target)
-                self._clients[config.name] = client
-                cursor: str | None = None
-                while True:
-                    page = await client.list_tools(cursor=cursor)
-                    for raw_tool in _page_tools(page):
-                        tool = _validate_remote_tool(config.name, raw_tool)
-                        if tool.local_name in local_names:
-                            raise ValueError(
-                                f"Conflicting MCP tool name {tool.local_name!r}"
-                            )
-                        local_names.add(tool.local_name)
-                        discovered.append(tool)
-                    cursor = _page_cursor(page)
-                    if cursor is None:
-                        break
+                timeout = config.connect_timeout_seconds if isinstance(config, StreamableHTTPMCPServerConfig) else self._call_timeout_seconds
+                async with asyncio.timeout(timeout):
+                    target = self._factory(config)
+                    client = await target.__aenter__()
+                    self._targets.append(target)
+                    self._clients[config.name] = client
+                    cursor: str | None = None
+                    while True:
+                        page = await client.list_tools(cursor=cursor)
+                        for raw_tool in _page_tools(page):
+                            tool = _validate_remote_tool(config.name, raw_tool)
+                            if tool.local_name in local_names:
+                                raise ValueError(
+                                    f"Conflicting MCP tool name {tool.local_name!r}"
+                                )
+                            local_names.add(tool.local_name)
+                            discovered.append(tool)
+                        cursor = _page_cursor(page)
+                        if cursor is None:
+                            break
         except BaseException:
             await self._close_clients()
             raise
@@ -286,14 +240,6 @@ class MCPRuntime:
             strict=False,
         )
 
-    def _submit(self, coroutine: Any, *, timeout: float) -> Any:
-        future = asyncio.run_coroutine_threadsafe(coroutine, self._require_loop())
-        try:
-            return future.result(timeout=timeout)
-        except FutureTimeoutError as exc:
-            future.cancel()
-            raise TimeoutError("MCP startup timed out") from exc
-
     def _require_loop(self) -> asyncio.AbstractEventLoop:
         loop = self._loop
         if loop is None:
@@ -316,7 +262,9 @@ class MCPRuntime:
             loop.close()
 
 
-def _default_client_target(config: StdioMCPServerConfig) -> AsyncContextManager[Any]:
+def _default_client_target(config: MCPServerConfig) -> AsyncContextManager[Any]:
+    if isinstance(config, StreamableHTTPMCPServerConfig):
+        return _http_client_target(config)
     # The optional SDK is deliberately imported only for a configured runtime.
     from mcp import Client, StdioServerParameters
     from mcp.client.stdio import stdio_client
@@ -330,6 +278,26 @@ def _default_client_target(config: StdioMCPServerConfig) -> AsyncContextManager[
         stdio_client(parameters),
         input_required_max_rounds=0,
     )
+
+
+@asynccontextmanager
+async def _http_client_target(config: StreamableHTTPMCPServerConfig):
+    import httpx2
+    from mcp import Client
+    from mcp.client.streamable_http import streamable_http_client
+
+    async with httpx2.AsyncClient(
+        headers=dict(config.headers),
+        timeout=httpx2.Timeout(config.call_timeout_seconds + 1, connect=config.connect_timeout_seconds),
+        follow_redirects=False,
+        trust_env=False,
+    ) as http_client:
+        async with Client(
+            streamable_http_client(config.url, http_client=http_client),
+            read_timeout_seconds=config.call_timeout_seconds + 1,
+            input_required_max_rounds=0,
+        ) as client:
+            yield client
 
 
 def _page_tools(page: object) -> Sequence[object]:
