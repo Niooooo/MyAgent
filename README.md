@@ -1,4 +1,23 @@
-# MyAgent
+<h1 align="center">MyAgent</h1>
+
+<p align="center">运行在本地工作区的 Python Agent</p>
+<p align="center">桌面工作台 · 命令行 · Python API</p>
+
+<p align="center">
+  <a href="#环境要求"><img src="https://img.shields.io/badge/Python-3.11%2B-3776AB?style=flat&amp;logo=python&amp;logoColor=white&amp;labelColor=30363D" alt="Python 3.11+"></a>
+  <a href="#2-启动桌面工作台"><img src="https://img.shields.io/badge/Electron-42-47848F?style=flat&amp;logo=electron&amp;logoColor=white&amp;labelColor=30363D" alt="Electron 42"></a>
+  <a href="#环境要求"><img src="https://img.shields.io/badge/Node.js-22.12%2B-339933?style=flat&amp;logo=nodedotjs&amp;logoColor=white&amp;labelColor=30363D" alt="Node.js 22.12+"></a>
+  <a href="#它是怎么运行的"><img src="https://img.shields.io/badge/OpenAI-Responses%20API-412991?style=flat&amp;labelColor=30363D" alt="OpenAI Responses API"></a>
+  <a href="docs/rag-mcp.md"><img src="https://img.shields.io/badge/MCP-Streamable%20HTTP-0EA5E9?style=flat&amp;labelColor=30363D" alt="MCP Streamable HTTP"></a>
+</p>
+
+<p align="center">
+  <a href="#快速开始">快速开始</a> ·
+  <a href="#myagent-能做什么">功能概览</a> ·
+  <a href="#配置">配置说明</a> ·
+  <a href="docs/rag-mcp.md">RAG / MCP 接入</a> ·
+  <a href="#开发与测试">开发与测试</a>
+</p>
 
 一个运行在本地工作区的 Python Agent。它使用 OpenAI Responses API，能读写文件、执行命令、维护任务和记忆，也可以把工作交给子 Agent 或长期运行的 Agent Team 成员。
 
