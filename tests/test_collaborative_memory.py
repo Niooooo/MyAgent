@@ -13,6 +13,7 @@ from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from myagent.agent import AgentLoop
 from myagent.collaborative_memory.config import CollaborativeMemoryConfig
@@ -326,29 +327,43 @@ class RuntimeMemoryTests(unittest.TestCase):
             store.end(qid)
             store.feedback(qid, criterion="tests", passed=True, summary="timeout tests passed")
             store.close()
-            done = threading.Event()
             class Extractor:
                 def create(self, **kwargs):
                     payload = json.loads(kwargs["input"][0]["content"])
                     refs = [e["id"] for e in payload["events"]]
-                    done.set()
                     return response([], encode({"insights": [{
                         "text": "Bound retries before testing timeout behavior.", "conditions": "timeout",
                         "roles": ["implementer"], "event_ids": refs,
                     }]}))
-            service = CollaborativeMemory(Path(folder), CollaborativeMemoryConfig(mode="learn"),
-                                          client=SimpleNamespace(responses=Extractor()), model="fake")
-            try:
-                self.assertTrue(done.wait(5))
-                for _ in range(100):
-                    if service.store.rows("SELECT * FROM insights"):
-                        break
-                    time.sleep(.01)
-                insights = service.store.rows("SELECT * FROM insights")
-                self.assertEqual(1, len(insights))
-                self.assertEqual("done", service.store.rows("SELECT state FROM jobs")[0]["state"])
-            finally:
-                service.close()
+            feedback_started, release_feedback = threading.Event(), threading.Event()
+            apply_feedback = MemoryStore.apply_insight_feedback
+
+            def paused_feedback(memory_store, *args, **kwargs):
+                feedback_started.set()
+                if not release_feedback.wait(5):
+                    raise TimeoutError("test did not release learning feedback")
+                return apply_feedback(memory_store, *args, **kwargs)
+
+            with patch.object(MemoryStore, "apply_insight_feedback", paused_feedback):
+                service = CollaborativeMemory(Path(folder), CollaborativeMemoryConfig(mode="learn"),
+                                              client=SimpleNamespace(responses=Extractor()), model="fake")
+                try:
+                    self.assertTrue(feedback_started.wait(5))
+                    # An insight is visible before feedback and job finalization finish.
+                    self.assertEqual(1, len(service.store.rows("SELECT * FROM insights")))
+                    query = "SELECT state,error FROM jobs WHERE episode_id=?"
+                    job = service.store.rows(query, (qid,))[0]
+                    self.assertEqual("running", job["state"])
+                    release_feedback.set()
+                    deadline = time.monotonic() + 5
+                    while job["state"] in {"pending", "running"} and time.monotonic() < deadline:
+                        time.sleep(.01)
+                        job = service.store.rows(query, (qid,))[0]
+                    self.assertEqual("done", job["state"], job)
+                    self.assertEqual(1, len(service.store.rows("SELECT * FROM insights")))
+                finally:
+                    release_feedback.set()
+                    service.close()
 
     def test_worktree_identity_shares_project_but_keeps_execution_directory(self):
         with tempfile.TemporaryDirectory() as folder:
