@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import os
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from pathlib import Path
 from threading import Lock
 from typing import Any
 
@@ -80,6 +81,10 @@ from .tools import (
     build_bash_function_tool,
 )
 from .worktrees import WORKTREE_TOOL_NAMES, WorktreeManager, worktree_tools
+from .collaborative_memory.config import CollaborativeMemoryConfig
+from .collaborative_memory.runtime import CollaborativeMemory
+from .collaborative_memory.tools import memory_tools as collaborative_memory_tools
+from .collaborative_memory.tools import COLLABORATIVE_TOOL_NAMES
 
 
 _SUBAGENT_INSTRUCTIONS_SUFFIX = """
@@ -120,6 +125,7 @@ class AgentConfig:
     allowed_tools: frozenset[str] | None = None
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     mcp_servers: tuple[MCPServerConfig, ...] = ()
+    collaborative_memory: CollaborativeMemoryConfig = field(default_factory=CollaborativeMemoryConfig)
 
     def __post_init__(self) -> None:
         if not isinstance(self.model, str) or not self.model.strip():
@@ -128,6 +134,8 @@ class AgentConfig:
             raise ValueError("fallback_model must be a non-empty string")
         if not isinstance(self.memory, MemoryConfig):
             raise TypeError("memory must be a MemoryConfig")
+        if not isinstance(self.collaborative_memory, CollaborativeMemoryConfig):
+            raise TypeError("collaborative_memory must be a CollaborativeMemoryConfig")
         if not isinstance(self.mcp_servers, tuple) or any(
             not isinstance(server, (StdioMCPServerConfig, StreamableHTTPMCPServerConfig))
             for server in self.mcp_servers
@@ -154,6 +162,7 @@ class DefaultAgentComponents:
     agent_team_manager: AgentTeamManager | None = None
     mcp_runtime: MCPRuntime | None = None
     inbox_reader: InboxReader | None = None
+    collaborative_memory: CollaborativeMemory | None = None
     _close_callback: Callable[[], None] = field(
         default=_noop,
         repr=False,
@@ -205,6 +214,8 @@ def build_default_components(
     mcp_servers: Iterable[MCPServerConfig] = (),
     mcp_client_target_factory: ClientTargetFactory | None = None,
     session_timeline: SessionTimeline | None = None,
+    collaborative_memory_config: CollaborativeMemoryConfig | None = None,
+    memory_client: ResponsesClient | None = None,
 ) -> DefaultAgentComponents:
     """Create and connect the standard tools, policies, state, and hooks."""
     if max_tool_rounds < 0:
@@ -258,6 +269,16 @@ def build_default_components(
     main_allowed_tools, child_allowed_tools, teammate_allowed_tools = (
         _split_allowed_tools(allowed_tools)
     )
+    collaboration_config = collaborative_memory_config or CollaborativeMemoryConfig()
+    collaborative = (
+        CollaborativeMemory(Path(workspace_root), collaboration_config,
+                            client=memory_client or client, model=model,
+                            allowed_tools=main_allowed_tools)
+        if collaboration_config.mode != "off" else None
+    )
+    if collaborative is not None and allowed_tools is None:
+        child_allowed_tools = child_allowed_tools | COLLABORATIVE_TOOL_NAMES
+        teammate_allowed_tools = teammate_allowed_tools | COLLABORATIVE_TOOL_NAMES
 
     if bash_tool is None:
         def make_bash_handler(
@@ -299,6 +320,7 @@ def build_default_components(
                 memory_config=selected_memory_config,
                 tool_result_store=shared_tool_result_store,
                 task_store=shared_task_store,
+                additional_tools=collaborative_memory_tools(collaborative),
             )
             try:
                 child = AgentLoop(
@@ -313,6 +335,7 @@ def build_default_components(
                     context_memory=child_components.context_memory,
                     session_timeline=child_components.session_timeline,
                     close_callback=child_components.close,
+                    run_observer=collaborative.observer("subagent") if collaborative else None,
                 )
             except BaseException:
                 child_components.close()
@@ -327,6 +350,7 @@ def build_default_components(
             create_subagent,
             max_workers=subagent_max_workers,
             max_tasks=subagent_max_tasks,
+            memory_runtime=collaborative,
         )
         management_tools.extend(subagent_tools(manager))
 
@@ -365,7 +389,8 @@ def build_default_components(
                 memory_config=selected_memory_config,
                 tool_result_store=shared_tool_result_store,
                 task_store=shared_task_store,
-                additional_tools=teammate_team_tools(team_manager, name),
+                additional_tools=[*teammate_team_tools(team_manager, name),
+                                  *collaborative_memory_tools(collaborative)],
             )
             try:
                 teammate = AgentLoop(
@@ -384,6 +409,7 @@ def build_default_components(
                     session_timeline=teammate_components.session_timeline,
                     inbox_reader=inbox_reader,
                     close_callback=teammate_components.close,
+                    run_observer=collaborative.observer(role, name, teammate_workspace) if collaborative else None,
                 )
             except BaseException:
                 teammate_components.close()
@@ -395,13 +421,16 @@ def build_default_components(
             return teammate, teammate_workspace
 
         try:
-            team_manager = AgentTeamManager(workspace_root, create_teammate_agent)
+            team_manager = AgentTeamManager(workspace_root, create_teammate_agent,
+                                            memory_runtime=collaborative)
         except BaseException:
             try:
                 if background_bash_runner is not None:
                     background_bash_runner.close()
             finally:
                 manager.close()
+                if collaborative is not None:
+                    collaborative.close()
             raise
         management_tools.extend(main_team_tools(team_manager))
 
@@ -423,6 +452,8 @@ def build_default_components(
                 manager.close()
             if team_manager is not None:
                 team_manager.close()
+            if collaborative is not None:
+                collaborative.close()
         raise
 
     mcp_tool_names = frozenset(tool.name for tool in mcp_tools)
@@ -448,11 +479,12 @@ def build_default_components(
             memory_config=selected_memory_config,
             tool_result_store=shared_tool_result_store,
             task_store=shared_task_store,
-            dynamic_default_tools=mcp_tool_names,
+            dynamic_default_tools=mcp_tool_names | (COLLABORATIVE_TOOL_NAMES if collaborative else frozenset()),
             dynamic_approval_reasons=mcp_approval_reasons,
             session_timeline=session_timeline,
             additional_tools=[
                 *management_tools,
+                *collaborative_memory_tools(collaborative),
                 *mcp_tools,
                 *(
                     [build_background_bash_function_tool(background_bash_runner)]
@@ -476,6 +508,8 @@ def build_default_components(
                     team_manager.close()
                 if mcp_runtime is not None:
                     mcp_runtime.close()
+                if collaborative is not None:
+                    collaborative.close()
         raise
 
     if client is not None:
@@ -514,6 +548,8 @@ def build_default_components(
                         team_manager.close()
                     if mcp_runtime is not None:
                         mcp_runtime.close()
+                    if collaborative is not None:
+                        collaborative.close()
             raise
 
     if (
@@ -523,7 +559,8 @@ def build_default_components(
         and team_manager is None
         and mcp_runtime is None
     ):
-        return components
+        return replace(components, collaborative_memory=collaborative,
+                       _close_callback=collaborative.close if collaborative else _noop)
 
     def close_runtime() -> None:
         try:
@@ -540,6 +577,8 @@ def build_default_components(
                     team_manager.close()
                 if mcp_runtime is not None:
                     mcp_runtime.close()
+                if collaborative is not None:
+                    collaborative.close()
 
     return DefaultAgentComponents(
         tool_registry=components.tool_registry,
@@ -556,6 +595,7 @@ def build_default_components(
         scheduled_task_runtime=scheduled_task_runtime,
         agent_team_manager=team_manager,
         mcp_runtime=mcp_runtime,
+        collaborative_memory=collaborative,
         inbox_reader=(
             team_manager.inbox_reader(MAIN_AGENT_NAME)
             if team_manager is not None
@@ -736,6 +776,7 @@ def create_default_agent(
         subagent_max_workers=selected.subagent_max_workers,
         subagent_max_tasks=selected.subagent_max_tasks,
         memory_config=selected.memory,
+        collaborative_memory_config=selected.collaborative_memory,
         mcp_servers=selected.mcp_servers,
         mcp_client_target_factory=mcp_client_target_factory,
         session_timeline=session_timeline,
@@ -756,6 +797,8 @@ def create_default_agent(
             inbox_reader=components.inbox_reader,
             stream_callback=stream_callback,
             close_callback=components.close,
+            run_observer=components.collaborative_memory.observer("coordinator", "main")
+            if components.collaborative_memory else None,
         )
     except BaseException:
         components.close()
@@ -768,6 +811,7 @@ def create_default_agent(
     agent.scheduled_task_runtime = components.scheduled_task_runtime
     agent.agent_team_manager = components.agent_team_manager
     agent.mcp_runtime = components.mcp_runtime
+    agent.collaborative_memory = components.collaborative_memory
     return agent
 
 
@@ -800,6 +844,8 @@ def create_default_subagent(
         | AGENT_TEAM_TOOL_NAMES
         | WORKTREE_TOOL_NAMES
     )
+    if selected.allowed_tools is None and selected.collaborative_memory.mode != "off":
+        isolated_tools |= COLLABORATIVE_TOOL_NAMES | {"collaborative_grep", "collaborative_read"}
     components = build_default_components(
         cwd=cwd,
         bash_timeout_seconds=selected.bash_timeout_seconds,
@@ -811,6 +857,8 @@ def create_default_subagent(
         fallback_model=selected.fallback_model,
         max_tool_rounds=selected.max_tool_rounds,
         memory_config=selected.memory,
+        collaborative_memory_config=selected.collaborative_memory,
+        memory_client=client,
         mcp_servers=selected.mcp_servers,
         mcp_client_target_factory=mcp_client_target_factory,
         session_timeline=session_timeline,
@@ -829,6 +877,8 @@ def create_default_subagent(
             session_timeline=components.session_timeline,
             stream_callback=stream_callback,
             close_callback=components.close,
+            run_observer=components.collaborative_memory.observer("subagent")
+            if components.collaborative_memory else None,
         )
     except BaseException:
         components.close()
@@ -839,4 +889,5 @@ def create_default_subagent(
     agent.task_store = components.task_store
     agent.agent_team_manager = None
     agent.mcp_runtime = components.mcp_runtime
+    agent.collaborative_memory = components.collaborative_memory
     return agent

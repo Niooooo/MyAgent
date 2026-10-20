@@ -52,6 +52,7 @@ class SubAgentManager:
         *,
         max_workers: int = DEFAULT_SUBAGENT_MAX_WORKERS,
         max_tasks: int = DEFAULT_SUBAGENT_MAX_TASKS,
+        memory_runtime=None,
     ) -> None:
         if not callable(agent_factory):
             raise TypeError("agent_factory must be callable")
@@ -65,6 +66,7 @@ class SubAgentManager:
             raise ValueError("max_tasks must be positive")
 
         self._agent_factory = agent_factory
+        self._memory_runtime = memory_runtime
         self._max_tasks = max_tasks
         self._executor = ThreadPoolExecutor(
             max_workers=max_workers,
@@ -84,7 +86,7 @@ class SubAgentManager:
         with self._lock:
             if self._closed:
                 return _manager_closed_result()
-            future = self._executor.submit(self._run_fresh_agent, task.strip())
+            future = self._submit(task.strip())
 
         try:
             output = future.result()
@@ -118,7 +120,7 @@ class SubAgentManager:
                 }
 
             fork_id = self._new_fork_id()
-            future = self._executor.submit(self._run_fresh_agent, task.strip())
+            future = self._submit(task.strip(), fork_id)
             self._records[fork_id] = _ForkRecord(future=future)
             future.add_done_callback(
                 lambda completed, identifier=fork_id: self._finish(
@@ -222,6 +224,13 @@ class SubAgentManager:
             return agent.run(task)
         finally:
             agent.close()
+
+    def _submit(self, task: str, task_id: str | None = None):
+        if self._memory_runtime is not None:
+            return self._memory_runtime.submit(
+                self._executor, self._run_fresh_agent, task, task_id=task_id,
+            )
+        return self._executor.submit(self._run_fresh_agent, task)
 
     def _finish(self, fork_id: str, future: Future[str]) -> None:
         try:

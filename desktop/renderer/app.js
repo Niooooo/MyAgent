@@ -177,6 +177,7 @@ function openSettings() {
     ["subagentMaxTasks", elements.subagentMaxTasks],
   ]) input.value = values[name] ?? ""
   elements.settingsDialogError.textContent = state.settingsError || ""
+  document.querySelector("#collaborative-memory-mode").value = values.collaborativeMemoryMode || "off"
   elements.settingsDialog.showModal()
 }
 
@@ -426,6 +427,10 @@ function renderConversation() {
   elements.status.classList.toggle("busy", session.state === "busy")
   elements.status.classList.toggle("error", session.status?.includes("失败") || false)
   if (state.conversationError) setStatus(state.conversationError, true)
+  const memoryButton = document.querySelector("#memory-button")
+  memoryButton.textContent = session.memoryNotice ? "协作记忆 · 异常" : "协作记忆"
+  memoryButton.title = session.memoryNotice || "查看任务经历、验证反馈和历史经验"
+  memoryButton.classList.toggle("memory-warning", Boolean(session.memoryNotice))
 
   renderAgentConfiguration(session)
   elements.prompt.disabled = state.closing
@@ -636,7 +641,13 @@ async function send() {
   renderConversation()
 
   try {
-    await request("session.submit", { sessionId: session.id, prompt })
+    await request("session.submit", {
+      sessionId: session.id, prompt,
+      acceptanceCriteria: memoryCriteria.value.split("\n").map((line) => line.trim()).filter(Boolean),
+      episodeId: memoryContinue.value.trim(),
+    })
+    memoryContinue.value = ""
+    memoryCriteria.value = ""
   } catch {
     streamingMessages.delete(session.id)
     const current = state.sessions.find((item) => item.id === session.id)
@@ -777,6 +788,7 @@ elements.settingsForm.addEventListener("submit", async (event) => {
     elements.settingsDialogError.textContent = "所有运行设置都必须是整数"
     return
   }
+  payload.collaborativeMemoryMode = document.querySelector("#collaborative-memory-mode").value
   try {
     await request("settings.update", payload, { notifyError: false })
     elements.settingsDialog.close()
@@ -860,6 +872,88 @@ api.onWindowState((windowState) => {
 updateHistorySidebar()
 drawWelcomeLogo()
 updateResponsiveLayout()
+const memoryDialog = document.querySelector("#memory-dialog")
+const memoryCriteria = document.querySelector("#memory-criteria")
+const memoryContinue = document.querySelector("#memory-continue")
+const memoryEpisodes = document.querySelector("#memory-episodes")
+const memoryInsights = document.querySelector("#memory-insights")
+const memoryStatus = document.querySelector("#memory-status")
+const memoryDetail = document.querySelector("#memory-detail")
+
+async function memoryCommand(action, values = {}) {
+  const result = await request("memory.command", { sessionId: state.activeSessionId, action, values })
+  return result.memory
+}
+
+function memoryOptions(select, rows, label) {
+  const selected = select.value
+  select.replaceChildren(...rows.map((row) => {
+    const option = document.createElement("option")
+    option.value = row.id
+    option.textContent = label(row)
+    return option
+  }))
+  if (rows.some((row) => row.id === selected)) select.value = selected
+  select.disabled = rows.length === 0
+  if (!rows.length) {
+    const empty = document.createElement("option")
+    empty.value = ""
+    empty.textContent = "暂无记录"
+    select.append(empty)
+  }
+}
+
+async function refreshMemory() {
+  const data = await memoryCommand("status")
+  memoryOptions(memoryEpisodes, data.episodes || [], (row) => `${row.outcome} · ${row.task.slice(0, 55)} · ${row.id}`)
+  memoryOptions(memoryInsights, data.insights || [], (row) => `${row.status} · ${row.text.slice(0, 65)} · ${row.id}`)
+  const modes = { off: "关闭", record: "只记录", learn: "读取并学习" }
+  memoryStatus.textContent = `模式：${modes[state.settings.collaborativeMemoryMode || "off"]} · ${data.episodes?.length || 0} 个近期任务`
+  memoryDetail.textContent = JSON.stringify({ errors: data.errors || [], jobs: data.jobs || [] }, null, 2)
+  memoryDetail.hidden = !data.errors?.length && !data.jobs?.length
+  document.querySelector("#memory-sources").disabled = !data.episodes?.length
+  document.querySelector("#memory-feedback").disabled = !data.episodes?.length
+  document.querySelector("#memory-disable").disabled = !data.insights?.length
+  document.querySelector("#memory-delete").disabled = !data.insights?.length
+}
+
+document.querySelector("#memory-button").addEventListener("click", () => {
+  memoryDialog.showModal()
+  refreshMemory().catch(() => undefined)
+})
+document.querySelector("#memory-refresh").addEventListener("click", () => refreshMemory().catch(() => undefined))
+document.querySelector("#memory-sources").addEventListener("click", async () => {
+  try {
+    const data = await memoryCommand("sources", { episode_id: memoryEpisodes.value })
+    memoryDetail.textContent = JSON.stringify(data, null, 2)
+    memoryDetail.hidden = false
+  } catch { /* request displays the error */ }
+})
+document.querySelector("#memory-feedback").addEventListener("click", async () => {
+  try {
+    const data = await memoryCommand("feedback", {
+      episode_id: memoryEpisodes.value,
+      criterion: document.querySelector("#memory-criterion").value,
+      passed: document.querySelector("#memory-result").value === "passed",
+      summary: document.querySelector("#memory-evidence").value,
+    })
+    await refreshMemory()
+    memoryDetail.textContent = JSON.stringify(data, null, 2)
+    memoryDetail.hidden = false
+  } catch { /* request displays the error */ }
+})
+for (const action of ["disable", "delete"]) {
+  document.querySelector(`#memory-${action}`).addEventListener("click", async () => {
+    try {
+      await memoryCommand(action, {
+        insight_id: memoryInsights.value,
+        reason: document.querySelector("#memory-reason").value,
+      })
+      await refreshMemory()
+    } catch { /* request displays the error */ }
+  })
+}
+
 request("app.snapshot").catch(() => undefined)
 
 export { COMPACT_ENTER_WIDTH, COMPACT_EXIT_WIDTH }

@@ -16,6 +16,7 @@ const BACKGROUND = "#0b0e10"
 const smokeTest = process.argv.includes("--smoke-test")
 const smokeScreenshotPath = process.env.MYAGENT_SMOKE_SCREENSHOT || ""
 const smokeSettingsScreenshotPath = process.env.MYAGENT_SMOKE_SETTINGS_SCREENSHOT || ""
+const smokeMemoryScreenshotPath = process.env.MYAGENT_SMOKE_MEMORY_SCREENSHOT || ""
 const smokeIconPath = process.env.MYAGENT_SMOKE_ICON || ""
 const IPC_METHODS = new Set([
   "app.snapshot",
@@ -32,6 +33,7 @@ const IPC_METHODS = new Set([
   "model.delete",
   "model.refresh",
   "settings.update",
+  "memory.command",
   "approval.decide",
 ])
 
@@ -386,6 +388,29 @@ function createWindow() {
         ) {
           throw new Error("Settings dialog or Agent configuration dismissal behavior failed")
         }
+        const memoryControls = await mainWindow.webContents.executeJavaScript(`(async () => {
+          document.querySelector("#memory-button").click()
+          const snapshot = await window.myagent.request("app.snapshot")
+          const result = await window.myagent.request("memory.command", {
+            sessionId: snapshot.state.activeSessionId, action: "status", values: {}
+          })
+          const dialog = document.querySelector("#memory-dialog")
+          const bounds = dialog.getBoundingClientRect()
+          return {
+            open: dialog.open,
+            fits: bounds.height <= innerHeight && bounds.width <= innerWidth,
+            modes: [...document.querySelector("#collaborative-memory-mode").options].map(item => item.value),
+            records: Array.isArray(result.memory.episodes),
+          }
+        })()`)
+        if (!memoryControls.open || !memoryControls.fits || !memoryControls.records ||
+            memoryControls.modes.join(",") !== "off,record,learn") {
+          throw new Error("Collaborative memory management controls failed")
+        }
+        if (smokeMemoryScreenshotPath) {
+          writeFileSync(smokeMemoryScreenshotPath, (await mainWindow.webContents.capturePage()).toPNG())
+        }
+        await mainWindow.webContents.executeJavaScript('document.querySelector("#memory-dialog").close()')
         const renameStarted = await mainWindow.webContents.executeJavaScript(`(() => {
           const title = document.querySelector(".tab-title")
           const rect = title?.getBoundingClientRect()

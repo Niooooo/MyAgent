@@ -8,5 +8,20 @@
   "todo_reminder_tool_calls": 4,
   "subagent_max_workers": 4,
   "subagent_max_tasks": 16,
-  "mcp_servers": []
+  "mcp_servers": [],
+  "collaborative_memory": {
+    "mode": "off",
+    "search_rounds": 3,
+    "hits_per_round": 8,
+    "read_chars": 16000,
+    "scan_bytes": 2000000,
+    "candidate_tasks": 4,
+    "expansion_nodes": 8,
+    "model_calls": 4,
+    "injection_chars": 6000,
+    "timeout_seconds": 15,
+    "model_output_tokens": 1500,
+    "event_chars": 65536,
+    "learning_attempts": 3
+  }
 }

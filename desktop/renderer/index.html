@@ -80,6 +80,7 @@
             <span class="context-label">工作区</span>
             <span id="workspace-value" class="workspace-value"></span>
             <span id="session-status" class="status-pill">正在连接桌面后端…</span>
+            <button id="memory-button" class="secondary-button" type="button">协作记忆</button>
           </div>
 
           <div id="transcript-host">
@@ -192,6 +193,7 @@
         <label><span>TODO 提醒调用数</span><input id="todo-reminder-tool-calls-input" name="todoReminderToolCalls" type="number" min="1" max="100000" step="1" required /></label>
         <label><span>子 Agent 最大并发数</span><input id="subagent-max-workers-input" name="subagentMaxWorkers" type="number" min="1" max="256" step="1" required /></label>
         <label><span>子 Agent 最大任务数</span><input id="subagent-max-tasks-input" name="subagentMaxTasks" type="number" min="1" max="100000" step="1" required /></label>
+        <label><span>协作记忆</span><select id="collaborative-memory-mode"><option value="off">关闭</option><option value="record">只记录</option><option value="learn">读取并学习</option></select></label>
         <p id="settings-dialog-error" class="dialog-error" aria-live="polite"></p>
         <footer>
           <button id="settings-cancel-button" class="secondary-button" type="button">取消</button>
@@ -200,6 +202,35 @@
       </form>
     </dialog>
 
+    <dialog id="memory-dialog">
+      <form method="dialog" id="memory-form">
+        <header><h2>协作记忆</h2><p>经验必须有验证依据。模式可在运行设置中修改。</p></header>
+        <details open>
+          <summary>下次任务的边界</summary>
+          <label><span>验收条件（每行一项，留空时结果保持未知）</span><textarea id="memory-criteria" rows="3"></textarea></label>
+          <label><span>继续已有任务 ID（留空即新任务）</span><input id="memory-continue" autocomplete="off" /></label>
+        </details>
+        <label><span>历史任务</span><select id="memory-episodes"></select></label>
+        <button id="memory-sources" class="secondary-button" type="button">查看来源与检索记录</button>
+        <details>
+          <summary>提交任务结果</summary>
+          <label><span>覆盖的验收条件（与任务原文一致）</span><input id="memory-criterion" /></label>
+          <label><span>结果</span><select id="memory-result"><option value="passed">通过</option><option value="failed">失败</option></select></label>
+          <label><span>验证依据或用户反馈</span><textarea id="memory-evidence" rows="3"></textarea></label>
+          <button id="memory-feedback" class="secondary-button" type="button">保存结果反馈</button>
+        </details>
+        <details>
+          <summary>纠正经验</summary>
+          <label><span>经验</span><select id="memory-insights"></select></label>
+          <label><span>纠正原因</span><input id="memory-reason" /></label>
+          <button id="memory-disable" class="secondary-button" type="button">停用经验</button>
+          <button id="memory-delete" class="secondary-button" type="button">删除经验</button>
+        </details>
+        <p id="memory-status" role="status"></p>
+        <pre id="memory-detail" tabindex="0"></pre>
+        <footer><button id="memory-refresh" class="secondary-button" type="button">刷新</button><button class="primary-button" type="submit">返回对话</button></footer>
+      </form>
+    </dialog>
     <script type="module" src="./app.js"></script>
   </body>
 </html>

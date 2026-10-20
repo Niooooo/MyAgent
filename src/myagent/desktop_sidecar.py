@@ -57,6 +57,7 @@ class DesktopSidecar:
         self._closing = False
         self._approval_ids = count(1)
         self._approvals: dict[str, tuple[int, ApprovalProposal]] = {}
+        self._memory_notices: dict[int, str] = {}
         self._poll_thread: threading.Thread | None = None
         if start_polling:
             self._poll_thread = threading.Thread(
@@ -90,6 +91,7 @@ class DesktopSidecar:
                 "model.delete": self._delete_model,
                 "model.refresh": self._refresh_models,
                 "settings.update": self._update_settings,
+                "memory.command": self._memory_command,
                 "approval.decide": self._decide_approval,
             }
             handler = handlers.get(method)
@@ -123,6 +125,10 @@ class DesktopSidecar:
         changed = False
         with self._lock:
             for session in tuple(self.manager.sessions):
+                notice = self._memory_notice(session)
+                if self._memory_notices.get(session.session_id, "") != notice:
+                    self._memory_notices[session.session_id] = notice
+                    changed = True
                 while True:
                     try:
                         event = session.controller.events.get_nowait()
@@ -265,6 +271,16 @@ class DesktopSidecar:
     def _submit(self, params: dict[str, Any]) -> ProtocolPayload:
         session = self._find_session(self._session_id(params))
         prompt = self._required_text(params, "prompt")
+        if "acceptanceCriteria" in params or "episodeId" in params:
+            criteria = params.get("acceptanceCriteria", [])
+            episode = params.get("episodeId") or None
+            if not isinstance(criteria, list) or any(not isinstance(c, str) or not c.strip() for c in criteria):
+                raise ProtocolError("acceptanceCriteria must contain non-empty strings")
+            if episode is not None and not isinstance(episode, str):
+                raise ProtocolError("episodeId must be a string")
+            if session.controller.state != "idle":
+                raise ProtocolError("session is busy")
+            session.controller.agent.configure_memory_turn(criteria, episode)
         if not session.controller.submit(prompt):
             raise ProtocolError(session.controller.last_error or "message could not be sent")
         session.messages.append(("你", prompt.strip()))
@@ -302,6 +318,19 @@ class DesktopSidecar:
                 self.manager.settings_error or "desktop settings could not be saved"
             )
         return {"state": self.snapshot()}
+
+    def _memory_command(self, params: dict[str, Any]) -> ProtocolPayload:
+        session = self._find_session(self._session_id(params))
+        action = self._required_text(params, "action")
+        if session.controller.state != "idle" and action != "status":
+            raise ProtocolError("请等待当前任务结束后管理协作记忆")
+        values = params.get("values", {})
+        if not isinstance(values, dict):
+            raise ProtocolError("memory values must be an object")
+        try:
+            return {"memory": session.controller.agent.memory_command(action, values)}
+        except (ValueError, KeyError, TypeError) as exc:
+            raise ProtocolError(str(exc)) from exc
 
     def _decide_approval(self, params: dict[str, Any]) -> ProtocolPayload:
         approval_id = self._required_text(params, "approvalId")
@@ -352,11 +381,17 @@ class DesktopSidecar:
                 for speaker, text in session.messages
             ],
             "status": session.status,
+            "memoryNotice": self._memory_notice(session),
             "canSend": controller.state == "idle" and bool(controller.model),
             "canChangeModel": controller.state == "idle",
             "canConfigureAgents": controller.state == "idle",
             "canChangeKind": controller.state == "idle" and not controller.has_started,
         }
+
+    @staticmethod
+    def _memory_notice(session: Any) -> str:
+        getter = getattr(session.controller.agent, "memory_notice", None)
+        return session.controller.redact_for_ui(getter()) if callable(getter) else ""
 
     def _find_session(self, session_id: int) -> Any:
         for session in self.manager.sessions:

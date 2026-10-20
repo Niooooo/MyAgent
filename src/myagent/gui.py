@@ -255,6 +255,25 @@ class DeferredAgent:
         self.timeline = timeline if timeline is not None else SessionTimeline()
         self._closed = False
         self._lock = threading.RLock()
+        self._memory_turn_options = {}
+
+    def configure_memory_turn(self, criteria: list[str], episode_id: str | None) -> None:
+        with self._lock:
+            self._memory_turn_options = {"acceptance_criteria": criteria, "episode_id": episode_id}
+
+    def memory_command(self, action: str, values: dict) -> dict:
+        from .collaborative_memory.management import manage
+        with self._lock:
+            service = getattr(self._agent, "collaborative_memory", None)
+            return manage(self.cwd, action, values, service=service)
+
+    def memory_notice(self) -> str:
+        with self._lock:
+            service = getattr(self._agent, "collaborative_memory", None)
+            if service is None or not service.errors:
+                return ""
+            latest = service.errors[-1]
+            return f"{latest['stage']}: {latest['error']}"
 
     def __repr__(self) -> str:
         return (
@@ -420,7 +439,9 @@ class DeferredAgent:
 
     def run(self, prompt: str) -> str:
         try:
-            return self._get_or_create().run(prompt)
+            options, self._memory_turn_options = self._memory_turn_options, {}
+            agent = self._get_or_create()
+            return agent.run(prompt, **options) if any(options.values()) else agent.run(prompt)
         except SystemExit as exc:
             # CLI configuration validation uses SystemExit; a desktop worker
             # must turn it into a normal result event instead of dying silently.
@@ -1411,6 +1432,9 @@ def create_runtime(
             todo_reminder_tool_calls=selected_settings.todo_reminder_tool_calls,
             subagent_max_workers=selected_settings.subagent_max_workers,
             subagent_max_tasks=selected_settings.subagent_max_tasks,
+            collaborative_memory=replace(
+                config.collaborative_memory, mode=selected_settings.collaborative_memory_mode,
+            ),
         )
 
     from openai import OpenAI

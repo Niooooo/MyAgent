@@ -616,7 +616,7 @@ body.sidebar-collapsed .history-toggle-glyph {
 
 .context-bar {
   display: grid;
-  grid-template-columns: max-content minmax(0, 1fr) max-content;
+  grid-template-columns: max-content minmax(0, 1fr) max-content max-content;
   align-items: center;
   gap: 10px;
   padding: 12px 22px 8px;
@@ -1285,6 +1285,10 @@ dialog footer {
     display: none;
   }
 
+  .context-bar {
+    grid-template-columns: minmax(0, 1fr) max-content max-content;
+  }
+
   .brand {
     padding-right: 12px;
   }
@@ -1318,4 +1322,73 @@ dialog footer {
     animation: none;
     opacity: 0.7;
   }
+}
+#memory-dialog {
+  width: min(640px, calc(100vw - 40px));
+  max-height: 85vh;
+  overflow: auto;
+}
+
+#memory-dialog details {
+  margin: 0;
+}
+
+#memory-dialog form {
+  gap: 12px;
+}
+
+#memory-dialog footer {
+  position: sticky;
+  bottom: 0;
+  padding: 10px 0 0;
+  background: var(--app);
+}
+
+#memory-dialog summary {
+  padding: 7px 0;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+#memory-dialog summary:focus-visible {
+  outline: 2px solid #527ec4;
+  outline-offset: 3px;
+}
+
+#memory-dialog details label {
+  margin: 8px 0;
+}
+
+#memory-dialog textarea {
+  width: 100%;
+  min-height: 64px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--input);
+  color: var(--text);
+  resize: vertical;
+}
+
+#memory-detail {
+  max-height: 300px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+}
+
+#memory-status {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+#memory-button.memory-warning {
+  color: var(--error);
+}
+
+#memory-button {
+  min-height: 28px;
+  font-size: 11px;
 }

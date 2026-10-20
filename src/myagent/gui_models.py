@@ -66,6 +66,7 @@ class DesktopSettings:
     todo_reminder_tool_calls: int
     subagent_max_workers: int
     subagent_max_tasks: int
+    collaborative_memory_mode: str = "off"
 
     @classmethod
     def defaults(cls) -> "DesktopSettings":
@@ -78,13 +79,14 @@ class DesktopSettings:
             values.subagent_max_tasks,
         )
 
-    def public_dict(self) -> dict[str, int]:
+    def public_dict(self) -> dict[str, int | str]:
         return {
             "maxToolRounds": self.max_tool_rounds,
             "bashTimeoutSeconds": self.bash_timeout_seconds,
             "todoReminderToolCalls": self.todo_reminder_tool_calls,
             "subagentMaxWorkers": self.subagent_max_workers,
             "subagentMaxTasks": self.subagent_max_tasks,
+            "collaborativeMemoryMode": self.collaborative_memory_mode,
         }
 
 
@@ -122,7 +124,7 @@ class DesktopSettingsStore:
     def validate(cls, raw: object) -> DesktopSettings:
         if not isinstance(raw, dict):
             raise DesktopSettingsError("设置必须是对象")
-        if set(raw) != set(cls._FIELDS):
+        if set(raw).difference({"collaborativeMemoryMode"}) != set(cls._FIELDS):
             raise DesktopSettingsError("设置字段必须完整且不能包含未知字段")
         selected: dict[str, int] = {}
         for public_name, (field_name, minimum, maximum) in cls._FIELDS.items():
@@ -134,6 +136,10 @@ class DesktopSettingsStore:
                     f"{public_name} 必须在 {minimum} 到 {maximum} 之间"
                 )
             selected[field_name] = value
+        mode = raw.get("collaborativeMemoryMode", "off")
+        if mode not in {"off", "record", "learn"}:
+            raise DesktopSettingsError("协作记忆模式必须是 off、record 或 learn")
+        selected["collaborative_memory_mode"] = mode
         return DesktopSettings(**selected)
 
     def save(self, settings: DesktopSettings) -> None:
