@@ -72,6 +72,7 @@ class _PlanApprovalRequest:
     member: str
     task_id: str
     plan: str
+    memory_scope: object = None
 
 
 class AgentTeamManager:
@@ -81,6 +82,7 @@ class AgentTeamManager:
         self,
         workspace_root: str | os.PathLike[str],
         factory: TeammateFactory,
+        memory_runtime=None,
     ) -> None:
         if not callable(factory):
             raise TypeError("factory must be callable")
@@ -88,6 +90,7 @@ class AgentTeamManager:
             Path(workspace_root) / ".myagent" / "agent-team" / "inboxes"
         )
         self._factory = factory
+        self._memory_runtime = memory_runtime
         self._lock = RLock()
         self._members: dict[str, _Member] = {}
         self._proposals: set[str] = set()
@@ -189,7 +192,8 @@ class AgentTeamManager:
             task_id = secrets.token_hex(16)
             member.active_task_id = task_id
             try:
-                member.executor.submit(
+                self._submit(
+                    member.executor,
                     self._run_teammate_task,
                     name,
                     member,
@@ -241,6 +245,8 @@ class AgentTeamManager:
             "recipient": recipient,
             "message": message,
         }
+        if self._memory_runtime is not None:
+            payload = self._memory_runtime.message_sent(payload)
         temporary = inbox / f".{identifier}.{secrets.token_hex(8)}.tmp"
         destination = inbox / f"{identifier}.json"
         try:
@@ -293,7 +299,8 @@ class AgentTeamManager:
             member.shutdown_request = shutdown_request
             self._shutdown_requests[name] = shutdown_request
             try:
-                member.executor.submit(
+                self._submit(
+                    member.executor,
                     self._close_teammate,
                     name,
                     member,
@@ -375,7 +382,8 @@ class AgentTeamManager:
             if not written["ok"]:
                 return written
             self._pending_plan_approvals[request_id] = _PlanApprovalRequest(
-                member, task_id.strip(), plan.strip()
+                member, task_id.strip(), plan.strip(),
+                self._memory_runtime.current_scope() if self._memory_runtime else None,
             )
         return {
             "ok": True,
@@ -423,12 +431,14 @@ class AgentTeamManager:
             if approved:
                 member.queued_plan_request_id = request_id
                 try:
-                    member.executor.submit(
+                    self._submit(
+                        member.executor,
                         self._run_approved_task,
                         pending.member,
                         member,
                         request_id,
                         pending,
+                        origin=pending.memory_scope,
                     )
                 except RuntimeError:
                     member.queued_plan_request_id = None
@@ -475,6 +485,13 @@ class AgentTeamManager:
                 pass
         with self._lock:
             self._members.clear()
+
+    def _submit(self, executor, callback, *args, origin=None):
+        if self._memory_runtime is not None:
+            return self._memory_runtime.submit(executor, callback, *args,
+                                               task_id=args[2] if len(args) > 2 else None,
+                                               origin=origin)
+        return executor.submit(callback, *args)
 
     def _run_teammate_task(
         self,
@@ -810,7 +827,10 @@ class AgentTeamManager:
         }
 
         def acknowledge() -> None:
-            for path in consumed:
+            for path, payload in zip(consumed, messages):
+                if (self._memory_runtime is not None
+                        and not self._memory_runtime.message_delivered(payload, member)):
+                    continue
                 try:
                     path.unlink()
                 except OSError:

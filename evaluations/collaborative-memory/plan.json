@@ -1,0 +1,7 @@
+[
+  {"case": "repair_retry_config", "family": "retry", "phase": "train"},
+  {"case": "normalize_slug", "family": "text", "phase": "interference"},
+  {"case": "retry_budget", "family": "retry", "phase": "test"},
+  {"case": "retry_policy_revision", "family": "retry", "phase": "correction"},
+  {"case": "retry_deadline", "family": "retry", "phase": "test"}
+]

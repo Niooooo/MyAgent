@@ -81,6 +81,8 @@ _SENSITIVE_SKILL_TOOLS = {
     DELETE_SKILL_TOOL: "deleting a Skill removes persistent instructions",
 }
 _SENSITIVE_LONG_TERM_MEMORY_TOOLS = {
+    "change_collaborative_insight": "changing collaborative insights modifies persistent project memory",
+    "cite_collaborative_insight": "recording an explicit citation changes persistent memory provenance",
     STORE_MEMORY_TOOL: "storing a memory persistently changes workspace state",
     UPDATE_MEMORY_TOOL: "updating a memory replaces persistent workspace state",
     DELETE_MEMORY_TOOL: "deleting a memory removes persistent workspace state",

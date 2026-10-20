@@ -67,6 +67,18 @@ class SessionTimeline:
         self._current_turn = 0
         self._open_exchange_id: int | None = None
         self._pending_from = 0
+        self._observers = []
+
+    def add_observer(self, callback) -> None:
+        """Observe new operations without sharing or consuming protocol history."""
+        with self._lock:
+            if callback not in self._observers:
+                self._observers.append(callback)
+
+    def remove_observer(self, callback) -> None:
+        with self._lock:
+            if callback in self._observers:
+                self._observers.remove(callback)
 
     @classmethod
     def from_operations(
@@ -502,6 +514,8 @@ class SessionTimeline:
         )
         self._next_operation_id += 1
         self._operations.append(operation)
+        for callback in tuple(self._observers):
+            callback(deepcopy(operation))
         return operation
 
     def _new_block(

@@ -21,6 +21,8 @@ from .session_store import (
     StoredSession,
 )
 from .session_timeline import SessionTimeline
+from .collaborative_memory.config import CollaborativeMemoryConfig
+from .collaborative_memory.management import manage as manage_collaborative_memory
 
 
 CONFIG_PATH = Path("myagent.config.json")
@@ -36,6 +38,7 @@ _CONFIG_FIELDS = frozenset(
         "subagent_max_workers",
         "subagent_max_tasks",
         "mcp_servers",
+        "collaborative_memory",
     }
 )
 _POSITIVE_INTEGER_FIELDS = frozenset(
@@ -61,6 +64,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=os.getenv("OPENAI_MODEL", configured_model),
         help="OpenAI model ID (default: %(default)s)",
     )
+    parser.add_argument("--collaborative-memory", choices=("off", "record", "learn"))
+    parser.add_argument("--accept", action="append", default=[], help="A task acceptance criterion; repeat for each condition")
+    parser.add_argument("--continue-episode", help="Explicitly continue this collaborative task ID")
+    parser.add_argument("--memory-action", choices=("status", "sources", "feedback", "disable", "delete",
+                                                 "revise", "delete_episode", "rebuild", "recover", "retry", "end"))
+    parser.add_argument("--memory-episode")
+    parser.add_argument("--memory-insight")
+    parser.add_argument("--criterion")
+    parser.add_argument("--result", choices=("passed", "failed"))
+    parser.add_argument("--evidence", help="Concrete verification result or user feedback")
+    parser.add_argument("--reason", help="Why an insight should be corrected")
+    parser.add_argument("--replacement", help="Revised insight text")
     sessions = parser.add_mutually_exclusive_group()
     sessions.add_argument(
         "-c",
@@ -86,6 +101,21 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    if args.memory_action:
+        try:
+            result = manage_collaborative_memory(Path.cwd(), args.memory_action, {
+                "episode_id": args.memory_episode, "insight_id": args.memory_insight,
+                "criterion": args.criterion, "passed": args.result == "passed" if args.result else None,
+                "summary": args.evidence or "", "reason": args.reason or "", "text": args.replacement,
+            })
+        except (ValueError, KeyError, TypeError) as exc:
+            raise SystemExit(f"memory command failed: {exc}") from exc
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+    if args.collaborative_memory:
+        args.file_config["collaborative_memory"] = {
+            **args.file_config.get("collaborative_memory", {}), "mode": args.collaborative_memory,
+        }
     prompt = " ".join(args.prompt)
     client_options = _client_options(args.file_config)
     sensitive_values = _sensitive_values(client_options)
@@ -110,6 +140,9 @@ def main() -> None:
         session_timeline=cli_session.timeline,
     )
     try:
+        agent._memory_turn_options = {
+            "episode_id": args.continue_episode, "acceptance_criteria": args.accept,
+        }
         if args.prompt:
             _run_turn(agent, prompt, cli_session)
             return
@@ -139,7 +172,8 @@ def _run_turn(
     selected = cli_session or _CLISession.temporary(Path.cwd().resolve(), ())
     selected.record_message("你", user_input)
     try:
-        answer = agent.run(user_input)
+        options = getattr(agent, "_memory_turn_options", {})
+        answer = agent.run(user_input, **options) if any(options.values()) else agent.run(user_input)
     except AgentLoopLimitError as exc:
         error_text = f"agent error: {selected.redact_error(exc)}"
         print(error_text, file=sys.stderr)
@@ -152,6 +186,11 @@ def _run_turn(
         print(f"agent> {answer}")
         selected.record_message("MyAgent", answer)
     selected.persist()
+    memory = getattr(agent, "collaborative_memory", None)
+    if memory is not None:
+        print(f"collaborative memory: mode={memory.config.mode} episode={memory.last_episode}", file=sys.stderr)
+        if memory.errors:
+            print(f"memory status: {memory.errors[-1]}", file=sys.stderr)
 
 
 @dataclass
@@ -404,6 +443,11 @@ def _load_config(
             payload["mcp_servers"] = parse_mcp_servers(payload["mcp_servers"])
         except ValueError as exc:
             raise SystemExit(f"Invalid config {selected_path}: {exc}") from exc
+    if "collaborative_memory" in payload:
+        try:
+            CollaborativeMemoryConfig(**payload["collaborative_memory"])
+        except (TypeError, ValueError) as exc:
+            raise SystemExit(f"Invalid collaborative_memory config: {exc}") from exc
     return payload
 
 
@@ -458,6 +502,9 @@ def _config_from_environment(
                 "SUBAGENT_MAX_TASKS",
             ),
             mcp_servers=tuple(selected_file_config.get("mcp_servers", ())),
+            collaborative_memory=CollaborativeMemoryConfig(
+                **selected_file_config.get("collaborative_memory", {})
+            ),
         )
     except ValueError as exc:
         raise SystemExit(

@@ -104,6 +104,16 @@ class ResponsesClient(Protocol):
     responses: ResponsesEndpoint
 
 
+class AgentRunObserver(Protocol):
+    """Optional runtime observation without storage or graph policy in the loop."""
+
+    def begin(self, task: str, timeline: SessionTimeline, *, episode_id: str | None = None,
+              criteria: list[str] | None = None, tools: Sequence[str] = ()) -> str: ...
+    def tool_result(self, call_id: str, result: dict) -> None: ...
+    def context_is_current(self) -> bool: ...
+    def finish(self, output: str | None, failure: BaseException | None) -> None: ...
+
+
 class AgentLoop:
     """Run a stateful OpenAI Responses API tool-calling loop."""
 
@@ -131,6 +141,7 @@ class AgentLoop:
         inbox_reader: InboxReader | None = None,
         stream_callback: StreamCallback | None = None,
         close_callback: Callable[[], None] | None = None,
+        run_observer: AgentRunObserver | None = None,
     ) -> None:
         if max_tool_rounds < 0:
             raise ValueError("max_tool_rounds must be non-negative")
@@ -210,6 +221,9 @@ class AgentLoop:
         self.mcp_runtime = None
         self.inbox_reader = inbox_reader
         self.stream_callback = stream_callback
+        self.run_observer = run_observer
+        self.collaborative_memory = None
+        self._run_context_items: list[object] = []
         if tool_registry is not None:
             if hooks is not None and tool_registry.hooks is not hooks:
                 raise ValueError(
@@ -258,7 +272,8 @@ class AgentLoop:
         )
         self.hooks = self.tool_registry.hooks
 
-    def run(self, user_input: str) -> str:
+    def run(self, user_input: str, *, episode_id: str | None = None,
+            acceptance_criteria: list[str] | None = None) -> str:
         """Process one user turn and return the model's final text."""
         tool_rounds = 0
         inbox_drained = False
@@ -266,7 +281,16 @@ class AgentLoop:
         failure: BaseException | None = None
 
         try:
+            material = ""
+            if self.run_observer is not None:
+                material = self.run_observer.begin(
+                    user_input, self.session_timeline, episode_id=episode_id,
+                    criteria=acceptance_criteria,
+                    tools=[tool["name"] for tool in self.tool_registry.definitions],
+                )
             self._submit_user_input(user_input)
+            if material:
+                self._run_context_items = [{"role": "user", "content": material}]
 
             while True:
                 response = self._request_response()
@@ -310,7 +334,12 @@ class AgentLoop:
                 output_text=output_text,
                 error=failure,
             )
-            self._emit_stop(stop, failure)
+            try:
+                self._emit_stop(stop, failure)
+            finally:
+                if self.run_observer is not None:
+                    self.run_observer.finish(output_text, failure)
+                self._run_context_items = []
 
     def reset(self) -> None:
         """Clear the in-memory conversation history."""
@@ -378,7 +407,7 @@ class AgentLoop:
                 model=self.model,
                 instructions=instructions,
                 tools=self.tool_registry.definitions,
-                input=self.session_timeline.build_model_input(),
+                input=self._model_input(),
             )
         except Exception as exc:
             if self.context_memory is None or not _is_context_length_error(exc):
@@ -391,10 +420,16 @@ class AgentLoop:
                 model=self.model,
                 instructions=instructions,
                 tools=self.tool_registry.definitions,
-                input=self.session_timeline.build_model_input(),
+                input=self._model_input(),
             )
         self.session_timeline.record_request_succeeded()
         return response
+
+    def _model_input(self) -> list[object]:
+        """Transient sourced context never becomes durable protocol history."""
+        if self.run_observer is not None and not self.run_observer.context_is_current():
+            self._run_context_items = []
+        return [*self.session_timeline.build_model_input(), *self._run_context_items]
 
     def _request_history_summary(self, source: str, max_chars: int) -> str:
         response = self._request_model(
@@ -567,6 +602,8 @@ class AgentLoop:
         results = [(call, self._execute_call(call)) for call in calls]
         outputs: list[object] = []
         for call, result in results:
+            if self.run_observer is not None:
+                self.run_observer.tool_result(call.call_id, result)
             serialized = json.dumps(result, ensure_ascii=False)
             if self.context_memory is not None:
                 serialized = self.context_memory.prepare_tool_output(serialized)

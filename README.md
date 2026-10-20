@@ -16,6 +16,7 @@
   <a href="#myagent-能做什么">功能概览</a> ·
   <a href="#配置">配置说明</a> ·
   <a href="docs/rag-mcp.md">RAG / MCP 接入</a> ·
+  <a href="docs/collaborative-memory.md">协作记忆</a> ·
   <a href="#开发与测试">开发与测试</a>
 </p>
 
