@@ -5,6 +5,8 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
+from myagent.agent import AgentLoop
+from myagent.tooling import ToolRegistry
 from myagent.evaluation.cases import DatasetError, load_cases
 from myagent.evaluation.deepseek import DeepSeekResponsesClient
 from myagent.evaluation.judge import (
@@ -113,6 +115,80 @@ class ResumeDatasetTests(unittest.TestCase):
 
 
 class DeepSeekAdapterTests(unittest.TestCase):
+    def test_text_reply_omits_empty_tool_calls_in_both_continuation_paths(self):
+        for use_response_id in (False, True):
+            for tool_calls in (None, []):
+                with self.subTest(use_response_id=use_response_id, tool_calls=tool_calls):
+                    reply = _chat_response(
+                        response_id="first", content="Done.", reasoning_content="Checked."
+                    )
+                    reply.choices[0].message.tool_calls = tool_calls
+                    endpoint = FakeChatCompletions([
+                        reply, _chat_response(response_id="review", content="Reviewed.")
+                    ])
+                    client = DeepSeekResponsesClient(endpoint)
+                    first = client.responses.create(
+                        model="offline", input=[{"role": "user", "content": "Implement."}]
+                    )
+                    followup = [{"role": "user", "content": "Review."}]
+                    continuation = (
+                        {"previous_response_id": first.id, "input": followup}
+                        if use_response_id else
+                        {"input": [{"role": "user", "content": "Implement."}, *first.output, *followup]}
+                    )
+                    client.responses.create(model="offline", **continuation)
+                    assistant = endpoint.requests[-1]["messages"][1]
+                    self.assertEqual(assistant["content"], "Done.")
+                    self.assertEqual(assistant["reasoning_content"], "Checked.")
+                    self.assertNotIn("tool_calls", assistant)
+
+    def test_response_id_continuation_preserves_real_tool_calls(self):
+        endpoint = FakeChatCompletions([
+            _chat_response(
+                response_id="tool", reasoning_content="Read first.",
+                tool_calls=[_tool_call("call-1", "read_file", '{"path":"README.md"}')],
+                finish_reason="tool_calls",
+            ),
+            _chat_response(response_id="done", content="Done."),
+        ])
+        client = DeepSeekResponsesClient(endpoint)
+        first = client.responses.create(model="offline", input=[{"role": "user", "content": "Read."}])
+        client.responses.create(
+            model="offline", previous_response_id=first.id,
+            input=[{"type": "function_call_output", "call_id": "call-1", "output": "file content"}],
+        )
+        messages = endpoint.requests[-1]["messages"]
+        self.assertEqual(messages[1]["tool_calls"], [{
+            "id": "call-1", "type": "function",
+            "function": {"name": "read_file", "arguments": '{"path":"README.md"}'},
+        }])
+        self.assertEqual(messages[1]["reasoning_content"], "Read first.")
+        self.assertEqual(messages[2], {"role": "tool", "tool_call_id": "call-1", "content": "file content"})
+
+    def test_agent_preserves_history_across_three_user_turns(self):
+        class StrictChatCompletions(FakeChatCompletions):
+            def create(self, **kwargs):
+                for message in kwargs["messages"]:
+                    if "tool_calls" in message and not message["tool_calls"]:
+                        raise ValueError("Invalid tool_calls: empty array")
+                return super().create(**kwargs)
+
+        phases = ("Answer", "Followup", "Confirm")
+        endpoint = StrictChatCompletions([
+            _chat_response(response_id=phase, content=phase + " done") for phase in phases
+        ])
+        agent = AgentLoop(DeepSeekResponsesClient(endpoint), tool_registry=ToolRegistry())
+        try:
+            for phase in phases:
+                self.assertEqual(agent.run(phase), phase + " done")
+        finally:
+            agent.close()
+        self.assertEqual(len(endpoint.requests), 3)
+        self.assertEqual(
+            [m["content"] for m in endpoint.requests[-1]["messages"] if m["role"] == "assistant"],
+            ["Answer done", "Followup done"],
+        )
+
     def test_tool_call_round_trip_preserves_reasoning_and_usage(self):
         endpoint = FakeChatCompletions(
             [

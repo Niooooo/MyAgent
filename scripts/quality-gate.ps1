@@ -25,11 +25,27 @@ try {
     }
 
     if ($gateExitCode -eq 0) {
+        & $PythonExecutable -m myagent.evaluation.bfcl validate
+        if ($LASTEXITCODE -ne 0) {
+            $gateExitCode = $LASTEXITCODE
+        }
+    }
+
+    if ($gateExitCode -eq 0) {
         & $PythonExecutable -m myagent.evaluation run `
             --dataset evaluations/live/cases.jsonl `
             --provider replay `
             --allow-code-execution `
             --output eval-results/replay
+        if ($LASTEXITCODE -ne 0) {
+            $gateExitCode = $LASTEXITCODE
+        }
+    }
+
+    if ($gateExitCode -eq 0) {
+        $benchmarkOutput = Join-Path $projectRoot ('eval-results/bfcl-gate-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff'))
+        & $PythonExecutable -m myagent.evaluation.bfcl run `
+            --provider replay --repeat 1 --output $benchmarkOutput
         if ($LASTEXITCODE -ne 0) {
             $gateExitCode = $LASTEXITCODE
         }
