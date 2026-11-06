@@ -28,18 +28,23 @@ jobs:
         if: always()
         shell: pwsh
         run: |
-          $summary = "eval-results/replay/summary.md"
-          if (Test-Path $summary) {
-            Get-Content $summary | Out-File `
+          $summaries = @("eval-results/replay/summary.md")
+          $summaries += @(Get-ChildItem -Path "eval-results/bfcl-gate-*/summary.md" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName)
+          foreach ($summary in $summaries) {
+            if (Test-Path $summary) {
+              Get-Content $summary | Out-File `
               -FilePath $env:GITHUB_STEP_SUMMARY `
               -Append `
               -Encoding utf8
+            }
           }
       - name: Upload evaluation reports
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: myagent-evaluation-replay
-          path: eval-results/replay
+          path: |
+            eval-results/replay
+            eval-results/bfcl-gate-*
           if-no-files-found: warn
           retention-days: 14

@@ -1,5 +1,10 @@
 # MyAgent 评测
 
+[BFCL-inspired single 评测](bfcl-local/README.md) 包含 11 个维度，每维 30 题，
+共 330 道本地工具与集成任务。默认重复 3 次，执行 990 次评测。
+使用 `./scripts/run-bfcl-eval.ps1 -Provider deepseek -PromptApiKey` 启动，
+结果按维度汇总，并保存工具轨迹、文件终态和失败检查。
+
 首版采用“双车道”：同一组自建小仓库任务既能用固定 Responses 脚本离线回放，
 也能手动交给真实模型执行。普通单元测试和 PR 门禁只跑离线车道，不读取密钥、
 不请求网络，也不把离线结果冒充为模型能力分数。

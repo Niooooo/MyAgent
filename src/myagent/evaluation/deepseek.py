@@ -78,8 +78,9 @@ class DeepSeekResponsesEndpoint:
             "role": "assistant",
             "content": content,
             "reasoning_content": reasoning_content,
-            "tool_calls": tool_calls,
         }
+        if tool_calls:
+            assistant_message["tool_calls"] = tool_calls
 
         response_id = getattr(response, "id", None) or f"deepseek-{uuid4().hex}"
         self._response_messages[str(response_id)] = [*messages, assistant_message]
@@ -134,14 +135,15 @@ def _messages_from_input(items: Any) -> list[dict[str, Any]]:
                 continue
         item_type = getattr(item, "type", None)
         if item_type == "message" and getattr(item, "role", None) == "assistant":
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": getattr(item, "content", None) or "",
-                    "reasoning_content": getattr(item, "reasoning_content", None),
-                    "tool_calls": list(getattr(item, "tool_calls", ()) or ()),
-                }
-            )
+            message = {
+                "role": "assistant",
+                "content": getattr(item, "content", None) or "",
+                "reasoning_content": getattr(item, "reasoning_content", None),
+            }
+            tool_calls = list(getattr(item, "tool_calls", ()) or ())
+            if tool_calls:
+                message["tool_calls"] = tool_calls
+            messages.append(message)
         # Function-call items are represented by the preceding assistant message.
     return messages
 
